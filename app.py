@@ -336,13 +336,21 @@ def load_test_stl():
 
         logger.info(f"Test STL loaded: {default_path}")
 
+        # Convert numpy arrays to lists for JSON serialization
+        bounds = mesh_info['bounds']
+        dimensions = mesh_info['dimensions']
+        if hasattr(bounds, 'tolist'):
+            bounds = bounds.tolist()
+        if hasattr(dimensions, 'tolist'):
+            dimensions = dimensions.tolist()
+
         return jsonify({
             'status': 'success',
             'filename': os.path.basename(default_path),
             'info': {
                 'n_triangles': mesh_info['n_triangles'],
-                'bounds': mesh_info['bounds'],
-                'dimensions': mesh_info['dimensions']
+                'bounds': bounds,
+                'dimensions': dimensions
             }
         })
 
@@ -999,21 +1007,159 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             transition: width 0.3s;
             width: 0%;
         }}
-        .console {{
-            background: var(--bg-input);
-            border-radius: 6px;
-            padding: 10px;
-            margin-top: 12px;
-            max-height: 120px;
-            overflow-y: auto;
+        /* Floating Console - positioned at top-left of main area */
+        .floating-console {{
+            position: absolute;
+            top: 8px;
+            left: 12px;
+            z-index: 50;
+            max-width: 500px;
             font-family: 'Consolas', monospace;
-            font-size: 0.8rem;
+            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            pointer-events: none;
         }}
-        .console-line {{ padding: 2px 0; color: var(--text-secondary); }}
-        .console-line.info {{ color: var(--accent); }}
-        .console-line.success {{ color: var(--success); }}
-        .console-line.warning {{ color: var(--warning); }}
-        .console-line.error {{ color: var(--danger); }}
+
+        .console-header-row {{
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 4px;
+        }}
+
+        .console-toggle-btn {{
+            background: transparent;
+            border: 1px solid rgba(255,255,255,0.3);
+            color: #ccc;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+        }}
+
+        .console-toggle-btn:hover {{
+            background: rgba(45, 95, 142, 0.3);
+            color: #fff;
+            border-color: var(--accent);
+        }}
+
+        .console-toggle-btn.active {{
+            background: rgba(45, 95, 142, 0.4);
+            color: #fff;
+            border-color: var(--primary);
+        }}
+
+        .console-toggle-btn .chevron {{
+            font-size: 9px;
+            transition: transform 0.2s;
+        }}
+
+        .console-toggle-btn.active .chevron {{
+            transform: rotate(90deg);
+        }}
+
+        #console-wrapper {{
+            display: none;
+            flex-direction: column;
+            max-height: 600px;
+            background: transparent;
+            border: none;
+            overflow: hidden;
+            box-shadow: none;
+            pointer-events: none;
+        }}
+
+        #console-wrapper.visible {{
+            display: flex;
+        }}
+
+        .floating-console-content {{
+            flex: 1;
+            overflow-y: scroll;
+            overflow-x: hidden;
+            padding: 10px 4px 10px 12px;
+            color: #d0f0d0;
+            line-height: 1.6;
+            background: transparent;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 8px rgba(0, 0, 0, 0.7);
+            pointer-events: auto;
+            user-select: none;
+            direction: rtl;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(45, 95, 142, 0.6) transparent;
+            max-height: 550px;
+            font-size: 11px;
+            border: none;
+        }}
+
+        .floating-console-content::-webkit-scrollbar {{
+            width: 6px;
+        }}
+
+        .floating-console-content::-webkit-scrollbar-track {{
+            background: transparent;
+        }}
+
+        .floating-console-content::-webkit-scrollbar-thumb {{
+            background: rgba(45, 95, 142, 0.6);
+            border-radius: 3px;
+        }}
+
+        .floating-console-content::-webkit-scrollbar-thumb:hover {{
+            background: rgba(45, 95, 142, 0.8);
+        }}
+
+        .floating-console-content > * {{
+            direction: ltr;
+            pointer-events: none;
+        }}
+
+        .floating-console-content .error {{ color: #ff6b6b; font-weight: 500; }}
+        .floating-console-content .info {{ color: #74b9ff; }}
+        .floating-console-content .warn {{ color: #ffeaa7; }}
+        .floating-console-content .success {{ color: #55efc4; font-weight: 500; }}
+        .floating-console-content .progress {{ color: #a29bfe; }}
+        .floating-console-content .stage {{ color: #5BA3D9; font-weight: 600; }}
+
+        /* Floating Run Analysis button */
+        .floating-simulate-btn {{
+            pointer-events: auto;
+            width: 300px;
+            padding: 10px 24px;
+            background: linear-gradient(135deg, var(--primary), var(--primary-light));
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+            overflow: hidden;
+            margin-bottom: 6px;
+        }}
+
+        .floating-simulate-btn:hover:not(.running) {{
+            background: linear-gradient(135deg, var(--primary-light), var(--accent));
+            transform: translateY(-1px);
+        }}
+
+        .floating-simulate-btn.running {{
+            background: linear-gradient(to right, var(--accent) var(--progress, 0%), var(--bg-input) var(--progress, 0%));
+            cursor: default;
+        }}
+
+        .floating-simulate-btn:disabled {{
+            opacity: 0.6;
+            cursor: not-allowed;
+        }}
         .info-card {{
             background: var(--bg-input);
             border-radius: 8px;
@@ -1105,6 +1251,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         <div id="fileUploadText">Click to upload STL file</div>
                     </div>
                     <input type="file" id="fileInput" accept=".stl" style="display: none;" onchange="handleFileUpload(this)">
+                    <button class="btn btn-secondary" style="width: 100%; margin-top: 8px;" onclick="loadTestSTL()">Load Test STL</button>
 
                     <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color);">
                         <div class="param-row">
@@ -1189,27 +1336,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- Run Button -->
-            <button class="btn btn-primary" id="runBtn" onclick="runAnalysis()" disabled>
-                &#9654; Run Analysis
-            </button>
-
-            <!-- Progress -->
-            <div id="progressSection" style="display: none; margin-top: 12px;">
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
-                </div>
-                <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--text-secondary);">
-                    <span id="progressText">Initializing...</span>
-                    <span id="progressPercent">0%</span>
-                </div>
-            </div>
-
-            <!-- Console -->
-            <div class="console" id="console">
-                <div class="console-line info">Ready. Upload an STL file to begin.</div>
-            </div>
-
             <!-- STL Info -->
             <div class="info-card" id="stlInfo" style="display: none;">
                 <h4>STL Information</h4>
@@ -1228,7 +1354,22 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn" onclick="switchTab('summary')">Summary</button>
             </nav>
 
-            <div class="tab-content">
+            <div class="tab-content" style="position: relative;">
+                <!-- Floating Console & Run Analysis Button -->
+                <div class="floating-console">
+                    <button class="floating-simulate-btn" id="runBtn" onclick="runAnalysis()" disabled>
+                        &#9654; Run Analysis
+                    </button>
+                    <div class="console-header-row">
+                        <button class="console-toggle-btn" id="consoleToggle" onclick="toggleConsole()">
+                            <span class="chevron">&#9654;</span> Console
+                        </button>
+                    </div>
+                    <div id="console-wrapper">
+                        <div class="floating-console-content" id="console"></div>
+                    </div>
+                </div>
+
                 <!-- STL Preview Tab -->
                 <div class="tab-panel active" id="tab-preview">
                     <div class="viz-container" id="previewPlot">
@@ -1321,14 +1462,59 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('tab-' + tabName).classList.add('active');
         }}
 
-        // Log to console
+        // Log to floating console
         function logConsole(message, type = '') {{
-            const console = document.getElementById('console');
+            const consoleEl = document.getElementById('console');
             const line = document.createElement('div');
-            line.className = 'console-line ' + type;
+            line.className = type;
             line.textContent = message;
-            console.appendChild(line);
-            console.scrollTop = console.scrollHeight;
+            consoleEl.appendChild(line);
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+
+            // Show console when logging
+            const wrapper = document.getElementById('console-wrapper');
+            const toggleBtn = document.getElementById('consoleToggle');
+            if (!wrapper.classList.contains('visible')) {{
+                wrapper.classList.add('visible');
+                toggleBtn.classList.add('active');
+            }}
+        }}
+
+        // Toggle console visibility
+        function toggleConsole() {{
+            const wrapper = document.getElementById('console-wrapper');
+            const toggleBtn = document.getElementById('consoleToggle');
+            wrapper.classList.toggle('visible');
+            toggleBtn.classList.toggle('active');
+        }}
+
+        // Load test STL
+        async function loadTestSTL() {{
+            logConsole('Loading test STL...', 'info');
+
+            try {{
+                const response = await fetch('/api/load_test_stl', {{ method: 'POST' }});
+                const data = await response.json();
+
+                if (data.status === 'success') {{
+                    stlLoaded = true;
+                    document.getElementById('runBtn').disabled = false;
+                    document.getElementById('fileUpload').classList.add('loaded');
+                    document.getElementById('fileUploadText').textContent = data.filename || 'Test STL';
+
+                    document.getElementById('stlInfo').style.display = 'block';
+                    document.getElementById('infoFilename').textContent = data.filename || 'Test STL';
+                    document.getElementById('infoTriangles').textContent = data.info.n_triangles.toLocaleString();
+                    const dims = data.info.dimensions;
+                    document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
+
+                    logConsole('Test STL loaded: ' + data.info.n_triangles + ' triangles', 'success');
+                }} else {{
+                    logConsole('Error: ' + data.message, 'error');
+                }}
+            }} catch (err) {{
+                logConsole('Failed to load test STL: ' + err.message, 'error');
+            }}
         }}
 
         // Handle file upload
@@ -1389,8 +1575,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 threshold_high: parseFloat(document.getElementById('thresholdHigh').value)
             }};
 
-            document.getElementById('runBtn').disabled = true;
-            document.getElementById('progressSection').style.display = 'block';
+            const runBtn = document.getElementById('runBtn');
+            runBtn.disabled = true;
+            runBtn.classList.add('running');
+            runBtn.innerHTML = '&#9632; Running...';
+            runBtn.style.setProperty('--progress', '0%');
 
             try {{
                 logConsole('Starting analysis...', 'info');
@@ -1408,11 +1597,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     monitorProgress(currentSessionId);
                 }} else {{
                     logConsole('Error: ' + data.message, 'error');
-                    document.getElementById('runBtn').disabled = false;
+                    runBtn.classList.remove('running');
+                    runBtn.innerHTML = '&#9654; Run Analysis';
+                    runBtn.disabled = false;
                 }}
             }} catch (err) {{
                 logConsole('Analysis failed: ' + err.message, 'error');
-                document.getElementById('runBtn').disabled = false;
+                runBtn.classList.remove('running');
+                runBtn.innerHTML = '&#9654; Run Analysis';
+                runBtn.disabled = false;
             }}
         }}
 
@@ -1422,13 +1615,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             evtSource.onmessage = function(event) {{
                 const data = JSON.parse(event.data);
+                const runBtn = document.getElementById('runBtn');
 
                 if (data.heartbeat) return;
 
                 const progress = data.progress || 0;
-                document.getElementById('progressFill').style.width = progress + '%';
-                document.getElementById('progressPercent').textContent = Math.round(progress) + '%';
-                document.getElementById('progressText').textContent = data.step || '';
+                runBtn.style.setProperty('--progress', progress + '%');
+                runBtn.innerHTML = '&#9632; ' + Math.round(progress) + '%';
 
                 if (data.step && !data.step.includes('[HEARTBEAT]')) {{
                     logConsole(data.step, 'info');
@@ -1436,17 +1629,27 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                 if (data.status === 'complete') {{
                     evtSource.close();
+                    runBtn.classList.remove('running');
+                    runBtn.innerHTML = '&#9654; Run Analysis';
+                    runBtn.disabled = false;
                     logConsole('Analysis complete!', 'success');
                     loadResults(sessionId);
                 }} else if (data.status === 'error') {{
                     evtSource.close();
+                    runBtn.classList.remove('running');
+                    runBtn.innerHTML = '&#9654; Run Analysis';
+                    runBtn.disabled = false;
                     logConsole('Error: ' + (data.error || 'Unknown error'), 'error');
-                    document.getElementById('runBtn').disabled = false;
                 }}
             }};
 
             evtSource.onerror = function() {{
                 evtSource.close();
+                const runBtn = document.getElementById('runBtn');
+                runBtn.classList.remove('running');
+                runBtn.innerHTML = '&#9654; Run Analysis';
+                runBtn.disabled = false;
+                logConsole('Connection lost', 'error');
             }};
         }}
 
@@ -1565,6 +1768,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         function updateMarkerSize(size) {{
             document.getElementById('markerSizeVal').textContent = size;
         }}
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {{
+            logConsole('Ready - Load an STL file or use "Load Test STL"', 'info');
+        }});
     </script>
 </body>
 </html>
