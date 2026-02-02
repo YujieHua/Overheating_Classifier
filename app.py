@@ -309,7 +309,7 @@ def upload_stl():
 @app.route('/api/load_test_stl', methods=['POST'])
 def load_test_stl():
     default_path = os.getenv('TEST_STL_PATH',
-        r"B:\SmartFusion\20250728\CAD\SmartFusion_Calibration_Square.STL")
+        r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl")
 
     if not os.path.exists(default_path):
         return jsonify({
