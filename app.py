@@ -30,17 +30,31 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 # LOGGING SETUP
 # =============================================================================
 def setup_logging(log_dir: str = "logs"):
-    """Configure structured logging."""
+    """Configure structured logging with rotation."""
+    from logging.handlers import RotatingFileHandler
+
     log_path = Path(log_dir)
     log_path.mkdir(exist_ok=True)
 
+    # Use RotatingFileHandler to prevent unbounded log growth
+    # Max 5MB per file, keep 3 backup files
+    file_handler = RotatingFileHandler(
+        log_path / 'app.log',
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3
+    )
+    file_handler.setLevel(logging.DEBUG)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)  # Less verbose console output
+
+    formatter = logging.Formatter('%(asctime)s | %(name)s | %(levelname)s | %(message)s')
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+
     logging.basicConfig(
         level=logging.DEBUG,
-        format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-        handlers=[
-            logging.FileHandler(log_path / 'app.log'),
-            logging.StreamHandler()
-        ]
+        handlers=[file_handler, stream_handler]
     )
 
 setup_logging()
@@ -97,7 +111,7 @@ class AnalysisSession:
     def get_progress_update(self, timeout: float = 1.0):
         try:
             return self._progress_queue.get(timeout=timeout)
-        except:
+        except Exception:  # Queue.Empty or timeout
             return None
 
     def set_complete(self, results: Dict, computation_time: float = 0.0):
@@ -361,8 +375,12 @@ def load_test_stl():
 
 @app.route('/api/slice', methods=['POST'])
 def api_slice():
-    voxel_size = float(request.form.get('voxel_size', 0.1))
-    layer_thickness = float(request.form.get('layer_thickness', 0.04))
+    try:
+        voxel_size = float(request.form.get('voxel_size', 0.1))
+        layer_thickness = float(request.form.get('layer_thickness', 0.04))
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid parameter format: {e}")
+        return jsonify({'status': 'error', 'message': 'Invalid parameter format'}), 400
 
     is_valid, errors = validate_parameters({
         'voxel_size': voxel_size,
@@ -396,7 +414,7 @@ def api_slice():
 def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, layer_thickness: float):
     try:
         start_time = time.time()
-        from src.data.stl_loader import slice_stl
+        from src.data.stl_loader import load_stl, slice_stl
 
         def progress_with_cancel(progress, step):
             if session.is_cancelled():
@@ -405,10 +423,14 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
 
         session.update_progress(5, "[STAGE] Loading STL mesh...")
 
+        # Load mesh first (slice_stl expects mesh_info dict, not path)
+        mesh_info = load_stl(stl_path)
+
         slice_result = slice_stl(
-            stl_path=stl_path,
+            mesh_info=mesh_info,
             voxel_size=voxel_size,
             layer_thickness=layer_thickness,
+            layer_grouping=1,  # Default grouping for preview slicing
             progress_callback=progress_with_cancel
         )
 
@@ -417,7 +439,8 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 current_state['cached_masks'] = slice_result['masks']
                 current_state['cached_slice_params'] = {
                     'voxel_size': voxel_size,
-                    'layer_thickness': layer_thickness
+                    'layer_thickness': layer_thickness,
+                    'layer_grouping': 1  # Default for preview slicing
                 }
                 current_state['cached_slice_info'] = {
                     'n_layers': slice_result['n_layers'],
@@ -507,6 +530,8 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
 
         voxel_size = params.get('voxel_size', 0.1)
         layer_thickness = params.get('layer_thickness', 0.04)
+        layer_grouping = params.get('layer_grouping', 1)
+        build_direction = params.get('build_direction', 'Z')
         dissipation_factor = params.get('dissipation_factor', 0.5)
         convection_factor = params.get('convection_factor', 0.05)
         use_geometry_multiplier = params.get('use_geometry_multiplier', False)
@@ -522,20 +547,75 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         if slice_cache is not None:
             cached_params = slice_cache.get('params', {})
             if (cached_params.get('voxel_size') == voxel_size and
-                cached_params.get('layer_thickness') == layer_thickness):
+                cached_params.get('layer_thickness') == layer_thickness and
+                cached_params.get('layer_grouping') == layer_grouping and
+                cached_params.get('build_direction') == build_direction):
                 masks = slice_cache['masks']
                 slice_info = slice_cache['info']
                 need_reslice = False
                 progress_with_cancel(20, "[INFO] Using cached slice data")
 
         if need_reslice:
+            import trimesh
+
             progress_with_cancel(5, "[STAGE] Loading STL mesh...")
             mesh_info = load_stl(stl_path)
+
+            # Apply rotation if build direction is not Z
+            if build_direction != 'Z':
+                progress_with_cancel(6, f"[STAGE] Rotating mesh ({build_direction}→Z)...")
+
+                mesh = mesh_info['mesh']
+
+                if build_direction == 'Y':
+                    rotation_matrix = trimesh.transformations.rotation_matrix(
+                        np.radians(-90), [1, 0, 0]
+                    )
+                    progress_with_cancel(7, "[INFO] Applying Y→Z rotation (-90 deg around X)")
+                elif build_direction == 'Y-':
+                    # Y-down: rotate Y→Z then flip Z
+                    rotation_matrix = trimesh.transformations.rotation_matrix(
+                        np.radians(-90), [1, 0, 0]
+                    )
+                    flip_matrix = np.array([
+                        [1, 0, 0, 0],
+                        [0, 1, 0, 0],
+                        [0, 0, -1, 0],
+                        [0, 0, 0, 1]
+                    ])
+                    rotation_matrix = flip_matrix @ rotation_matrix
+                    progress_with_cancel(7, "[INFO] Applying Y→Z rotation + Z flip (Y-down)")
+                elif build_direction == 'X':
+                    rotation_matrix = trimesh.transformations.rotation_matrix(
+                        np.radians(90), [0, 1, 0]
+                    )
+                    progress_with_cancel(7, "[INFO] Applying X→Z rotation (90 deg around Y)")
+                else:
+                    rotation_matrix = np.eye(4)
+
+                rotated_mesh = mesh.copy()
+                rotated_mesh.apply_transform(rotation_matrix)
+
+                bounds = rotated_mesh.bounds
+                mesh_info = {
+                    'vertices': np.array(rotated_mesh.vertices),
+                    'faces': np.array(rotated_mesh.faces),
+                    'bounds': bounds,
+                    'dimensions': bounds[1] - bounds[0],
+                    'n_triangles': len(rotated_mesh.faces),
+                    'n_vertices': len(rotated_mesh.vertices),
+                    'is_watertight': rotated_mesh.is_watertight,
+                    'volume': rotated_mesh.volume if rotated_mesh.is_watertight else None,
+                    'mesh': rotated_mesh,
+                }
+                progress_with_cancel(8, f"[INFO] Rotated dimensions: {mesh_info['dimensions'][0]:.1f} x {mesh_info['dimensions'][1]:.1f} x {mesh_info['dimensions'][2]:.1f} mm")
+
             progress_with_cancel(8, "[STAGE] Slicing geometry into layers...")
             slice_result = slice_stl(
                 mesh_info=mesh_info,
                 voxel_size=voxel_size,
                 layer_thickness=layer_thickness,
+                layer_grouping=layer_grouping,
                 progress_callback=lambda p, s: progress_with_cancel(8 + p * 0.12, s)
             )
             masks = slice_result['masks']
@@ -599,6 +679,9 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             'params_used': {
                 'voxel_size': voxel_size,
                 'layer_thickness': layer_thickness,
+                'layer_grouping': layer_grouping,
+                'build_direction': build_direction,
+                'effective_layer_thickness': layer_thickness * layer_grouping,
                 'dissipation_factor': dissipation_factor,
                 'convection_factor': convection_factor,
                 'use_geometry_multiplier': use_geometry_multiplier,
@@ -776,6 +859,229 @@ def export_results(session_id):
         response.headers['Content-Type'] = 'application/json'
         response.headers['Content-Disposition'] = f'attachment; filename=energy_results_{session_id}.json'
         return response
+
+
+@app.route('/api/layer_surfaces/<session_id>/<data_type>')
+def get_layer_surfaces(session_id, data_type):
+    """Get 3D layer surfaces with per-layer values for different data types.
+
+    Supports: energy (risk scores), risk (risk levels)
+
+    Each layer is rendered as a surface with color based on its value.
+    """
+    session = session_registry.get_session(session_id)
+    if not session or not session.results:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    masks = results.get('masks', {})
+    params = results.get('params_used', {})
+
+    if not masks:
+        return jsonify({'status': 'error', 'message': 'No mask data available'}), 404
+
+    voxel_size = params.get('voxel_size', 0.1)
+    layer_thickness = params.get('effective_layer_thickness', params.get('layer_thickness', 0.04))
+
+    # Get layer values based on data type
+    if data_type == 'energy':
+        layer_values = {int(k): float(v) for k, v in results.get('risk_scores', {}).items()}
+        value_label = 'Risk Score'
+        min_val = 0.0
+        max_val = 1.0
+    elif data_type == 'risk':
+        # Map risk levels to numeric values: LOW=0, MEDIUM=1, HIGH=2
+        risk_levels = results.get('risk_levels', {})
+        layer_values = {}
+        for k, level in risk_levels.items():
+            if level == 'LOW':
+                layer_values[int(k)] = 0
+            elif level == 'MEDIUM':
+                layer_values[int(k)] = 1
+            else:  # HIGH
+                layer_values[int(k)] = 2
+        value_label = 'Risk Level'
+        min_val = 0
+        max_val = 2
+    else:
+        return jsonify({'status': 'error', 'message': f'Unknown data type: {data_type}'}), 400
+
+    # Generate layer surfaces from masks
+    layers_data = []
+    sorted_layers = sorted(masks.keys())
+
+    for layer in sorted_layers:
+        mask = masks.get(layer)
+        if mask is None:
+            continue
+
+        mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+        if mask_arr.sum() == 0:
+            continue
+
+        # Get the value for this layer
+        value = layer_values.get(layer, 0)
+
+        # Calculate Z height for this layer
+        z = layer * layer_thickness
+
+        # Find contour of the mask using simple boundary detection
+        # Get bounding box and create vertices from mask outline
+        rows, cols = np.where(mask_arr > 0)
+        if len(rows) == 0:
+            continue
+
+        # Create a simplified polygon from the mask using convex hull approach
+        # or generate a grid-based surface
+        vertices, faces = _generate_layer_surface(mask_arr, voxel_size, z)
+
+        if vertices and faces:
+            layers_data.append({
+                'layer': int(layer),
+                'z': float(z),
+                'value': float(value) if isinstance(value, (int, float, np.number)) else value,
+                'vertices': vertices,
+                'faces': faces
+            })
+
+    return jsonify({
+        'status': 'success',
+        'layers': layers_data,
+        'n_layers': len(sorted_layers),
+        'n_valid_layers': len(layers_data),
+        'min_val': float(min_val),
+        'max_val': float(max_val),
+        'value_label': value_label,
+        'layer_thickness': layer_thickness,
+        'voxel_size': voxel_size
+    })
+
+
+def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float) -> tuple:
+    """Generate triangulated surface from a 2D mask.
+
+    Uses marching squares-like approach to find contours and triangulate them.
+    Returns (vertices, faces) for mesh3d rendering.
+    """
+    from scipy import ndimage
+
+    # Find connected regions and their boundaries
+    labeled, n_features = ndimage.label(mask)
+
+    all_vertices = []
+    all_faces = []
+    vertex_offset = 0
+
+    for region_id in range(1, n_features + 1):
+        region_mask = (labeled == region_id)
+
+        # Find boundary pixels using erosion
+        eroded = ndimage.binary_erosion(region_mask)
+        boundary = region_mask & ~eroded
+
+        # Get boundary coordinates
+        rows, cols = np.where(boundary)
+        if len(rows) < 3:
+            # If boundary too small, use all region pixels
+            rows, cols = np.where(region_mask)
+            if len(rows) < 3:
+                continue
+
+        # Convert to physical coordinates
+        points = np.column_stack([cols * voxel_size, rows * voxel_size])
+
+        # Create convex hull for triangulation
+        try:
+            from scipy.spatial import ConvexHull, Delaunay
+            hull = ConvexHull(points)
+            hull_points = points[hull.vertices]
+
+            if len(hull_points) < 3:
+                continue
+
+            # Calculate centroid
+            cx = np.mean(hull_points[:, 0])
+            cy = np.mean(hull_points[:, 1])
+
+            # Add centroid as first vertex
+            all_vertices.append([float(cx), float(cy), float(z)])
+            centroid_idx = vertex_offset
+
+            # Add hull vertices
+            for pt in hull_points:
+                all_vertices.append([float(pt[0]), float(pt[1]), float(z)])
+
+            # Create fan triangulation from centroid
+            n_pts = len(hull_points)
+            for i in range(n_pts):
+                v1 = vertex_offset + 1 + i
+                v2 = vertex_offset + 1 + ((i + 1) % n_pts)
+                all_faces.append([centroid_idx, v1, v2])
+
+            vertex_offset = len(all_vertices)
+
+        except Exception:
+            # Fallback: create simple rectangular approximation
+            min_row, max_row = rows.min(), rows.max()
+            min_col, max_col = cols.min(), cols.max()
+
+            # Create rectangle corners
+            x1, y1 = min_col * voxel_size, min_row * voxel_size
+            x2, y2 = (max_col + 1) * voxel_size, (max_row + 1) * voxel_size
+
+            # Add 4 vertices
+            all_vertices.extend([
+                [float(x1), float(y1), float(z)],
+                [float(x2), float(y1), float(z)],
+                [float(x2), float(y2), float(z)],
+                [float(x1), float(y2), float(z)]
+            ])
+
+            # Add 2 triangles for rectangle
+            all_faces.extend([
+                [vertex_offset, vertex_offset + 1, vertex_offset + 2],
+                [vertex_offset, vertex_offset + 2, vertex_offset + 3]
+            ])
+
+            vertex_offset = len(all_vertices)
+
+    return all_vertices, all_faces
+
+
+@app.route('/api/stl_preview')
+def get_stl_preview():
+    """Get STL mesh data for 3D preview."""
+    with current_state['lock']:
+        if not current_state['stl_loaded']:
+            return jsonify({'status': 'error', 'message': 'No STL loaded'}), 404
+        stl_path = current_state['stl_path']
+        stl_info = current_state['stl_info']
+
+    try:
+        import trimesh
+
+        mesh = trimesh.load(stl_path)
+
+        # Sample vertices if too many (for performance)
+        max_triangles = 50000
+        if len(mesh.faces) > max_triangles:
+            # Simplify mesh
+            mesh = mesh.simplify_quadric_decimation(max_triangles)
+
+        vertices = mesh.vertices.tolist()
+        faces = mesh.faces.tolist()
+
+        return jsonify({
+            'status': 'success',
+            'vertices': vertices,
+            'faces': faces,
+            'n_triangles': len(faces),
+            'bounds': mesh.bounds.tolist() if hasattr(mesh.bounds, 'tolist') else mesh.bounds
+        })
+
+    except Exception as e:
+        logger.error(f"STL preview error: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 # =============================================================================
@@ -1264,6 +1570,27 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <input type="number" class="param-input" id="layerThickness" value="0.04" step="0.01">
                             <span class="param-unit">mm</span>
                         </div>
+                        <div class="param-row" style="margin-top: 8px;">
+                            <span class="param-label">Layer Grouping</span>
+                            <input type="range" id="layerGrouping" min="1" max="100" value="1" step="1" style="flex: 1; margin: 0 8px;" oninput="updateLayerGrouping()">
+                            <input type="number" class="param-input" id="layerGroupingValue" value="1" min="1" max="500" step="1" style="width: 65px;" onchange="syncLayerGrouping()">
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px;">
+                            <span id="layerGroupingDim">= 0.04 mm effective</span>
+                            <span id="layerGroupingLayers"></span>
+                        </div>
+                        <div style="font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px;">
+                            <button class="btn btn-secondary" style="padding: 2px 8px; font-size: 0.7rem;" onclick="autoLayerGrouping()">Auto (~200 layers)</button>
+                        </div>
+                        <div class="param-row" style="margin-top: 12px;">
+                            <span class="param-label">Build Direction</span>
+                            <select class="param-input" id="buildDirection" style="flex: 1;" onchange="onBuildDirectionChange()">
+                                <option value="Z">Z-up (default)</option>
+                                <option value="Y">Y-up (rotate Y→Z)</option>
+                                <option value="Y-">Y-down (rotate Y→Z, flip)</option>
+                                <option value="X">X-up (rotate X→Z)</option>
+                            </select>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1348,10 +1675,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         <!-- Main Content -->
         <main class="content">
             <nav class="tab-nav">
-                <button class="tab-btn active" onclick="switchTab('preview')">STL Preview</button>
-                <button class="tab-btn" onclick="switchTab('energy')">Energy Accumulation</button>
-                <button class="tab-btn" onclick="switchTab('risk')">Risk Map</button>
-                <button class="tab-btn" onclick="switchTab('summary')">Summary</button>
+                <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
+                <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
+                <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
+                <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
 
             <div class="tab-content" style="position: relative;">
@@ -1440,6 +1767,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         let currentSessionId = null;
         let analysisResults = null;
         let stlLoaded = false;
+        let currentEventSource = null;  // Track EventSource for cleanup
 
         // Toggle section expand/collapse
         function toggleSection(header) {{
@@ -1455,10 +1783,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         }}
 
         // Switch tabs
-        function switchTab(tabName) {{
+        function switchTab(tabName, evt) {{
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
             document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.remove('active'));
-            event.target.classList.add('active');
+            if (evt && evt.target) {{
+                evt.target.classList.add('active');
+            }}
             document.getElementById('tab-' + tabName).classList.add('active');
         }}
 
@@ -1470,14 +1800,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             line.textContent = message;
             consoleEl.appendChild(line);
             consoleEl.scrollTop = consoleEl.scrollHeight;
-
-            // Show console when logging
-            const wrapper = document.getElementById('console-wrapper');
-            const toggleBtn = document.getElementById('consoleToggle');
-            if (!wrapper.classList.contains('visible')) {{
-                wrapper.classList.add('visible');
-                toggleBtn.classList.add('active');
-            }}
+            // Console stays in its current state - doesn't auto-expand
         }}
 
         // Toggle console visibility
@@ -1486,6 +1809,57 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const toggleBtn = document.getElementById('consoleToggle');
             wrapper.classList.toggle('visible');
             toggleBtn.classList.toggle('active');
+        }}
+
+        // Store STL info for layer grouping calculation
+        let stlDimensions = null;
+
+        // Layer grouping functions
+        function updateLayerGrouping() {{
+            const slider = document.getElementById('layerGrouping');
+            const valueInput = document.getElementById('layerGroupingValue');
+            valueInput.value = slider.value;
+            updateLayerGroupingDisplay();
+        }}
+
+        function syncLayerGrouping() {{
+            const valueInput = document.getElementById('layerGroupingValue');
+            const slider = document.getElementById('layerGrouping');
+            let val = parseInt(valueInput.value) || 1;
+            val = Math.max(1, Math.min(500, val));
+            valueInput.value = val;
+            slider.value = Math.min(val, 100);
+            updateLayerGroupingDisplay();
+        }}
+
+        function updateLayerGroupingDisplay() {{
+            const grouping = parseInt(document.getElementById('layerGroupingValue').value) || 1;
+            const layerThickness = parseFloat(document.getElementById('layerThickness').value) || 0.04;
+            const effectiveThickness = (grouping * layerThickness).toFixed(3);
+            document.getElementById('layerGroupingDim').textContent = '= ' + effectiveThickness + ' mm effective';
+
+            if (stlDimensions) {{
+                const zHeight = stlDimensions[2];
+                const nLayers = Math.ceil(zHeight / (grouping * layerThickness));
+                document.getElementById('layerGroupingLayers').textContent = '~' + nLayers + ' layers';
+            }} else {{
+                document.getElementById('layerGroupingLayers').textContent = '';
+            }}
+        }}
+
+        function autoLayerGrouping() {{
+            if (!stlDimensions) {{
+                logConsole('Load an STL first to auto-calculate layer grouping', 'warning');
+                return;
+            }}
+            const layerThickness = parseFloat(document.getElementById('layerThickness').value) || 0.04;
+            const zHeight = stlDimensions[2];
+            const targetLayers = 200;
+            const grouping = Math.max(1, Math.ceil(zHeight / (targetLayers * layerThickness)));
+            document.getElementById('layerGroupingValue').value = grouping;
+            document.getElementById('layerGrouping').value = Math.min(grouping, 100);
+            updateLayerGroupingDisplay();
+            logConsole('Auto layer grouping: ' + grouping + ' (~' + Math.ceil(zHeight / (grouping * layerThickness)) + ' layers)', 'info');
         }}
 
         // Load test STL
@@ -1498,6 +1872,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                 if (data.status === 'success') {{
                     stlLoaded = true;
+                    stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
                     document.getElementById('fileUpload').classList.add('loaded');
                     document.getElementById('fileUploadText').textContent = data.filename || 'Test STL';
@@ -1508,7 +1883,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     const dims = data.info.dimensions;
                     document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
 
+                    updateLayerGroupingDisplay();
                     logConsole('Test STL loaded: ' + data.info.n_triangles + ' triangles', 'success');
+
+                    // Render 3D STL preview
+                    renderSTLPreview();
                 }} else {{
                     logConsole('Error: ' + data.message, 'error');
                 }}
@@ -1537,6 +1916,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                 if (data.status === 'success') {{
                     stlLoaded = true;
+                    stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
                     document.getElementById('fileUpload').classList.add('loaded');
                     document.getElementById('fileUploadText').textContent = file.name;
@@ -1547,7 +1927,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     const dims = data.info.dimensions;
                     document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
 
+                    updateLayerGroupingDisplay();
                     logConsole('STL loaded: ' + data.info.n_triangles + ' triangles', 'success');
+
+                    // Render 3D STL preview
+                    renderSTLPreview();
                 }} else {{
                     logConsole('Error: ' + data.message, 'error');
                 }}
@@ -1566,6 +1950,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const params = {{
                 voxel_size: parseFloat(document.getElementById('voxelSize').value),
                 layer_thickness: parseFloat(document.getElementById('layerThickness').value),
+                layer_grouping: parseInt(document.getElementById('layerGroupingValue').value) || 1,
+                build_direction: document.getElementById('buildDirection').value,
                 dissipation_factor: parseFloat(document.getElementById('dissipationFactor').value),
                 convection_factor: parseFloat(document.getElementById('convectionFactor').value),
                 use_geometry_multiplier: document.querySelector('input[name="energyModel"]:checked').value === 'geometry_multiplier',
@@ -1582,7 +1968,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             runBtn.style.setProperty('--progress', '0%');
 
             try {{
-                logConsole('Starting analysis...', 'info');
+                const grouping = params.layer_grouping;
+                if (grouping > 1) {{
+                    logConsole('Starting analysis (layer grouping: ' + grouping + 'x)...', 'info');
+                }} else {{
+                    logConsole('Starting analysis...', 'info');
+                }}
 
                 const response = await fetch('/api/run', {{
                     method: 'POST',
@@ -1611,7 +2002,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Monitor progress via SSE
         function monitorProgress(sessionId) {{
+            // Close previous EventSource to prevent memory leak
+            if (currentEventSource) {{
+                currentEventSource.close();
+                currentEventSource = null;
+            }}
             const evtSource = new EventSource('/api/progress/' + sessionId);
+            currentEventSource = evtSource;  // Track for cleanup
 
             evtSource.onmessage = function(event) {{
                 const data = JSON.parse(event.data);
@@ -1629,6 +2026,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                 if (data.status === 'complete') {{
                     evtSource.close();
+                    currentEventSource = null;
                     runBtn.classList.remove('running');
                     runBtn.innerHTML = '&#9654; Run Analysis';
                     runBtn.disabled = false;
@@ -1636,6 +2034,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     loadResults(sessionId);
                 }} else if (data.status === 'error') {{
                     evtSource.close();
+                    currentEventSource = null;
                     runBtn.classList.remove('running');
                     runBtn.innerHTML = '&#9654; Run Analysis';
                     runBtn.disabled = false;
@@ -1645,6 +2044,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             evtSource.onerror = function() {{
                 evtSource.close();
+                currentEventSource = null;
                 const runBtn = document.getElementById('runBtn');
                 runBtn.classList.remove('running');
                 runBtn.innerHTML = '&#9654; Run Analysis';
@@ -1677,48 +2077,307 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
-            // Energy plot
-            const layers = Object.keys(analysisResults.risk_scores).map(Number).sort((a, b) => a - b);
-            const scores = layers.map(l => analysisResults.risk_scores[l]);
-
-            Plotly.newPlot('energyPlot', [{{
-                x: layers,
-                y: scores,
-                type: 'scatter',
-                mode: 'lines+markers',
-                marker: {{ color: scores, colorscale: 'RdYlGn', reversescale: true, size: 6 }},
-                line: {{ color: 'rgba(0, 127, 163, 0.5)' }}
-            }}], {{
-                title: 'Energy Accumulation (Normalized Risk Score)',
-                xaxis: {{ title: 'Layer Number', color: '#aaa', gridcolor: '#333' }},
-                yaxis: {{ title: 'Risk Score (0-1)', range: [0, 1.05], color: '#aaa', gridcolor: '#333' }},
-                paper_bgcolor: '{BG_MAIN}',
-                plot_bgcolor: '{BG_MAIN}',
-                font: {{ color: '#fff' }},
-                margin: {{ t: 50, r: 20, b: 50, l: 60 }}
-            }}, {{responsive: true}});
-
-            // Risk bar chart
-            const summary = analysisResults.summary;
-            Plotly.newPlot('riskPlot', [{{
-                x: ['LOW', 'MEDIUM', 'HIGH'],
-                y: [summary.n_low, summary.n_medium, summary.n_high],
-                type: 'bar',
-                marker: {{ color: ['{ACCENT_COLOR}', '#fbbf24', '#f87171'] }}
-            }}], {{
-                title: 'Risk Distribution by Layer Count',
-                xaxis: {{ title: 'Risk Level', color: '#aaa' }},
-                yaxis: {{ title: 'Number of Layers', color: '#aaa', gridcolor: '#333' }},
-                paper_bgcolor: '{BG_MAIN}',
-                plot_bgcolor: '{BG_MAIN}',
-                font: {{ color: '#fff' }},
-                margin: {{ t: 50, r: 20, b: 50, l: 60 }}
-            }}, {{responsive: true}});
+            // Render 3D layer surfaces for Energy and Risk tabs
+            renderLayerSurfaces('energy');
+            renderLayerSurfaces('risk');
 
             document.getElementById('riskLegend').style.display = 'block';
 
             // Summary
             updateSummary();
+        }}
+
+        // Unified layer surface rendering for 3D visualization
+        async function renderLayerSurfaces(dataType) {{
+            if (!currentSessionId) return;
+
+            const plotConfig = {{
+                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
+                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }}
+            }};
+
+            const config = plotConfig[dataType];
+            if (!config) {{
+                logConsole('Unknown data type: ' + dataType, 'error');
+                return;
+            }}
+
+            logConsole('Loading ' + config.title + ' surfaces...', 'info');
+
+            try {{
+                const response = await fetch('/api/layer_surfaces/' + currentSessionId + '/' + dataType);
+                if (!response.ok) {{
+                    logConsole('Failed to load ' + config.title + ': HTTP ' + response.status, 'error');
+                    return;
+                }}
+
+                const data = await response.json();
+                if (data.status !== 'success') {{
+                    logConsole(config.title + ' error: ' + (data.message || 'Unknown'), 'error');
+                    return;
+                }}
+
+                if (data.n_valid_layers === 0) {{
+                    logConsole('No layer geometry available', 'warning');
+                    return;
+                }}
+
+                // Create mesh3d traces for each layer
+                const traces = [];
+                const allX = [], allY = [], allZ = [];
+                const minVal = data.min_val;
+                const maxVal = data.max_val;
+                const valueRange = maxVal - minVal || 1;
+
+                const layerValues = [];
+
+                data.layers.forEach((layerData) => {{
+                    if (!layerData.vertices || layerData.vertices.length === 0) return;
+
+                    const vertices = layerData.vertices;
+                    const faces = layerData.faces;
+                    const value = layerData.value;
+                    const layer = layerData.layer;
+                    const z = layerData.z;
+
+                    layerValues.push(value);
+
+                    const x = vertices.map(v => v[0]);
+                    const y = vertices.map(v => v[1]);
+                    const zArr = vertices.map(v => v[2]);
+
+                    allX.push(...x);
+                    allY.push(...y);
+                    allZ.push(...zArr);
+
+                    const i = faces.map(f => f[0]);
+                    const j = faces.map(f => f[1]);
+                    const k = faces.map(f => f[2]);
+
+                    const normalizedValue = (value - minVal) / valueRange;
+
+                    // Get color based on data type
+                    let color;
+                    if (dataType === 'risk') {{
+                        // Risk uses categorical colors: LOW=green, MEDIUM=yellow, HIGH=red
+                        if (value >= 2) color = '#f87171';  // HIGH - red
+                        else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
+                        else color = '#4ade80';  // LOW - green
+                    }} else {{
+                        // Energy: RdYlGn reversed (green=low, red=high)
+                        if (normalizedValue < 0.3) {{
+                            // Green range
+                            const t = normalizedValue / 0.3;
+                            color = `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
+                        }} else if (normalizedValue < 0.6) {{
+                            // Yellow range
+                            const t = (normalizedValue - 0.3) / 0.3;
+                            color = `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189 - t * 0)}}, ${{Math.round(36 - t * 0)}})`;
+                        }} else {{
+                            // Red range
+                            const t = (normalizedValue - 0.6) / 0.4;
+                            color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
+                        }}
+                    }}
+
+                    traces.push({{
+                        type: 'mesh3d',
+                        x: x,
+                        y: y,
+                        z: zArr,
+                        i: i,
+                        j: j,
+                        k: k,
+                        color: color,
+                        opacity: 0.9,
+                        flatshading: true,
+                        hovertemplate: 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>',
+                        showscale: false
+                    }});
+                }});
+
+                if (traces.length === 0) {{
+                    logConsole('No valid layer geometry to display', 'warning');
+                    return;
+                }}
+
+                // Add colorbar via invisible scatter3d trace
+                let colorscale;
+                if (dataType === 'risk') {{
+                    colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
+                }} else {{
+                    colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
+                }}
+
+                const colorbarTrace = {{
+                    type: 'scatter3d',
+                    mode: 'markers',
+                    x: [null],
+                    y: [null],
+                    z: [null],
+                    marker: {{
+                        size: 0.001,
+                        color: layerValues,
+                        colorscale: colorscale,
+                        cmin: minVal,
+                        cmax: maxVal,
+                        colorbar: {{
+                            title: {{ text: data.value_label, font: {{ color: '#e0e0e0', size: 12 }} }},
+                            tickfont: {{ color: '#c0c0c0', size: 11 }},
+                            x: 1.02,
+                            xanchor: 'left',
+                            y: 0.5,
+                            yanchor: 'middle',
+                            len: 0.6,
+                            thickness: 15,
+                            bgcolor: 'rgba(40,40,40,0.9)',
+                            bordercolor: '#666',
+                            borderwidth: 1
+                        }},
+                        showscale: true
+                    }},
+                    hoverinfo: 'skip',
+                    showlegend: false
+                }};
+                traces.push(colorbarTrace);
+
+                // Calculate scene bounds with padding
+                const padding = 0.1;
+                const xRange = [Math.min(...allX), Math.max(...allX)];
+                const yRange = [Math.min(...allY), Math.max(...allY)];
+                const zRange = [Math.min(...allZ), Math.max(...allZ)];
+                const xPad = (xRange[1] - xRange[0]) * padding;
+                const yPad = (yRange[1] - yRange[0]) * padding;
+                const zPad = (zRange[1] - zRange[0]) * padding;
+
+                const layout = {{
+                    title: {{ text: config.title + ' (' + data.n_valid_layers + ' layers)', font: {{ color: '#fff', size: 14 }} }},
+                    paper_bgcolor: '{BG_MAIN}',
+                    plot_bgcolor: '{BG_MAIN}',
+                    scene: {{
+                        xaxis: {{ title: 'X (mm)', color: '#aaa', gridcolor: '#333', range: [xRange[0] - xPad, xRange[1] + xPad] }},
+                        yaxis: {{ title: 'Y (mm)', color: '#aaa', gridcolor: '#333', range: [yRange[0] - yPad, yRange[1] + yPad] }},
+                        zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
+                        bgcolor: '{BG_MAIN}',
+                        aspectmode: 'data'
+                    }},
+                    margin: {{ l: 0, r: 80, t: 40, b: 0 }}
+                }};
+
+                Plotly.newPlot(config.plotId, traces, layout, {{ responsive: true, displayModeBar: true }});
+                logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
+
+            }} catch (e) {{
+                console.error(e);
+                logConsole('Error loading ' + config.title + ': ' + e.message, 'error');
+            }}
+        }}
+
+        // Apply build direction rotation to coordinates (for preview)
+        function applyBuildDirectionRotation(x, y, z, buildDir) {{
+            if (buildDir === 'Y') {{
+                // Rotate Y to Z: swap Y and Z, negate new Y
+                return {{ x: x, y: z.map(v => -v), z: y }};
+            }} else if (buildDir === 'Y-') {{
+                // Rotate Y to Z then flip: swap Y and Z, negate both
+                return {{ x: x, y: z.map(v => -v), z: y.map(v => -v) }};
+            }} else if (buildDir === 'X') {{
+                // Rotate X to Z: swap X and Z, negate new X
+                return {{ x: z.map(v => -v), y: y, z: x }};
+            }}
+            // Z-up (default): no rotation
+            return {{ x, y, z }};
+        }}
+
+        // Handle build direction change
+        function onBuildDirectionChange() {{
+            const buildDir = document.getElementById('buildDirection').value;
+            logConsole('Build direction changed to: ' + buildDir + '-up', 'info');
+            if (stlLoaded) {{
+                renderSTLPreview();
+            }}
+        }}
+
+        // Render STL preview
+        async function renderSTLPreview() {{
+            logConsole('Loading STL preview...', 'info');
+
+            try {{
+                const buildDir = document.getElementById('buildDirection').value;
+                const response = await fetch('/api/stl_preview?build_direction=' + buildDir);
+                if (!response.ok) {{
+                    logConsole('Failed to load STL preview: HTTP ' + response.status, 'error');
+                    return;
+                }}
+
+                const data = await response.json();
+                if (data.status !== 'success') {{
+                    logConsole('STL preview error: ' + (data.message || 'Unknown'), 'error');
+                    return;
+                }}
+
+                const vertices = data.vertices;
+                const faces = data.faces;
+
+                let x = vertices.map(v => v[0]);
+                let y = vertices.map(v => v[1]);
+                let z = vertices.map(v => v[2]);
+
+                // Apply rotation for preview
+                const rotated = applyBuildDirectionRotation(x, y, z, buildDir);
+                x = rotated.x;
+                y = rotated.y;
+                z = rotated.z;
+
+                const i = faces.map(f => f[0]);
+                const j = faces.map(f => f[1]);
+                const k = faces.map(f => f[2]);
+
+                const trace = {{
+                    type: 'mesh3d',
+                    x: x,
+                    y: y,
+                    z: z,
+                    i: i,
+                    j: j,
+                    k: k,
+                    color: '#5BA3D9',
+                    opacity: 1.0,
+                    flatshading: true,
+                    hovertemplate: 'X: %{{x:.2f}} mm<br>Y: %{{y:.2f}} mm<br>Z: %{{z:.2f}} mm<extra></extra>'
+                }};
+
+                // Calculate bounds
+                const padding = 0.1;
+                const xRange = [Math.min(...x), Math.max(...x)];
+                const yRange = [Math.min(...y), Math.max(...y)];
+                const zRange = [Math.min(...z), Math.max(...z)];
+                const xPad = (xRange[1] - xRange[0]) * padding;
+                const yPad = (yRange[1] - yRange[0]) * padding;
+                const zPad = (zRange[1] - zRange[0]) * padding;
+
+                const dirLabel = buildDir === 'Z' ? '' : ' (' + buildDir + '-up)';
+                const layout = {{
+                    title: {{ text: 'STL Preview (' + data.n_triangles + ' triangles)' + dirLabel, font: {{ color: '#fff', size: 14 }} }},
+                    paper_bgcolor: '{BG_MAIN}',
+                    plot_bgcolor: '{BG_MAIN}',
+                    scene: {{
+                        xaxis: {{ title: 'X (mm)', color: '#aaa', gridcolor: '#333', range: [xRange[0] - xPad, xRange[1] + xPad] }},
+                        yaxis: {{ title: 'Y (mm)', color: '#aaa', gridcolor: '#333', range: [yRange[0] - yPad, yRange[1] + yPad] }},
+                        zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
+                        bgcolor: '{BG_MAIN}',
+                        aspectmode: 'data'
+                    }},
+                    margin: {{ l: 0, r: 20, t: 40, b: 0 }}
+                }};
+
+                Plotly.newPlot('previewPlot', [trace], layout, {{ responsive: true, displayModeBar: true }});
+                logConsole('STL preview loaded: ' + data.n_triangles + ' triangles' + (buildDir !== 'Z' ? ' (' + buildDir + '-up)' : ''), 'success');
+
+            }} catch (e) {{
+                console.error(e);
+                logConsole('Error loading STL preview: ' + e.message, 'error');
+            }}
         }}
 
         // Update summary tab
@@ -1744,7 +2403,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <div class="summary-card">
                     <h4>Parameters Used</h4>
                     <div class="summary-stat"><span class="label">Mode</span><span class="value">${{p.mode}}</span></div>
+                    <div class="summary-stat"><span class="label">Build Direction</span><span class="value">${{p.build_direction || 'Z'}}-up</span></div>
                     <div class="summary-stat"><span class="label">Voxel Size</span><span class="value">${{p.voxel_size}} mm</span></div>
+                    <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
                     <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
                     <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
                 </div>
