@@ -1,0 +1,19 @@
+# Overheating Classifier - Dependencies
+# Energy-based risk screening for LPBF
+
+# Core computation
+numpy>=1.20
+scipy>=1.7
+trimesh>=3.10
+scikit-image>=0.19
+
+# Web framework
+flask>=2.0
+werkzeug>=2.0
+
+# Validation (optional)
+marshmallow>=3.14
+
+# Testing
+pytest>=7.0
+pytest-cov>=4.0
