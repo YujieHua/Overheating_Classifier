@@ -322,13 +322,22 @@ def upload_stl():
 
 @app.route('/api/load_test_stl', methods=['POST'])
 def load_test_stl():
-    default_path = os.getenv('TEST_STL_PATH',
-        r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl")
+    # Support multiple test STL files via index parameter
+    stl_index = request.args.get('index', '1')
+
+    test_stl_paths = {
+        '1': os.getenv('TEST_STL_PATH',
+            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl"),
+        '2': os.getenv('TEST_STL_PATH_2',
+            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl"),
+    }
+
+    default_path = test_stl_paths.get(stl_index, test_stl_paths['1'])
 
     if not os.path.exists(default_path):
         return jsonify({
             'status': 'error',
-            'message': f'Test STL not found at: {default_path}'
+            'message': f'Test STL {stl_index} not found at: {default_path}'
         }), 404
 
     try:
@@ -1048,6 +1057,95 @@ def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float) -> tu
     return all_vertices, all_faces
 
 
+@app.route('/api/slice_visualization/<session_id>')
+def get_slice_visualization(session_id):
+    """Get sliced layer visualization data with edge points for kernel display.
+
+    Returns layer surfaces and edge points where kernels can be placed.
+    The frontend handles kernel rendering, updating when sigma changes.
+    """
+    session = session_registry.get_session(session_id)
+    if not session or not session.results:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    masks = results.get('masks', {})
+    params = results.get('params_used', {})
+
+    if not masks:
+        return jsonify({'status': 'error', 'message': 'No mask data available'}), 404
+
+    voxel_size = params.get('voxel_size', 0.1)
+    layer_thickness = params.get('effective_layer_thickness', params.get('layer_thickness', 0.04))
+
+    layers_data = []
+    all_edge_points = []
+    sorted_layers = sorted(masks.keys())
+
+    for layer in sorted_layers:
+        mask = masks.get(layer)
+        if mask is None:
+            continue
+
+        mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+        if mask_arr.sum() == 0:
+            continue
+
+        z = layer * layer_thickness
+
+        # Generate surface for this layer
+        vertices, faces = _generate_layer_surface(mask_arr, voxel_size, z)
+
+        if vertices and faces:
+            layers_data.append({
+                'layer': int(layer),
+                'z': float(z),
+                'vertices': vertices,
+                'faces': faces
+            })
+
+            # Extract edge points from this layer's mask for kernel placement
+            edge_points = _extract_edge_points(mask_arr, voxel_size, z)
+            all_edge_points.extend(edge_points)
+
+    return jsonify({
+        'status': 'success',
+        'layers': layers_data,
+        'edge_points': all_edge_points,  # Random subset will be used by frontend
+        'n_layers': len(sorted_layers),
+        'n_valid_layers': len(layers_data),
+        'layer_thickness': layer_thickness,
+        'voxel_size': voxel_size
+    })
+
+
+def _extract_edge_points(mask: np.ndarray, voxel_size: float, z: float, sample_rate: int = 5) -> list:
+    """Extract edge points from a 2D mask for kernel placement.
+
+    Returns a list of [x, y, z] points on the outer edges.
+    """
+    from scipy import ndimage
+
+    # Find boundary pixels
+    eroded = ndimage.binary_erosion(mask)
+    boundary = mask & ~eroded
+
+    rows, cols = np.where(boundary)
+    if len(rows) == 0:
+        return []
+
+    # Sample every N points to reduce density
+    indices = range(0, len(rows), sample_rate)
+    edge_points = []
+
+    for i in indices:
+        x = cols[i] * voxel_size
+        y = rows[i] * voxel_size
+        edge_points.append([float(x), float(y), float(z)])
+
+    return edge_points
+
+
 @app.route('/api/stl_preview')
 def get_stl_preview():
     """Get STL mesh data for 3D preview."""
@@ -1180,37 +1278,44 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             padding-bottom: 8px;
         }}
         .sidebar-section {{
-            margin-bottom: 10px;
+            margin-bottom: 6px;
             background: var(--bg-card);
-            border-radius: 8px;
+            border-radius: 6px;
             border: 1px solid rgba(45, 95, 142, 0.15);
+            transition: all 0.3s ease;
+        }}
+        .sidebar-section.expanded {{
+            background: #1f2d42;
+            box-shadow: 0 4px 20px rgba(0, 127, 163, 0.25), 0 0 0 1px rgba(0, 127, 163, 0.3);
+            border-color: rgba(0, 127, 163, 0.4);
         }}
         .section-header {{
-            padding: 10px 14px;
+            padding: 8px 12px;
             cursor: pointer;
             display: flex;
             justify-content: space-between;
             align-items: center;
             font-weight: 500;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
+            border-radius: 6px;
         }}
-        .section-header:hover {{ background: rgba(45, 95, 142, 0.2); border-radius: 8px; }}
+        .section-header:hover {{ background: rgba(45, 95, 142, 0.2); }}
         .section-header .arrow {{ font-size: 0.75rem; color: var(--text-secondary); transition: transform 0.3s; }}
         .section-header.collapsed .arrow {{ transform: rotate(-90deg); }}
         .section-content {{
-            padding: 0 14px 12px 14px;
+            padding: 0 12px 6px 12px;
             max-height: 800px;
             opacity: 1;
             transition: all 0.3s ease;
         }}
-        .section-content.collapsed {{ max-height: 0; opacity: 0; padding: 0 14px; overflow: hidden; }}
+        .section-content.collapsed {{ max-height: 0; opacity: 0; padding: 0 12px; overflow: hidden; }}
         .param-row {{
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 10px;
+            margin-bottom: 6px;
         }}
-        .param-label {{ font-size: 0.85rem; color: var(--text-secondary); }}
+        .param-label {{ font-size: 0.8rem; color: var(--text-secondary); }}
         .param-input {{
             width: 100px;
             padding: 6px 10px;
@@ -1226,32 +1331,32 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         .radio-option {{
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
             color: var(--text-secondary);
             font-size: 0.85rem;
             cursor: pointer;
-            padding: 4px 0;
+            padding: 2px 0;
         }}
         .radio-option:hover {{ color: var(--text-primary); }}
         .radio-option input {{ accent-color: var(--accent); width: 16px; height: 16px; }}
         .btn {{
-            padding: 10px 20px;
+            padding: 8px 16px;
             border: none;
-            border-radius: 6px;
-            font-size: 0.9rem;
+            border-radius: 5px;
+            font-size: 0.85rem;
             font-weight: 500;
             cursor: pointer;
             transition: all 0.2s;
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 8px;
+            gap: 6px;
         }}
         .btn-primary {{
             background: linear-gradient(135deg, var(--primary), var(--primary-light));
             color: white;
             width: 100%;
-            margin-top: 12px;
+            margin-top: 8px;
         }}
         .btn-primary:hover {{ background: linear-gradient(135deg, var(--primary-light), var(--accent)); }}
         .btn-primary:disabled {{ background: var(--border-color); cursor: not-allowed; }}
@@ -1260,12 +1365,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         }}
         .file-upload {{
             border: 2px dashed var(--border-color);
-            border-radius: 8px;
-            padding: 20px;
+            border-radius: 6px;
+            padding: 10px;
             text-align: center;
             cursor: pointer;
             transition: all 0.2s;
-            margin-bottom: 12px;
+            margin-bottom: 6px;
         }}
         .file-upload:hover {{ border-color: var(--accent); background: rgba(91, 163, 217, 0.1); }}
         .file-upload.loaded {{ border-color: var(--success); background: rgba(74, 222, 128, 0.1); }}
@@ -1290,15 +1395,21 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         .tab-btn:hover:not(.active) {{ color: #bbb; background: rgba(255,255,255,0.03); }}
         .tab-btn.active {{ background: var(--bg-main); color: #fff; border-top-color: var(--accent); }}
         .tab-content {{ flex: 1; padding: 0; overflow: hidden; display: flex; flex-direction: column; }}
-        .tab-panel {{ display: none; height: 100%; flex: 1; flex-direction: column; }}
+        .tab-panel {{ display: none; height: 100%; flex: 1; flex-direction: column; overflow: hidden; position: relative; }}
         .tab-panel.active {{ display: flex; }}
         .viz-container {{
             flex: 1;
             background: var(--bg-main);
-            position: relative;
-            min-height: 400px;
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            min-height: 0;
         }}
-        .viz-container .plotly-graph-div {{ width: 100% !important; height: 100% !important; }}
+        .viz-container .plotly-graph-div {{ width: 100% !important; height: 100% !important; position: absolute !important; top: 0 !important; left: 0 !important; }}
+        .viz-container .js-plotly-plot {{ width: 100% !important; height: 100% !important; }}
+        .viz-container .svg-container {{ width: 100% !important; height: 100% !important; }}
         .progress-bar {{
             height: 8px;
             background: var(--bg-input);
@@ -1521,6 +1632,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 16px;
             padding: 20px;
+            padding-top: 70px;  /* Space for floating buttons */
         }}
         .summary-card {{
             background: var(--bg-card);
@@ -1546,20 +1658,31 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             <div class="panel-title">Parameters</div>
 
             <!-- STL Input Section -->
-            <div class="sidebar-section">
+            <div class="sidebar-section expanded">
                 <div class="section-header" onclick="toggleSection(this)">
                     <span>STL Input</span>
                     <span class="arrow">&#9660;</span>
                 </div>
                 <div class="section-content">
                     <div class="file-upload" id="fileUpload" onclick="document.getElementById('fileInput').click()">
-                        <div style="font-size: 1.5rem; margin-bottom: 8px;">📁</div>
-                        <div id="fileUploadText">Click to upload STL file</div>
+                        <div style="font-size: 1.2rem; margin-bottom: 2px;">📁</div>
+                        <div id="fileUploadText" style="font-size: 0.8rem;">Click or drag STL file here</div>
                     </div>
                     <input type="file" id="fileInput" accept=".stl" style="display: none;" onchange="handleFileUpload(this)">
-                    <button class="btn btn-secondary" style="width: 100%; margin-top: 8px;" onclick="loadTestSTL()">Load Test STL</button>
+                    <div style="display: flex; gap: 4px; margin-top: 4px;">
+                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(1)">Test STL 1</button>
+                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(2)">Test STL 2</button>
+                    </div>
 
-                    <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color);">
+                    <!-- STL Info (shown when loaded) -->
+                    <div class="stl-info-inline" id="stlInfo" style="display: none; margin-top: 6px; padding: 4px 8px; background: rgba(0,127,163,0.1); border-radius: 4px; border: 1px solid rgba(0,127,163,0.2);">
+                        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.7rem; color: var(--text-secondary);">
+                            <span><span id="infoTriangles">-</span> triangles</span>
+                            <span id="infoDimensions">-</span>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border-color);">
                         <div class="param-row">
                             <span class="param-label">Voxel Size</span>
                             <input type="number" class="param-input" id="voxelSize" value="0.1" step="0.01">
@@ -1570,19 +1693,19 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <input type="number" class="param-input" id="layerThickness" value="0.04" step="0.01">
                             <span class="param-unit">mm</span>
                         </div>
-                        <div class="param-row" style="margin-top: 8px;">
+                        <div class="param-row" style="margin-top: 4px;">
                             <span class="param-label">Layer Grouping</span>
-                            <input type="range" id="layerGrouping" min="1" max="100" value="1" step="1" style="flex: 1; margin: 0 8px;" oninput="updateLayerGrouping()">
-                            <input type="number" class="param-input" id="layerGroupingValue" value="1" min="1" max="500" step="1" style="width: 65px;" onchange="syncLayerGrouping()">
+                            <input type="range" id="layerGrouping" min="1" max="100" value="25" step="1" style="flex: 1; margin: 0 6px;" oninput="updateLayerGrouping()">
+                            <input type="number" class="param-input" id="layerGroupingValue" value="25" min="1" max="500" step="1" style="width: 60px;" onchange="syncLayerGrouping()">
                         </div>
-                        <div style="display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.65rem; color: var(--text-secondary); margin-top: 2px;">
                             <span id="layerGroupingDim">= 0.04 mm effective</span>
                             <span id="layerGroupingLayers"></span>
                         </div>
-                        <div style="font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px;">
-                            <button class="btn btn-secondary" style="padding: 2px 8px; font-size: 0.7rem;" onclick="autoLayerGrouping()">Auto (~200 layers)</button>
+                        <div style="margin-top: 2px;">
+                            <button class="btn btn-secondary" style="padding: 2px 6px; font-size: 0.65rem;" onclick="autoLayerGrouping()">Auto (~200 layers)</button>
                         </div>
-                        <div class="param-row" style="margin-top: 12px;">
+                        <div class="param-row" style="margin-top: 6px;">
                             <span class="param-label">Build Direction</span>
                             <select class="param-input" id="buildDirection" style="flex: 1;" onchange="onBuildDirectionChange()">
                                 <option value="Z">Z-up (default)</option>
@@ -1602,13 +1725,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <span class="arrow">&#9660;</span>
                 </div>
                 <div class="section-content">
-                    <div style="margin-bottom: 12px;">
+                    <div style="margin-bottom: 6px;">
                         <label class="radio-option">
-                            <input type="radio" name="energyModel" value="area_only" checked onchange="updateModelVisibility()">
+                            <input type="radio" name="energyModel" value="area_only" onchange="updateModelVisibility()">
                             <span>Area-Only Mode (faster)</span>
                         </label>
                         <label class="radio-option">
-                            <input type="radio" name="energyModel" value="geometry_multiplier" onchange="updateModelVisibility()">
+                            <input type="radio" name="energyModel" value="geometry_multiplier" checked onchange="updateModelVisibility()">
                             <span>Geometry Multiplier Mode</span>
                         </label>
                     </div>
@@ -1622,11 +1745,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         <input type="number" class="param-input" id="convectionFactor" value="0.05" step="0.01" min="0" max="0.5">
                         <span class="param-unit"></span>
                     </div>
-
-                    <div id="geometryParams" style="display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color);">
+                    <div id="geometryParams" style="display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-color);">
                         <div class="param-row">
                             <span class="param-label">Sigma (σ)</span>
-                            <input type="number" class="param-input" id="sigmaMM" value="1.0" step="0.1">
+                            <input type="number" class="param-input" id="sigmaMM" value="1.0" step="0.1" onchange="onSigmaChange()">
                             <span class="param-unit">mm</span>
                         </div>
                         <div class="param-row">
@@ -1655,7 +1777,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         <input type="number" class="param-input" id="thresholdHigh" value="0.6" step="0.05" min="0" max="1">
                         <span class="param-unit"></span>
                     </div>
-                    <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 8px;">
+                    <div style="font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">
                         <strong style="color: var(--success);">LOW:</strong> score &lt; medium<br>
                         <strong style="color: var(--warning);">MEDIUM:</strong> medium ≤ score &lt; high<br>
                         <strong style="color: var(--danger);">HIGH:</strong> score ≥ high
@@ -1663,19 +1785,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- STL Info -->
-            <div class="info-card" id="stlInfo" style="display: none;">
-                <h4>STL Information</h4>
-                <div class="info-row"><span>File:</span><span id="infoFilename">-</span></div>
-                <div class="info-row"><span>Triangles:</span><span id="infoTriangles">-</span></div>
-                <div class="info-row"><span>Dimensions:</span><span id="infoDimensions">-</span></div>
-            </div>
         </aside>
 
         <!-- Main Content -->
         <main class="content">
             <nav class="tab-nav">
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
+                <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
@@ -1702,6 +1818,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="viz-container" id="previewPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Load an STL file to preview
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sliced Layers Tab -->
+                <div class="tab-panel" id="tab-slices">
+                    <div class="viz-container" id="slicesPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see sliced layers with kernel visualization
                         </div>
                     </div>
                 </div>
@@ -1759,6 +1884,18 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <input type="range" id="markerSize" min="1" max="10" value="4" onchange="updateMarkerSize(this.value)">
                 </div>
             </div>
+
+            <div class="viz-block" id="kernelVizBlock" style="display: none;">
+                <div class="block-title">Kernel Visualization</div>
+                <div class="control-group">
+                    <label>Kernel Count <span class="value" id="kernelCountVal">10</span></label>
+                    <input type="range" id="kernelCount" min="5" max="100" value="10" onchange="updateKernelCount(this.value)">
+                </div>
+                <div class="control-group">
+                    <label>Opacity <span class="value" id="kernelOpacityVal">0.8</span></label>
+                    <input type="range" id="kernelOpacity" min="0.1" max="1.0" step="0.1" value="0.8" onchange="updateKernelOpacity(this.value)">
+                </div>
+            </div>
         </aside>
     </div>
 
@@ -1769,11 +1906,28 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         let stlLoaded = false;
         let currentEventSource = null;  // Track EventSource for cleanup
 
-        // Toggle section expand/collapse
+        // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
-            header.classList.toggle('collapsed');
-            const content = header.nextElementSibling;
-            content.classList.toggle('collapsed');
+            const section = header.parentElement;
+            const isCurrentlyCollapsed = header.classList.contains('collapsed');
+
+            // Collapse all sections first (accordion behavior)
+            document.querySelectorAll('.sidebar-section').forEach(sec => {{
+                const h = sec.querySelector('.section-header');
+                const c = sec.querySelector('.section-content');
+                if (h && c) {{
+                    h.classList.add('collapsed');
+                    c.classList.add('collapsed');
+                    sec.classList.remove('expanded');
+                }}
+            }});
+
+            // If the clicked section was collapsed, expand it
+            if (isCurrentlyCollapsed) {{
+                header.classList.remove('collapsed');
+                header.nextElementSibling.classList.remove('collapsed');
+                section.classList.add('expanded');
+            }}
         }}
 
         // Update geometry params visibility
@@ -1790,7 +1944,40 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 evt.target.classList.add('active');
             }}
             document.getElementById('tab-' + tabName).classList.add('active');
+
+            // Resize Plotly plots after tab becomes visible
+            setTimeout(() => {{
+                const plotIds = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot' }};
+                const plotId = plotIds[tabName];
+                if (plotId) {{
+                    const plotEl = document.getElementById(plotId);
+                    if (plotEl && plotEl.data) {{
+                        Plotly.Plots.resize(plotEl);
+                    }}
+                }}
+            }}, 50);
+
+            // Show/hide kernel visualization controls
+            const kernelBlock = document.getElementById('kernelVizBlock');
+            if (kernelBlock) {{
+                kernelBlock.style.display = (tabName === 'slices') ? 'block' : 'none';
+            }}
         }}
+
+        // Resize all visible Plotly plots
+        function resizeAllPlots() {{
+            ['previewPlot', 'slicesPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
+                const plotEl = document.getElementById(plotId);
+                if (plotEl && plotEl.data) {{
+                    Plotly.Plots.resize(plotEl);
+                }}
+            }});
+        }}
+
+        // Window resize handler
+        window.addEventListener('resize', () => {{
+            setTimeout(resizeAllPlots, 100);
+        }});
 
         // Log to floating console
         function logConsole(message, type = '') {{
@@ -1862,15 +2049,19 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             logConsole('Auto layer grouping: ' + grouping + ' (~' + Math.ceil(zHeight / (grouping * layerThickness)) + ' layers)', 'info');
         }}
 
-        // Load test STL
-        async function loadTestSTL() {{
-            logConsole('Loading test STL...', 'info');
+        // Load test STL (stlIndex: 1 or 2)
+        async function loadTestSTL(stlIndex = 1) {{
+            logConsole('Loading test STL ' + stlIndex + '...', 'info');
 
             try {{
-                const response = await fetch('/api/load_test_stl', {{ method: 'POST' }});
+                const response = await fetch('/api/load_test_stl?index=' + stlIndex, {{ method: 'POST' }});
                 const data = await response.json();
 
                 if (data.status === 'success') {{
+                    // Clear previous analysis results
+                    analysisResults = null;
+                    currentSessionId = null;
+
                     stlLoaded = true;
                     stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
@@ -1878,7 +2069,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     document.getElementById('fileUploadText').textContent = data.filename || 'Test STL';
 
                     document.getElementById('stlInfo').style.display = 'block';
-                    document.getElementById('infoFilename').textContent = data.filename || 'Test STL';
                     document.getElementById('infoTriangles').textContent = data.info.n_triangles.toLocaleString();
                     const dims = data.info.dimensions;
                     document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
@@ -1915,6 +2105,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 const data = await response.json();
 
                 if (data.status === 'success') {{
+                    // Clear previous analysis results
+                    analysisResults = null;
+                    currentSessionId = null;
+
                     stlLoaded = true;
                     stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
@@ -1922,7 +2116,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     document.getElementById('fileUploadText').textContent = file.name;
 
                     document.getElementById('stlInfo').style.display = 'block';
-                    document.getElementById('infoFilename').textContent = data.filename;
                     document.getElementById('infoTriangles').textContent = data.info.n_triangles.toLocaleString();
                     const dims = data.info.dimensions;
                     document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
@@ -1932,19 +2125,37 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                     // Render 3D STL preview
                     renderSTLPreview();
+
+                    // Clear file input to allow reselecting same file
+                    input.value = '';
                 }} else {{
                     logConsole('Error: ' + data.message, 'error');
+                    input.value = '';  // Clear on error too
                 }}
             }} catch (err) {{
                 logConsole('Upload failed: ' + err.message, 'error');
             }}
         }}
 
-        // Run analysis
+        // Run analysis (can be called during existing run to restart with new params)
         async function runAnalysis() {{
             if (!stlLoaded) {{
                 logConsole('Please upload an STL file first', 'warning');
                 return;
+            }}
+
+            // If already running, cancel the previous session first
+            if (currentSessionId && currentEventSource) {{
+                logConsole('Cancelling previous analysis...', 'warning');
+                try {{
+                    await fetch('/api/cancel/' + currentSessionId, {{ method: 'POST' }});
+                }} catch (e) {{
+                    // Ignore cancel errors
+                }}
+                if (currentEventSource) {{
+                    currentEventSource.close();
+                    currentEventSource = null;
+                }}
             }}
 
             const params = {{
@@ -1962,7 +2173,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }};
 
             const runBtn = document.getElementById('runBtn');
-            runBtn.disabled = true;
+            // Don't disable - allow rerun
             runBtn.classList.add('running');
             runBtn.innerHTML = '&#9632; Running...';
             runBtn.style.setProperty('--progress', '0%');
@@ -1990,13 +2201,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     logConsole('Error: ' + data.message, 'error');
                     runBtn.classList.remove('running');
                     runBtn.innerHTML = '&#9654; Run Analysis';
-                    runBtn.disabled = false;
                 }}
             }} catch (err) {{
                 logConsole('Analysis failed: ' + err.message, 'error');
                 runBtn.classList.remove('running');
                 runBtn.innerHTML = '&#9654; Run Analysis';
-                runBtn.disabled = false;
             }}
         }}
 
@@ -2029,7 +2238,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     currentEventSource = null;
                     runBtn.classList.remove('running');
                     runBtn.innerHTML = '&#9654; Run Analysis';
-                    runBtn.disabled = false;
                     logConsole('Analysis complete!', 'success');
                     loadResults(sessionId);
                 }} else if (data.status === 'error') {{
@@ -2037,7 +2245,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     currentEventSource = null;
                     runBtn.classList.remove('running');
                     runBtn.innerHTML = '&#9654; Run Analysis';
-                    runBtn.disabled = false;
                     logConsole('Error: ' + (data.error || 'Unknown error'), 'error');
                 }}
             }};
@@ -2048,7 +2255,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 const runBtn = document.getElementById('runBtn');
                 runBtn.classList.remove('running');
                 runBtn.innerHTML = '&#9654; Run Analysis';
-                runBtn.disabled = false;
                 logConsole('Connection lost', 'error');
             }};
         }}
@@ -2062,7 +2268,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 if (data.status === 'success') {{
                     analysisResults = data.results;
                     updateVisualizations();
-                    document.getElementById('runBtn').disabled = false;
                 }}
             }} catch (err) {{
                 logConsole('Failed to load results: ' + err.message, 'error');
@@ -2080,6 +2285,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             // Render 3D layer surfaces for Energy and Risk tabs
             renderLayerSurfaces('energy');
             renderLayerSurfaces('risk');
+
+            // Render sliced layers with kernel visualization
+            renderSlicesPlot();
 
             document.getElementById('riskLegend').style.display = 'block';
 
@@ -2189,8 +2397,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         j: j,
                         k: k,
                         color: color,
-                        opacity: 0.9,
+                        opacity: 1.0,  // Full opacity for proper depth sorting
                         flatshading: true,
+                        lighting: {{ ambient: 0.8, diffuse: 0.5, specular: 0.1, roughness: 0.5 }},
+                        lightposition: {{ x: 1000, y: 1000, z: 1000 }},
                         hovertemplate: 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>',
                         showscale: false
                     }});
@@ -2251,7 +2461,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 const zPad = (zRange[1] - zRange[0]) * padding;
 
                 const layout = {{
-                    title: {{ text: config.title + ' (' + data.n_valid_layers + ' layers)', font: {{ color: '#fff', size: 14 }} }},
+                    title: {{ text: config.title + ' (' + data.n_valid_layers + ' layers)', font: {{ color: '#fff', size: 14 }}, x: 0.5, y: 0.98 }},
                     paper_bgcolor: '{BG_MAIN}',
                     plot_bgcolor: '{BG_MAIN}',
                     scene: {{
@@ -2259,12 +2469,23 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         yaxis: {{ title: 'Y (mm)', color: '#aaa', gridcolor: '#333', range: [yRange[0] - yPad, yRange[1] + yPad] }},
                         zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
                         bgcolor: '{BG_MAIN}',
-                        aspectmode: 'data'
+                        aspectmode: 'data',
+                        domain: {{ x: [0, 0.92], y: [0, 1] }}
                     }},
-                    margin: {{ l: 0, r: 80, t: 40, b: 0 }}
+                    margin: {{ l: 0, r: 0, t: 30, b: 0 }},
+                    autosize: true
                 }};
 
-                Plotly.newPlot(config.plotId, traces, layout, {{ responsive: true, displayModeBar: true }});
+                Plotly.newPlot(config.plotId, traces, layout, {{ responsive: true, displayModeBar: false }});
+
+                // Force resize after plot is created (fixes sizing when tab is hidden)
+                setTimeout(() => {{
+                    const plotEl = document.getElementById(config.plotId);
+                    if (plotEl && plotEl.data) {{
+                        Plotly.Plots.resize(plotEl);
+                    }}
+                }}, 100);
+
                 logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
 
             }} catch (e) {{
@@ -2273,17 +2494,254 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }}
         }}
 
+        // Global storage for slice visualization data (to update kernels without re-fetching)
+        let sliceVizData = null;
+
+        // Render sliced layers with kernel visualization
+        async function renderSlicesPlot() {{
+            if (!currentSessionId) return;
+
+            logConsole('Loading sliced layers visualization...', 'info');
+
+            try {{
+                const response = await fetch('/api/slice_visualization/' + currentSessionId);
+                if (!response.ok) {{
+                    logConsole('Failed to load slices: HTTP ' + response.status, 'error');
+                    return;
+                }}
+
+                const data = await response.json();
+                if (data.status !== 'success') {{
+                    logConsole('Slices error: ' + (data.message || 'Unknown'), 'error');
+                    return;
+                }}
+
+                // Store globally for kernel updates
+                sliceVizData = data;
+
+                // Actually render the plot
+                updateSlicesPlotWithKernels();
+
+                logConsole('Sliced layers loaded: ' + data.n_valid_layers + ' layers', 'success');
+
+            }} catch (e) {{
+                console.error(e);
+                logConsole('Error loading slices: ' + e.message, 'error');
+            }}
+        }}
+
+        // Update slices plot with current sigma/kernel settings (no re-fetch)
+        function updateSlicesPlotWithKernels() {{
+            if (!sliceVizData) return;
+
+            const data = sliceVizData;
+            const sigmaMM = parseFloat(document.getElementById('sigmaMM').value) || 1.0;
+            const kernelCount = parseInt(document.getElementById('kernelCount').value) || 10;
+
+            // Create mesh3d traces for layers (neutral gray color)
+            const traces = [];
+            const allX = [], allY = [], allZ = [];
+
+            // Layer surfaces
+            data.layers.forEach((layerData, idx) => {{
+                if (!layerData.vertices || layerData.vertices.length === 0) return;
+
+                const vertices = layerData.vertices;
+                const faces = layerData.faces;
+                const x = vertices.map(v => v[0]);
+                const y = vertices.map(v => v[1]);
+                const z = vertices.map(v => v[2]);
+
+                allX.push(...x);
+                allY.push(...y);
+                allZ.push(...z);
+
+                // Alternate colors for layer visibility (solid colors for proper depth sorting)
+                const color = (idx % 2 === 0) ? 'rgb(100, 150, 200)' : 'rgb(80, 130, 180)';
+
+                traces.push({{
+                    type: 'mesh3d',
+                    x: x,
+                    y: y,
+                    z: z,
+                    i: faces.map(f => f[0]),
+                    j: faces.map(f => f[1]),
+                    k: faces.map(f => f[2]),
+                    color: color,
+                    opacity: 1.0,  // Full opacity for proper depth sorting
+                    flatshading: true,
+                    lighting: {{ ambient: 0.8, diffuse: 0.5, specular: 0.1, roughness: 0.5 }},
+                    lightposition: {{ x: 1000, y: 1000, z: 1000 }},
+                    hovertemplate: 'Layer ' + layerData.layer + '<br>Z: %{{z:.2f}} mm<extra></extra>',
+                    name: 'Layer ' + layerData.layer,
+                    showlegend: false
+                }});
+            }});
+
+            // Add half-sphere kernels at random edge points
+            if (data.edge_points && data.edge_points.length > 0) {{
+                const kernelTraces = generateKernelTraces(data.edge_points, sigmaMM, kernelCount);
+                traces.push(...kernelTraces);
+            }}
+
+            // Calculate scene bounds with padding
+            if (allX.length === 0) return;
+
+            const padding = 0.15;
+            const xRange = [Math.min(...allX), Math.max(...allX)];
+            const yRange = [Math.min(...allY), Math.max(...allY)];
+            const zRange = [Math.min(...allZ), Math.max(...allZ)];
+            const xPad = (xRange[1] - xRange[0]) * padding;
+            const yPad = (yRange[1] - yRange[0]) * padding;
+            const zPad = (zRange[1] - zRange[0]) * padding;
+
+            const layout = {{
+                title: {{ text: 'Sliced Layers (' + data.n_valid_layers + ' layers) - Kernel σ=' + sigmaMM.toFixed(1) + 'mm', font: {{ color: '#fff', size: 14 }}, x: 0.5, y: 0.98 }},
+                paper_bgcolor: '{BG_MAIN}',
+                plot_bgcolor: '{BG_MAIN}',
+                scene: {{
+                    xaxis: {{ title: 'X (mm)', color: '#aaa', gridcolor: '#333', range: [xRange[0] - xPad, xRange[1] + xPad] }},
+                    yaxis: {{ title: 'Y (mm)', color: '#aaa', gridcolor: '#333', range: [yRange[0] - yPad, yRange[1] + yPad] }},
+                    zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
+                    bgcolor: '{BG_MAIN}',
+                    aspectmode: 'data',
+                    domain: {{ x: [0, 1], y: [0, 1] }}
+                }},
+                margin: {{ l: 0, r: 0, t: 30, b: 0 }},
+                autosize: true
+            }};
+
+            Plotly.newPlot('slicesPlot', traces, layout, {{ responsive: true, displayModeBar: false }});
+
+            // Force resize after plot is created
+            setTimeout(() => {{
+                const plotEl = document.getElementById('slicesPlot');
+                if (plotEl && plotEl.data) {{
+                    Plotly.Plots.resize(plotEl);
+                }}
+            }}, 100);
+        }}
+
+        // Generate half-sphere kernel traces with gradient shells
+        function generateKernelTraces(edgePoints, sigmaMM, count) {{
+            const opacity = parseFloat(document.getElementById('kernelOpacity').value) || 0.8;
+            const radius = sigmaMM * 2;  // Visual radius based on sigma (2σ covers ~95% of Gaussian)
+
+            // Randomly select 'count' edge points
+            const shuffled = [...edgePoints].sort(() => Math.random() - 0.5);
+            const selected = shuffled.slice(0, Math.min(count, edgePoints.length));
+
+            const traces = [];
+            const numShells = 4;  // Number of concentric shells
+            const resolution = 12;
+
+            // Color gradient: bright red at center -> fading to transparent at edge
+            const colors = [
+                `rgba(255, 50, 50, ${{opacity}})`,           // Inner - bright red
+                `rgba(255, 100, 50, ${{opacity * 0.7}})`,    // Orange-red
+                `rgba(255, 150, 80, ${{opacity * 0.4}})`,    // Light orange
+                `rgba(255, 200, 150, ${{opacity * 0.2}})`    // Pale, nearly transparent
+            ];
+
+            selected.forEach((point) => {{
+                const [px, py, pz] = point;
+
+                // Generate concentric shells from inside out
+                for (let shell = 0; shell < numShells; shell++) {{
+                    const shellRadius = radius * (shell + 1) / numShells;
+                    const halfSphere = generateHalfSphereMesh(shellRadius, resolution);
+
+                    traces.push({{
+                        type: 'mesh3d',
+                        x: halfSphere.x.map(v => v + px),
+                        y: halfSphere.y.map(v => v + py),
+                        z: halfSphere.z.map(v => v + pz),
+                        i: halfSphere.i,
+                        j: halfSphere.j,
+                        k: halfSphere.k,
+                        color: colors[shell],
+                        flatshading: false,
+                        opacity: 1,  // Using color alpha instead
+                        hovertemplate: `Kernel (σ=${{sigmaMM.toFixed(1)}}mm, shell ${{shell+1}}/${{numShells}})<extra></extra>`,
+                        name: 'Kernel Shell',
+                        showlegend: false
+                    }});
+                }}
+            }});
+
+            return traces;
+        }}
+
+        // Helper: Generate half-sphere mesh pointing downward
+        function generateHalfSphereMesh(radius, segments) {{
+            const vertices = {{ x: [], y: [], z: [] }};
+            const faces = {{ i: [], j: [], k: [] }};
+
+            for (let lat = 0; lat <= segments / 2; lat++) {{
+                const theta = (lat / segments) * Math.PI;
+                const sinTheta = Math.sin(theta);
+                const cosTheta = Math.cos(theta);
+
+                for (let lon = 0; lon <= segments; lon++) {{
+                    const phi = (lon / segments) * 2 * Math.PI;
+                    vertices.x.push(radius * sinTheta * Math.cos(phi));
+                    vertices.y.push(radius * sinTheta * Math.sin(phi));
+                    vertices.z.push(-radius * cosTheta);  // Downward
+                }}
+            }}
+
+            const latCount = Math.floor(segments / 2) + 1;
+            const lonCount = segments + 1;
+
+            for (let lat = 0; lat < latCount - 1; lat++) {{
+                for (let lon = 0; lon < segments; lon++) {{
+                    const first = lat * lonCount + lon;
+                    const second = first + lonCount;
+                    faces.i.push(first, second);
+                    faces.j.push(first + 1, second + 1);
+                    faces.k.push(second, first + 1);
+                }}
+            }}
+
+            return {{ x: vertices.x, y: vertices.y, z: vertices.z, i: faces.i, j: faces.j, k: faces.k }};
+        }}
+
+        // Update kernel count from slider
+        function updateKernelCount(value) {{
+            document.getElementById('kernelCountVal').textContent = value;
+            if (sliceVizData) {{
+                updateSlicesPlotWithKernels();
+            }}
+        }}
+
+        // Update kernel opacity
+        function updateKernelOpacity(value) {{
+            document.getElementById('kernelOpacityVal').textContent = value;
+            if (sliceVizData) {{
+                updateSlicesPlotWithKernels();
+            }}
+        }}
+
+        // Handle sigma parameter change - update kernel visualization without re-slicing
+        function onSigmaChange() {{
+            if (sliceVizData) {{
+                logConsole('Sigma changed - updating kernel visualization', 'info');
+                updateSlicesPlotWithKernels();
+            }}
+        }}
+
         // Apply build direction rotation to coordinates (for preview)
+        // Must match backend trimesh rotation: -90° around X for Y-up, etc.
         function applyBuildDirectionRotation(x, y, z, buildDir) {{
             if (buildDir === 'Y') {{
-                // Rotate Y to Z: swap Y and Z, negate new Y
-                return {{ x: x, y: z.map(v => -v), z: y }};
+                // Backend: -90° around X axis: (x,y,z) -> (x, z, -y)
+                return {{ x: x, y: z, z: y.map(v => -v) }};
             }} else if (buildDir === 'Y-') {{
-                // Rotate Y to Z then flip: swap Y and Z, negate both
-                return {{ x: x, y: z.map(v => -v), z: y.map(v => -v) }};
+                // Backend: -90° around X then flip Z: (x,y,z) -> (x, z, y)
+                return {{ x: x, y: z, z: y }};
             }} else if (buildDir === 'X') {{
-                // Rotate X to Z: swap X and Z, negate new X
-                return {{ x: z.map(v => -v), y: y, z: x }};
+                // Backend: 90° around Y axis: (x,y,z) -> (z, y, -x)
+                return {{ x: z, y: y, z: x.map(v => -v) }};
             }}
             // Z-up (default): no rotation
             return {{ x, y, z }};
@@ -2358,7 +2816,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                 const dirLabel = buildDir === 'Z' ? '' : ' (' + buildDir + '-up)';
                 const layout = {{
-                    title: {{ text: 'STL Preview (' + data.n_triangles + ' triangles)' + dirLabel, font: {{ color: '#fff', size: 14 }} }},
+                    title: {{ text: 'STL Preview (' + data.n_triangles + ' triangles)' + dirLabel, font: {{ color: '#fff', size: 14 }}, x: 0.5, y: 0.98 }},
                     paper_bgcolor: '{BG_MAIN}',
                     plot_bgcolor: '{BG_MAIN}',
                     scene: {{
@@ -2366,12 +2824,23 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         yaxis: {{ title: 'Y (mm)', color: '#aaa', gridcolor: '#333', range: [yRange[0] - yPad, yRange[1] + yPad] }},
                         zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
                         bgcolor: '{BG_MAIN}',
-                        aspectmode: 'data'
+                        aspectmode: 'data',
+                        domain: {{ x: [0, 1], y: [0, 1] }}
                     }},
-                    margin: {{ l: 0, r: 20, t: 40, b: 0 }}
+                    margin: {{ l: 0, r: 0, t: 30, b: 0 }},
+                    autosize: true
                 }};
 
-                Plotly.newPlot('previewPlot', [trace], layout, {{ responsive: true, displayModeBar: true }});
+                Plotly.newPlot('previewPlot', [trace], layout, {{ responsive: true, displayModeBar: false }});
+
+                // Force resize after plot is created
+                setTimeout(() => {{
+                    const plotEl = document.getElementById('previewPlot');
+                    if (plotEl && plotEl.data) {{
+                        Plotly.Plots.resize(plotEl);
+                    }}
+                }}, 100);
+
                 logConsole('STL preview loaded: ' + data.n_triangles + ' triangles' + (buildDir !== 'Z' ? ' (' + buildDir + '-up)' : ''), 'success');
 
             }} catch (e) {{
