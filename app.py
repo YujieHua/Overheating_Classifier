@@ -1226,17 +1226,17 @@ def get_stl_preview():
 # =============================================================================
 # MAIN PAGE - EMBEDDED HTML/CSS/JS
 # =============================================================================
-PRIMARY_COLOR = '#1E3765'
-PRIMARY_DARK = '#152850'
-PRIMARY_LIGHT = '#2a4a80'
-ACCENT_COLOR = '#007FA3'
-BG_PAGE = '#080c14'
-BG_HEADER = '#0c1018'
-BG_SIDEBAR = '#141c28'
-BG_TABS = '#101620'
-BG_CARD = '#1a2436'
+PRIMARY_COLOR = '#1E6537'
+PRIMARY_DARK = '#154a28'
+PRIMARY_LIGHT = '#2a804a'
+ACCENT_COLOR = '#00A35F'
+BG_PAGE = '#080e0c'
+BG_HEADER = '#0c1810'
+BG_SIDEBAR = '#141c1a'
+BG_TABS = '#101a16'
+BG_CARD = '#1a3426'
 BG_MAIN = '#1a1a1a'
-BG_INPUT = '#0e1420'
+BG_INPUT = '#0e1a14'
 
 HTML_TEMPLATE = f'''<!DOCTYPE html>
 <html lang="en">
@@ -1259,7 +1259,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             --bg-input: {BG_INPUT};
             --text-primary: #ffffff;
             --text-secondary: #a0a0a0;
-            --border-color: rgba(30, 55, 101, 0.4);
+            --border-color: rgba(30, 101, 55, 0.4);
             --success: #4ade80;
             --warning: #fbbf24;
             --danger: #f87171;
@@ -1326,7 +1326,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             transition: all 0.3s ease;
         }}
         .sidebar-section.expanded {{
-            background: #1f2d42;
+            background: #1f422d;
             box-shadow: 0 4px 20px rgba(0, 127, 163, 0.25), 0 0 0 1px rgba(0, 127, 163, 0.3);
             border-color: rgba(0, 127, 163, 0.4);
         }}
@@ -1413,7 +1413,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             transition: all 0.2s;
             margin-bottom: 6px;
         }}
-        .file-upload:hover {{ border-color: var(--accent); background: rgba(91, 163, 217, 0.1); }}
+        .file-upload:hover {{ border-color: var(--accent); background: rgba(91, 217, 163, 0.1); }}
         .file-upload.loaded {{ border-color: var(--success); background: rgba(74, 222, 128, 0.1); }}
         .content {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
         .tab-nav {{
@@ -1580,11 +1580,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         }}
 
         .floating-console-content .error {{ color: #ff6b6b; font-weight: 500; }}
-        .floating-console-content .info {{ color: #74b9ff; }}
+        .floating-console-content .info {{ color: #74ffb9; }}
         .floating-console-content .warn {{ color: #ffeaa7; }}
         .floating-console-content .success {{ color: #55efc4; font-weight: 500; }}
         .floating-console-content .progress {{ color: #a29bfe; }}
-        .floating-console-content .stage {{ color: #5BA3D9; font-weight: 600; }}
+        .floating-console-content .stage {{ color: #5BD9A3; font-weight: 600; }}
 
         /* Floating Run Analysis button */
         .floating-simulate-btn {{
@@ -1640,7 +1640,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             background: rgba(10, 15, 30, 0.9);
             padding: 10px;
             border-radius: 6px;
-            border: 1px solid rgba(100, 150, 200, 0.2);
+            border: 1px solid rgba(100, 200, 150, 0.2);
             z-index: 50;
         }}
         .risk-item {{ display: flex; align-items: center; gap: 6px; font-size: 0.75rem; margin: 4px 0; }}
@@ -2326,9 +2326,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 if (data.status === 'complete') {{
                     evtSource.close();
                     currentEventSource = null;
-                    runBtn.classList.remove('running');
-                    runBtn.innerHTML = '&#9654; Run Analysis';
-                    logConsole('Analysis complete!', 'success');
+                    // Keep button in running state - loadResults will finish it
+                    runBtn.style.setProperty('--progress', '90%');
+                    runBtn.innerHTML = '&#9632; Loading results...';
+                    logConsole('Analysis complete! Loading visualizations...', 'success');
                     loadResults(sessionId);
                 }} else if (data.status === 'error') {{
                     evtSource.close();
@@ -2351,41 +2352,56 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Load results
         async function loadResults(sessionId) {{
+            const runBtn = document.getElementById('runBtn');
             try {{
                 const response = await fetch('/api/results/' + sessionId);
                 const data = await response.json();
 
                 if (data.status === 'success') {{
                     analysisResults = data.results;
-                    updateVisualizations();
+                    await updateVisualizations();
                 }}
             }} catch (err) {{
                 logConsole('Failed to load results: ' + err.message, 'error');
+            }} finally {{
+                // Now that all visualizations are rendered, mark as complete
+                runBtn.classList.remove('running');
+                runBtn.innerHTML = '&#9654; Run Analysis';
+                runBtn.style.setProperty('--progress', '0%');
             }}
         }}
 
-        // Update all visualizations
-        function updateVisualizations() {{
+        // Update all visualizations (sequential to avoid UI freeze)
+        async function updateVisualizations() {{
             if (!analysisResults) return;
 
+            const runBtn = document.getElementById('runBtn');
             const nLayers = analysisResults.n_layers;
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
-            // Render sliced layers first (populates sliceVizData for kernel overlay)
-            renderSlicesPlot();
+            const vizSteps = [
+                {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
+                {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
+                {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
+                {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
+                {{ label: 'Gaussian Factor', fn: () => renderLayerSurfaces('gaussian_factor') }},
+                {{ label: 'Combined Factor', fn: () => renderLayerSurfaces('combined_factor') }},
+                {{ label: 'Summary', fn: () => updateSummary() }}
+            ];
 
-            // Render 3D layer surfaces for all tabs
-            renderLayerSurfaces('energy');
-            renderLayerSurfaces('risk');
-            renderLayerSurfaces('area_ratio');
-            renderLayerSurfaces('gaussian_factor');
-            renderLayerSurfaces('combined_factor');
+            for (let i = 0; i < vizSteps.length; i++) {{
+                const step = vizSteps[i];
+                const pct = 90 + Math.round((i / vizSteps.length) * 10);
+                runBtn.style.setProperty('--progress', pct + '%');
+                runBtn.innerHTML = '&#9632; ' + step.label + '... ' + (i + 1) + '/' + vizSteps.length;
+                // Yield to browser to update UI before rendering
+                await new Promise(r => setTimeout(r, 20));
+                await step.fn();
+            }}
 
             document.getElementById('riskLegend').style.display = 'block';
-
-            // Summary
-            updateSummary();
+            logConsole('All visualizations loaded', 'success');
         }}
 
         // Unified layer surface rendering for 3D visualization
@@ -2642,9 +2658,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 // Actually render the plot
                 updateSlicesPlotWithKernels();
 
-                // Re-render gaussian_factor to add kernel overlay now that edge_points are available
-                renderLayerSurfaces('gaussian_factor');
-
                 logConsole('Sliced layers loaded: ' + data.n_valid_layers + ' layers', 'success');
 
             }} catch (e) {{
@@ -2678,7 +2691,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 allZ.push(...z);
 
                 // Alternate colors for layer visibility (solid colors for proper depth sorting)
-                const color = (idx % 2 === 0) ? 'rgb(100, 150, 200)' : 'rgb(80, 130, 180)';
+                const color = (idx % 2 === 0) ? 'rgb(100, 200, 150)' : 'rgb(80, 180, 130)';
 
                 traces.push({{
                     type: 'mesh3d',
@@ -2911,7 +2924,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     i: i,
                     j: j,
                     k: k,
-                    color: '#5BA3D9',
+                    color: '#5BD9A3',
                     opacity: 1.0,
                     flatshading: true,
                     hovertemplate: 'X: %{{x:.2f}} mm<br>Y: %{{y:.2f}} mm<br>Z: %{{z:.2f}} mm<extra></extra>'
