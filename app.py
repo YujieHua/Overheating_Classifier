@@ -439,7 +439,7 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
             mesh_info=mesh_info,
             voxel_size=voxel_size,
             layer_thickness=layer_thickness,
-            layer_grouping=1,  # Default grouping for preview slicing
+            layer_grouping=25,  # Default grouping for preview slicing
             progress_callback=progress_with_cancel
         )
 
@@ -449,7 +449,7 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 current_state['cached_slice_params'] = {
                     'voxel_size': voxel_size,
                     'layer_thickness': layer_thickness,
-                    'layer_grouping': 1  # Default for preview slicing
+                    'layer_grouping': 25  # Default for preview slicing
                 }
                 current_state['cached_slice_info'] = {
                     'n_layers': slice_result['n_layers'],
@@ -539,7 +539,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
 
         voxel_size = params.get('voxel_size', 0.1)
         layer_thickness = params.get('layer_thickness', 0.04)
-        layer_grouping = params.get('layer_grouping', 1)
+        layer_grouping = params.get('layer_grouping', 25)
         build_direction = params.get('build_direction', 'Z')
         dissipation_factor = params.get('dissipation_factor', 0.5)
         convection_factor = params.get('convection_factor', 0.05)
@@ -912,6 +912,47 @@ def get_layer_surfaces(session_id, data_type):
         value_label = 'Risk Level'
         min_val = 0
         max_val = 2
+    elif data_type == 'area_ratio':
+        layer_areas = results.get('layer_areas', {})
+        contact_areas = results.get('contact_areas', {})
+        layer_values = {}
+        for k in layer_areas:
+            a_layer = float(layer_areas[k])
+            a_contact = float(contact_areas.get(k, 0))
+            ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
+            layer_values[int(k)] = ratio
+        value_label = 'Area Ratio (A_contact / A_layer)'
+        min_val = 0.0
+        max_val = 1.0
+    elif data_type == 'gaussian_factor':
+        G_layers = results.get('G_layers')
+        if G_layers is None:
+            return jsonify({'status': 'error', 'message': 'Gaussian factor only available in Mode B'}), 400
+        layer_values = {}
+        for k, g_val in G_layers.items():
+            g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
+            layer_values[int(k)] = 1.0 / (1.0 + g_avg)
+        value_label = 'Gaussian Factor 1/(1+G)'
+        min_val = 0.0
+        max_val = 1.0
+    elif data_type == 'combined_factor':
+        G_layers = results.get('G_layers')
+        if G_layers is None:
+            return jsonify({'status': 'error', 'message': 'Combined factor only available in Mode B'}), 400
+        layer_areas = results.get('layer_areas', {})
+        contact_areas = results.get('contact_areas', {})
+        layer_values = {}
+        for k in layer_areas:
+            a_layer = float(layer_areas[k])
+            a_contact = float(contact_areas.get(k, 0))
+            area_ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
+            g_val = G_layers.get(int(k), G_layers.get(k, 0))
+            g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
+            gaussian_factor = 1.0 / (1.0 + g_avg)
+            layer_values[int(k)] = min(1.0, area_ratio * gaussian_factor)
+        value_label = 'Combined Geometry Factor'
+        min_val = 0.0
+        max_val = 1.0
     else:
         return jsonify({'status': 'error', 'message': f'Unknown data type: {data_type}'}), 400
 
@@ -1795,6 +1836,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
+                <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
+                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Factor</button>
+                <button class="tab-btn" onclick="switchTab('combined', event)">Combined Factor</button>
             </nav>
 
             <div class="tab-content" style="position: relative;">
@@ -1859,6 +1903,33 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="summary-grid" id="summaryContent">
                         <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); padding: 40px;">
                             Run analysis to see summary
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Area Ratio Tab -->
+                <div class="tab-panel" id="tab-area_ratio">
+                    <div class="viz-container" id="areaRatioPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see area ratio (A_contact / A_layer)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Gaussian Factor Tab -->
+                <div class="tab-panel" id="tab-gaussian">
+                    <div class="viz-container" id="gaussianPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see Gaussian factor 1/(1+G)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Combined Factor Tab -->
+                <div class="tab-panel" id="tab-combined">
+                    <div class="viz-container" id="combinedPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see combined geometry factor
                         </div>
                     </div>
                 </div>
@@ -2285,6 +2356,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             // Render 3D layer surfaces for Energy and Risk tabs
             renderLayerSurfaces('energy');
             renderLayerSurfaces('risk');
+            renderLayerSurfaces('area_ratio');
+            renderLayerSurfaces('gaussian_factor');
+            renderLayerSurfaces('combined_factor');
 
             // Render sliced layers with kernel visualization
             renderSlicesPlot();
@@ -2301,7 +2375,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             const plotConfig = {{
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
-                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }}
+                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }},
+                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)' }},
+                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Factor 1/(1+G)' }},
+                'combined_factor': {{ plotId: 'combinedPlot', title: 'Combined Geometry Factor' }}
             }};
 
             const config = plotConfig[dataType];
