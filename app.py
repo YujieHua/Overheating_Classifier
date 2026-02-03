@@ -1833,12 +1833,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             <nav class="tab-nav">
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
                 <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
-                <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
-                <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
-                <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
                 <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
                 <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Factor</button>
                 <button class="tab-btn" onclick="switchTab('combined', event)">Combined Factor</button>
+                <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
+                <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
+                <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
 
             <div class="tab-content" style="position: relative;">
@@ -1870,7 +1870,34 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <div class="tab-panel" id="tab-slices">
                     <div class="viz-container" id="slicesPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see sliced layers with kernel visualization
+                            Run analysis to see sliced layers
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Area Ratio Tab -->
+                <div class="tab-panel" id="tab-area_ratio">
+                    <div class="viz-container" id="areaRatioPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see area ratio (A_contact / A_layer)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Gaussian Factor Tab -->
+                <div class="tab-panel" id="tab-gaussian">
+                    <div class="viz-container" id="gaussianPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see Gaussian factor 1/(1+G)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Combined Factor Tab -->
+                <div class="tab-panel" id="tab-combined">
+                    <div class="viz-container" id="combinedPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see combined geometry factor
                         </div>
                     </div>
                 </div>
@@ -1903,33 +1930,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="summary-grid" id="summaryContent">
                         <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); padding: 40px;">
                             Run analysis to see summary
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Area Ratio Tab -->
-                <div class="tab-panel" id="tab-area_ratio">
-                    <div class="viz-container" id="areaRatioPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see area ratio (A_contact / A_layer)
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Gaussian Factor Tab -->
-                <div class="tab-panel" id="tab-gaussian">
-                    <div class="viz-container" id="gaussianPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see Gaussian factor 1/(1+G)
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Combined Factor Tab -->
-                <div class="tab-panel" id="tab-combined">
-                    <div class="viz-container" id="combinedPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see combined geometry factor
                         </div>
                     </div>
                 </div>
@@ -2018,7 +2018,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             // Resize Plotly plots after tab becomes visible
             setTimeout(() => {{
-                const plotIds = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot' }};
+                const plotIds = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'combined': 'combinedPlot' }};
                 const plotId = plotIds[tabName];
                 if (plotId) {{
                     const plotEl = document.getElementById(plotId);
@@ -2031,13 +2031,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             // Show/hide kernel visualization controls
             const kernelBlock = document.getElementById('kernelVizBlock');
             if (kernelBlock) {{
-                kernelBlock.style.display = (tabName === 'slices') ? 'block' : 'none';
+                kernelBlock.style.display = (tabName === 'gaussian') ? 'block' : 'none';
             }}
         }}
 
         // Resize all visible Plotly plots
         function resizeAllPlots() {{
-            ['previewPlot', 'slicesPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
+            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'combinedPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
                 const plotEl = document.getElementById(plotId);
                 if (plotEl && plotEl.data) {{
                     Plotly.Plots.resize(plotEl);
@@ -2353,15 +2353,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
-            // Render 3D layer surfaces for Energy and Risk tabs
+            // Render sliced layers first (populates sliceVizData for kernel overlay)
+            renderSlicesPlot();
+
+            // Render 3D layer surfaces for all tabs
             renderLayerSurfaces('energy');
             renderLayerSurfaces('risk');
             renderLayerSurfaces('area_ratio');
             renderLayerSurfaces('gaussian_factor');
             renderLayerSurfaces('combined_factor');
-
-            // Render sliced layers with kernel visualization
-            renderSlicesPlot();
 
             document.getElementById('riskLegend').style.display = 'block';
 
@@ -2448,8 +2448,21 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         if (value >= 2) color = '#f87171';  // HIGH - red
                         else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
                         else color = '#4ade80';  // LOW - green
+                    }} else if (dataType === 'area_ratio') {{
+                        // Area ratio: REVERSED - high=green (good contact), low=red (overhang)
+                        const rv = 1.0 - normalizedValue;  // Reverse: 0→1, 1→0
+                        if (rv < 0.3) {{
+                            const t = rv / 0.3;
+                            color = `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
+                        }} else if (rv < 0.6) {{
+                            const t = (rv - 0.3) / 0.3;
+                            color = `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189 - t * 0)}}, ${{Math.round(36 - t * 0)}})`;
+                        }} else {{
+                            const t = (rv - 0.6) / 0.4;
+                            color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
+                        }}
                     }} else {{
-                        // Energy: RdYlGn reversed (green=low, red=high)
+                        // Energy/Gaussian/Combined: green=low, red=high
                         if (normalizedValue < 0.3) {{
                             // Green range
                             const t = normalizedValue / 0.3;
@@ -2492,6 +2505,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 let colorscale;
                 if (dataType === 'risk') {{
                     colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
+                }} else if (dataType === 'area_ratio') {{
+                    // Reversed: red at 0 (bad), green at 1 (good contact)
+                    colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
                 }} else {{
                     colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
                 }}
@@ -2527,6 +2543,14 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     showlegend: false
                 }};
                 traces.push(colorbarTrace);
+
+                // Add kernel visualization for gaussian_factor tab
+                if (dataType === 'gaussian_factor' && sliceVizData && sliceVizData.edge_points && sliceVizData.edge_points.length > 0) {{
+                    const sigmaMM = parseFloat(document.getElementById('sigmaMM').value) || 1.0;
+                    const kernelCount = parseInt(document.getElementById('kernelCount').value) || 10;
+                    const kernelTraces = generateKernelTraces(sliceVizData.edge_points, sigmaMM, kernelCount);
+                    traces.push(...kernelTraces);
+                }}
 
                 // Calculate scene bounds with padding
                 const padding = 0.1;
@@ -2599,6 +2623,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 // Actually render the plot
                 updateSlicesPlotWithKernels();
 
+                // Re-render gaussian_factor to add kernel overlay now that edge_points are available
+                renderLayerSurfaces('gaussian_factor');
+
                 logConsole('Sliced layers loaded: ' + data.n_valid_layers + ' layers', 'success');
 
             }} catch (e) {{
@@ -2607,13 +2634,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }}
         }}
 
-        // Update slices plot with current sigma/kernel settings (no re-fetch)
+        // Update slices plot (no re-fetch)
         function updateSlicesPlotWithKernels() {{
             if (!sliceVizData) return;
 
             const data = sliceVizData;
-            const sigmaMM = parseFloat(document.getElementById('sigmaMM').value) || 1.0;
-            const kernelCount = parseInt(document.getElementById('kernelCount').value) || 10;
 
             // Create mesh3d traces for layers (neutral gray color)
             const traces = [];
@@ -2655,12 +2680,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 }});
             }});
 
-            // Add half-sphere kernels at random edge points
-            if (data.edge_points && data.edge_points.length > 0) {{
-                const kernelTraces = generateKernelTraces(data.edge_points, sigmaMM, kernelCount);
-                traces.push(...kernelTraces);
-            }}
-
             // Calculate scene bounds with padding
             if (allX.length === 0) return;
 
@@ -2673,7 +2692,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const zPad = (zRange[1] - zRange[0]) * padding;
 
             const layout = {{
-                title: {{ text: 'Sliced Layers (' + data.n_valid_layers + ' layers) - Kernel σ=' + sigmaMM.toFixed(1) + 'mm', font: {{ color: '#fff', size: 14 }}, x: 0.5, y: 0.98 }},
+                title: {{ text: 'Sliced Layers (' + data.n_valid_layers + ' layers)', font: {{ color: '#fff', size: 14 }}, x: 0.5, y: 0.98 }},
                 paper_bgcolor: '{BG_MAIN}',
                 plot_bgcolor: '{BG_MAIN}',
                 scene: {{
@@ -2786,25 +2805,22 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         // Update kernel count from slider
         function updateKernelCount(value) {{
             document.getElementById('kernelCountVal').textContent = value;
-            if (sliceVizData) {{
-                updateSlicesPlotWithKernels();
-            }}
+            renderLayerSurfaces('gaussian_factor');
         }}
 
         // Update kernel opacity
         function updateKernelOpacity(value) {{
             document.getElementById('kernelOpacityVal').textContent = value;
-            if (sliceVizData) {{
-                updateSlicesPlotWithKernels();
-            }}
+            renderLayerSurfaces('gaussian_factor');
         }}
 
-        // Handle sigma parameter change - update kernel visualization without re-slicing
+        // Handle sigma parameter change - update kernel visualization
         function onSigmaChange() {{
             if (sliceVizData) {{
                 logConsole('Sigma changed - updating kernel visualization', 'info');
                 updateSlicesPlotWithKernels();
             }}
+            renderLayerSurfaces('gaussian_factor');
         }}
 
         // Apply build direction rotation to coordinates (for preview)
