@@ -2007,8 +2007,25 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('geometryParams').style.display = isGeometry ? 'block' : 'none';
         }}
 
+        // Shared 3D camera state across tabs
+        let shared3DCamera = null;
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'combined': 'combinedPlot' }};
+
         // Switch tabs
         function switchTab(tabName, evt) {{
+            // Capture camera from currently active 3D plot before switching
+            const activePanel = document.querySelector('.tab-panel.active');
+            if (activePanel) {{
+                for (const [tab, pid] of Object.entries(plotIds3D)) {{
+                    const plotEl = document.getElementById(pid);
+                    if (plotEl && plotEl.layout && plotEl.layout.scene && plotEl.layout.scene.camera &&
+                        activePanel.id === 'tab-' + tab) {{
+                        shared3DCamera = JSON.parse(JSON.stringify(plotEl.layout.scene.camera));
+                        break;
+                    }}
+                }}
+            }}
+
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
             document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.remove('active'));
             if (evt && evt.target) {{
@@ -2016,14 +2033,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }}
             document.getElementById('tab-' + tabName).classList.add('active');
 
-            // Resize Plotly plots after tab becomes visible
+            // Resize and apply shared camera to the new tab's plot
             setTimeout(() => {{
-                const plotIds = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'combined': 'combinedPlot' }};
-                const plotId = plotIds[tabName];
+                const plotId = plotIds3D[tabName];
                 if (plotId) {{
                     const plotEl = document.getElementById(plotId);
                     if (plotEl && plotEl.data) {{
                         Plotly.Plots.resize(plotEl);
+                        if (shared3DCamera) {{
+                            Plotly.relayout(plotEl, {{ 'scene.camera': shared3DCamera }});
+                        }}
                     }}
                 }}
             }}, 50);
@@ -2448,8 +2467,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         if (value >= 2) color = '#f87171';  // HIGH - red
                         else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
                         else color = '#4ade80';  // LOW - green
-                    }} else if (dataType === 'area_ratio') {{
-                        // Area ratio: REVERSED - high=green (good contact), low=red (overhang)
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor' || dataType === 'combined_factor') {{
+                        // Geometry factors: REVERSED - high=green (good), low=red (bad)
                         const rv = 1.0 - normalizedValue;  // Reverse: 0→1, 1→0
                         if (rv < 0.3) {{
                             const t = rv / 0.3;
@@ -2462,7 +2481,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
                         }}
                     }} else {{
-                        // Energy/Gaussian/Combined: green=low, red=high
+                        // Energy: green=low, red=high
                         if (normalizedValue < 0.3) {{
                             // Green range
                             const t = normalizedValue / 0.3;
@@ -2505,8 +2524,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 let colorscale;
                 if (dataType === 'risk') {{
                     colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
-                }} else if (dataType === 'area_ratio') {{
-                    // Reversed: red at 0 (bad), green at 1 (good contact)
+                }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor' || dataType === 'combined_factor') {{
+                    // Reversed: red at 0 (bad), green at 1 (good)
                     colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
                 }} else {{
                     colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
