@@ -941,20 +941,7 @@ def get_layer_surfaces(session_id, data_type):
         for k, g_val in G_layers.items():
             g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
             layer_values[int(k)] = 1.0 / (1.0 + g_avg)
-        value_label = 'Gaussian Factor 1/(1+G)'
-        min_val = 0.0
-        max_val = 1.0
-    elif data_type == 'combined_factor':
-        # In Mode B, f_geometric = 1/(1+G) only (no area ratio)
-        # This tab shows what the energy model actually uses
-        G_layers = results.get('G_layers')
-        if G_layers is None:
-            return jsonify({'status': 'error', 'message': 'Combined factor only available in Mode B'}), 400
-        layer_values = {}
-        for k, g_val in G_layers.items():
-            g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
-            layer_values[int(k)] = 1.0 / (1.0 + g_avg)
-        value_label = 'Geometry Factor f = 1/(1+G)'
+        value_label = 'Gaussian Multiplier 1/(1+G)'
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'regions':
@@ -1918,8 +1905,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
                 <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
                 <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
-                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Factor</button>
-                <button class="tab-btn" onclick="switchTab('combined', event)">Combined Factor</button>
+                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
                 <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
@@ -1969,20 +1955,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- Gaussian Factor Tab -->
+                <!-- Gaussian Multiplier Tab -->
                 <div class="tab-panel" id="tab-gaussian">
                     <div class="viz-container" id="gaussianPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see Gaussian factor 1/(1+G)
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Combined Factor Tab -->
-                <div class="tab-panel" id="tab-combined">
-                    <div class="viz-container" id="combinedPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see combined geometry factor
+                            Run analysis (Mode B) to see Gaussian multiplier 1/(1+G)
                         </div>
                     </div>
                 </div>
@@ -2104,7 +2081,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'combined': 'combinedPlot', 'regions': 'regionsPlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -2151,7 +2128,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Resize all visible Plotly plots
         function resizeAllPlots() {{
-            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'combinedPlot', 'regionsPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
+            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
                 const plotEl = document.getElementById(plotId);
                 if (plotEl && plotEl.data) {{
                     Plotly.Plots.resize(plotEl);
@@ -2476,15 +2453,14 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
-            const isModeB = analysisResults.params && analysisResults.params.mode === 'geometry_multiplier';
+            const isModeB = analysisResults.params_used && analysisResults.params_used.mode === 'geometry_multiplier';
             const vizSteps = [
                 {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
                 {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
                 {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
                 {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
                 ...(isModeB ? [
-                    {{ label: 'Gaussian Factor', fn: () => renderLayerSurfaces('gaussian_factor') }},
-                    {{ label: 'Combined Factor', fn: () => renderLayerSurfaces('combined_factor') }},
+                    {{ label: 'Gaussian Multiplier', fn: () => renderLayerSurfaces('gaussian_factor') }},
                 ] : []),
                 {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
                 {{ label: 'Summary', fn: () => updateSummary() }}
@@ -2512,8 +2488,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
                 'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }},
                 'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)' }},
-                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Factor 1/(1+G)' }},
-                'combined_factor': {{ plotId: 'combinedPlot', title: 'Combined Geometry Factor' }},
+                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)' }},
                 'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)' }}
             }};
 
@@ -2587,7 +2562,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         if (value >= 2) color = '#f87171';  // HIGH - red
                         else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
                         else color = '#4ade80';  // LOW - green
-                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor' || dataType === 'combined_factor') {{
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
                         // Geometry factors: REVERSED - high=green (good), low=red (bad)
                         const rv = 1.0 - normalizedValue;  // Reverse: 0→1, 1→0
                         if (rv < 0.3) {{
@@ -2652,7 +2627,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     let colorscale;
                     if (dataType === 'risk') {{
                         colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
-                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor' || dataType === 'combined_factor') {{
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
                         // Reversed: red at 0 (bad), green at 1 (good)
                         colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
                     }} else {{
@@ -2672,16 +2647,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             cmin: minVal,
                             cmax: maxVal,
                             colorbar: {{
-                                title: {{ text: data.value_label, font: {{ color: '#e0e0e0', size: 12 }} }},
-                                tickfont: {{ color: '#c0c0c0', size: 11 }},
-                                x: 1.02,
-                                xanchor: 'left',
+                                title: {{ text: data.value_label, font: {{ color: '#e0e0e0', size: 11 }} }},
+                                tickfont: {{ color: '#c0c0c0', size: 10 }},
+                                x: 0.98,
+                                xanchor: 'right',
                                 y: 0.5,
                                 yanchor: 'middle',
-                                len: 0.6,
-                                thickness: 15,
-                                bgcolor: 'rgba(40,40,40,0.9)',
-                                bordercolor: '#666',
+                                len: 0.5,
+                                thickness: 12,
+                                bgcolor: 'rgba(30,30,30,0.85)',
+                                bordercolor: '#555',
                                 borderwidth: 1
                             }},
                             showscale: true
@@ -2719,7 +2694,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
                         bgcolor: '{BG_MAIN}',
                         aspectmode: 'data',
-                        domain: {{ x: [0, 0.92], y: [0, 1] }}
+                        domain: {{ x: [0, 1], y: [0, 1] }}
                     }},
                     margin: {{ l: 0, r: 0, t: 30, b: 0 }},
                     autosize: true
