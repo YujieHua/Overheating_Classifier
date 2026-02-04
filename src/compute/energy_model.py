@@ -108,10 +108,8 @@ def calculate_energy_accumulation(
         E_in = float(A_layer)
 
         # Geometry factor for downward dissipation
-        geometry_factor = A_contact / A_layer if A_layer > 0 else 1.0
-
         if use_geometry_multiplier and G_layers is not None and n in G_layers:
-            # Calculate average G for solid voxels in this layer
+            # Mode B: f_geometric = 1/(1+G) only (no area ratio)
             G_data = G_layers[n]
             if isinstance(G_data, np.ndarray):
                 solid_mask = masks[n] > 0
@@ -121,8 +119,11 @@ def calculate_energy_accumulation(
                     G_avg = 0.0
             else:
                 G_avg = float(G_data)  # Already a scalar
-            geometry_factor *= 1.0 / (1.0 + G_avg)
+            geometry_factor = 1.0 / (1.0 + G_avg)
             logger.debug(f"Layer {n}: G_avg={G_avg:.3f}, geometry_factor={geometry_factor:.3f}")
+        else:
+            # Mode A: use area ratio
+            geometry_factor = A_contact / A_layer if A_layer > 0 else 1.0
 
         # Combined dissipation ratio
         R_down = dissipation_factor * geometry_factor

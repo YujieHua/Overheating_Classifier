@@ -936,21 +936,16 @@ def get_layer_surfaces(session_id, data_type):
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'combined_factor':
+        # In Mode B, f_geometric = 1/(1+G) only (no area ratio)
+        # This tab shows what the energy model actually uses
         G_layers = results.get('G_layers')
         if G_layers is None:
             return jsonify({'status': 'error', 'message': 'Combined factor only available in Mode B'}), 400
-        layer_areas = results.get('layer_areas', {})
-        contact_areas = results.get('contact_areas', {})
         layer_values = {}
-        for k in layer_areas:
-            a_layer = float(layer_areas[k])
-            a_contact = float(contact_areas.get(k, 0))
-            area_ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
-            g_val = G_layers.get(int(k), G_layers.get(k, 0))
+        for k, g_val in G_layers.items():
             g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
-            gaussian_factor = 1.0 / (1.0 + g_avg)
-            layer_values[int(k)] = min(1.0, area_ratio * gaussian_factor)
-        value_label = 'Combined Geometry Factor'
+            layer_values[int(k)] = 1.0 / (1.0 + g_avg)
+        value_label = 'Geometry Factor f = 1/(1+G)'
         min_val = 0.0
         max_val = 1.0
     else:
