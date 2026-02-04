@@ -68,7 +68,7 @@ def calculate_energy_accumulation(
     dissipation_factor: float = 0.5,
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
-    area_ratio_power: float = 1.0,
+    area_ratio_power: float = 3.0,
     progress_callback: Optional[callable] = None
 ) -> Tuple[Dict[int, float], Dict]:
     """
@@ -420,7 +420,7 @@ def run_energy_analysis(
     dissipation_factor: float = 0.5,
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
-    area_ratio_power: float = 1.0,
+    area_ratio_power: float = 3.0,
     threshold_medium: float = 0.3,
     threshold_high: float = 0.6,
     voxel_size: float = 1.0,

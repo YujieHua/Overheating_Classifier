@@ -186,10 +186,10 @@ PARAMETER_RULES = {
     'dissipation_factor': {'min': 0.0, 'max': 1.0},
     'convection_factor': {'min': 0.0, 'max': 0.5},
     'sigma_mm': {'min': 0.1, 'max': 5.0, 'unit': 'mm'},
-    'G_max': {'min': 0.5, 'max': 5.0},
+    'G_max': {'min': 0.5, 'max': 100.0},
     'threshold_medium': {'min': 0.0, 'max': 1.0},
     'threshold_high': {'min': 0.0, 'max': 1.0},
-    'area_ratio_power': {'min': 1.0, 'max': 3.0},
+    'area_ratio_power': {'min': 0.1},
 }
 
 def safe_float(value, default=0.0):
@@ -546,10 +546,10 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         convection_factor = params.get('convection_factor', 0.05)
         use_geometry_multiplier = params.get('use_geometry_multiplier', False)
         sigma_mm = params.get('sigma_mm', 1.0)
-        G_max = params.get('G_max', 2.0)
+        G_max = params.get('G_max', 99.0)
         threshold_medium = params.get('threshold_medium', 0.3)
         threshold_high = params.get('threshold_high', 0.6)
-        area_ratio_power = params.get('area_ratio_power', 1.0)
+        area_ratio_power = params.get('area_ratio_power', 3.0)
 
         need_reslice = True
         masks = None
@@ -921,13 +921,16 @@ def get_layer_surfaces(session_id, data_type):
     elif data_type == 'area_ratio':
         layer_areas = results.get('layer_areas', {})
         contact_areas = results.get('contact_areas', {})
+        area_ratio_power = results.get('params_used', {}).get('area_ratio_power',
+                           results.get('params', {}).get('area_ratio_power', 3.0))
         layer_values = {}
         for k in layer_areas:
             a_layer = float(layer_areas[k])
             a_contact = float(contact_areas.get(k, 0))
             ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
-            layer_values[int(k)] = ratio
-        value_label = 'Area Ratio (A_contact / A_layer)'
+            layer_values[int(k)] = ratio ** area_ratio_power
+        power_label = f'^{area_ratio_power}' if area_ratio_power != 1.0 else ''
+        value_label = f'Area Ratio (A_contact / A_layer){power_label}'
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'gaussian_factor':
@@ -1864,8 +1867,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                     <div class="param-row" id="powerParamGroup">
                         <span class="param-label">Area Ratio Power</span>
-                        <input type="number" class="param-input" id="areaRatioPower" value="1.0" step="0.1" min="1.0" max="3.0">
-                        <span class="param-unit" style="font-size: 0.65rem; color: var(--text-secondary);">1=linear</span>
+                        <input type="number" class="param-input" id="areaRatioPower" value="3.0" step="0.1" min="0.1">
+                        <span class="param-unit"></span>
                     </div>
                     <div id="geometryParams" style="display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-color);">
                         <div class="param-row">
@@ -1875,7 +1878,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         </div>
                         <div class="param-row">
                             <span class="param-label">G Max</span>
-                            <input type="number" class="param-input" id="gMax" value="2.0" step="0.1">
+                            <input type="number" class="param-input" id="gMax" value="99" step="0.1" max="100">
                             <span class="param-unit"></span>
                         </div>
                     </div>
@@ -2352,7 +2355,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 G_max: parseFloat(document.getElementById('gMax').value),
                 threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
                 threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
-                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 1.0
+                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 3.0
             }};
 
             const runBtn = document.getElementById('runBtn');
@@ -2473,13 +2476,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
+            const isModeB = analysisResults.params && analysisResults.params.mode === 'geometry_multiplier';
             const vizSteps = [
                 {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
                 {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
                 {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
                 {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
-                {{ label: 'Gaussian Factor', fn: () => renderLayerSurfaces('gaussian_factor') }},
-                {{ label: 'Combined Factor', fn: () => renderLayerSurfaces('combined_factor') }},
+                ...(isModeB ? [
+                    {{ label: 'Gaussian Factor', fn: () => renderLayerSurfaces('gaussian_factor') }},
+                    {{ label: 'Combined Factor', fn: () => renderLayerSurfaces('combined_factor') }},
+                ] : []),
                 {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
                 {{ label: 'Summary', fn: () => updateSummary() }}
             ];
@@ -3109,7 +3115,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
                     <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
                     <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
-                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 1.0) + '</span></div>' : ''}}
+                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 3.0) + '</span></div>' : ''}}
                 </div>
                 <div class="summary-card">
                     <h4>Thresholds</h4>
