@@ -1202,32 +1202,29 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                             if parent_branch_id:
                                 parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + overlap_count
 
-                # If no overlap found, check for proximity (for thin bridges/overhangs)
+                # If no overlap found, check for proximity using dilation (for thin bridges/overhangs)
                 if not parent_branches:
-                    # Get bounding box of current region
-                    ys, xs = np.where(region_mask)
-                    if len(xs) > 0:
-                        curr_bbox = (xs.min(), ys.min(), xs.max(), ys.max())
+                    from scipy.ndimage import binary_dilation
 
-                        # Check proximity to parent regions (within 3 voxels)
-                        proximity_threshold = 3
-                        for parent_rid in range(1, prev_labeled.max() + 1):
-                            parent_mask = (prev_labeled == parent_rid)
-                            if np.any(parent_mask):
-                                pys, pxs = np.where(parent_mask)
-                                parent_bbox = (pxs.min(), pys.min(), pxs.max(), pys.max())
+                    # Dilate current region by 5 voxels to check for nearby parent regions
+                    # This handles thin structures that shift position between layers
+                    dilation_iterations = 5
+                    dilated_region = binary_dilation(region_mask, iterations=dilation_iterations)
 
-                                # Calculate distance between bounding boxes
-                                x_dist = max(0, curr_bbox[0] - parent_bbox[2], parent_bbox[0] - curr_bbox[2])
-                                y_dist = max(0, curr_bbox[1] - parent_bbox[3], parent_bbox[1] - curr_bbox[3])
-                                dist = np.sqrt(x_dist**2 + y_dist**2)
+                    # Check which parent regions overlap with dilated current region
+                    overlap_with_dilated = dilated_region & (prev_labeled > 0)
+                    if np.any(overlap_with_dilated):
+                        parent_rids = np.unique(prev_labeled[overlap_with_dilated])
+                        parent_rids = parent_rids[parent_rids > 0]
 
-                                if dist <= proximity_threshold:
-                                    parent_branch_id = prev_layer_branches.get(int(parent_rid))
-                                    if parent_branch_id:
-                                        # Use distance-based score (closer = higher score)
-                                        proximity_score = int((proximity_threshold - dist + 1) * 100)
-                                        parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + proximity_score
+                        for parent_rid in parent_rids:
+                            # Calculate overlap between dilated current region and parent
+                            proximity_overlap = np.sum(dilated_region & (prev_labeled == parent_rid))
+                            if proximity_overlap > 0:
+                                parent_branch_id = prev_layer_branches.get(int(parent_rid))
+                                if parent_branch_id:
+                                    # Score based on overlap area after dilation
+                                    parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + proximity_overlap
 
             region_parent_branches[rid] = parent_branches
 

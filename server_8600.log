@@ -1,0 +1,57 @@
+2026-02-05 16:24:28,211 | __main__ | INFO | Starting Overheating Classifier server on {args.host}:{args.port}
+ * Serving Flask app 'app'
+ * Debug mode: off
+2026-02-05 16:24:28,239 | werkzeug | INFO | [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8600
+2026-02-05 16:24:28,239 | werkzeug | INFO | [33mPress CTRL+C to quit[0m
+2026-02-05 16:24:40,613 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl
+2026-02-05 16:24:40,683 | src.data.stl_loader | INFO | Loaded STL: 37670 triangles, dimensions 96.00 x 50.00 x 28.68 mm
+2026-02-05 16:24:40,683 | __main__ | INFO | Test STL loaded: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl
+2026-02-05 16:24:40,684 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:24:40] "POST /api/load_test_stl?index=3 HTTP/1.1" 200 -
+2026-02-05 16:24:51,299 | __main__ | INFO | Created session: fd692d59
+2026-02-05 16:24:51,300 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:24:51] "POST /api/run HTTP/1.1" 200 -
+2026-02-05 16:24:51,610 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl
+2026-02-05 16:24:51,687 | src.data.stl_loader | INFO | Loaded STL: 37670 triangles, dimensions 96.00 x 50.00 x 28.68 mm
+2026-02-05 16:24:51,687 | src.data.stl_loader | INFO | Slicing into 29 layers (grouping=25), grid size 962 x 502
+2026-02-05 16:25:02,222 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:25:02] "GET /api/progress/fd692d59 HTTP/1.1" 200 -
+2026-02-05 16:26:24,028 | src.data.stl_loader | INFO | Slicing complete: 29 layers, 2674779 solid voxels, 29 with contours
+2026-02-05 16:26:24,063 | src.compute.energy_model | INFO | Starting energy analysis pipeline
+2026-02-05 16:26:24,091 | src.compute.energy_model | INFO | Calculating region-aware energy accumulation for 29 layers
+2026-02-05 16:26:24,091 | src.compute.energy_model | INFO | Parameters: dissipation_factor=0.5, convection_factor=0.05, use_geometry_multiplier=False, area_ratio_power=3.0, gaussian_ratio_power=0.15
+2026-02-05 16:26:25,935 | src.compute.energy_model | INFO | Energy accumulation complete. Max raw E=323304.02, Max risk score=1.000
+2026-02-05 16:26:25,936 | src.compute.energy_model | INFO | Energy analysis complete: 3 HIGH, 0 MEDIUM, 26 LOW
+2026-02-05 16:26:30,489 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:26:30] "GET /api/progress/fd692d59 HTTP/1.1" 200 -
+2026-02-05 16:29:11,180 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:29:11] "GET /api/progress/fd692d59 HTTP/1.1" 200 -
+2026-02-05 16:32:26,541 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:32:26] "GET /api/status/fd692d59 HTTP/1.1" 200 -
+2026-02-05 16:32:46,215 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:32:46] "GET /api/layer_surfaces/fd692d59/regions HTTP/1.1" 200 -
+2026-02-05 16:36:16,873 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:36:16] "GET / HTTP/1.1" 200 -
+2026-02-05 16:36:17,930 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:36:17] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-02-05 16:38:16,698 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:38:16] "GET / HTTP/1.1" 200 -
+2026-02-05 16:38:24,064 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl
+2026-02-05 16:38:24,137 | src.data.stl_loader | INFO | Loaded STL: 37670 triangles, dimensions 96.00 x 50.00 x 28.68 mm
+2026-02-05 16:38:24,138 | __main__ | INFO | Test STL loaded: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl
+2026-02-05 16:38:24,138 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:38:24] "POST /api/load_test_stl?index=3 HTTP/1.1" 200 -
+2026-02-05 16:38:24,230 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:38:24] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
+2026-02-05 16:38:25,119 | __main__ | INFO | Cleared 1 old sessions
+2026-02-05 16:38:25,119 | __main__ | INFO | Created session: 5d761a7f
+2026-02-05 16:38:25,120 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:38:25] "POST /api/run HTTP/1.1" 200 -
+2026-02-05 16:38:25,120 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl
+2026-02-05 16:38:25,214 | src.data.stl_loader | INFO | Loaded STL: 37670 triangles, dimensions 96.00 x 50.00 x 28.68 mm
+2026-02-05 16:38:25,214 | src.data.stl_loader | INFO | Slicing into 29 layers (grouping=25), grid size 962 x 502
+2026-02-05 16:38:25,364 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:38:25] "GET /api/progress/5d761a7f HTTP/1.1" 200 -
+2026-02-05 16:39:47,882 | src.data.stl_loader | INFO | Slicing complete: 29 layers, 2674779 solid voxels, 29 with contours
+2026-02-05 16:39:47,914 | src.compute.geometry_score | INFO | Calculating geometry multiplier: sigma=1mm, G_max=99 (causal half-sphere)
+2026-02-05 16:39:47,939 | src.compute.geometry_score | INFO | Kernel radius: Z=20 layers, XY=15 voxels
+2026-02-05 16:39:49,523 | src.compute.geometry_score | INFO | Geometry G stats: min=-0.000, max=97.962, mean=73.665
+2026-02-05 16:39:49,538 | src.compute.energy_model | INFO | Starting energy analysis pipeline
+2026-02-05 16:39:49,565 | src.compute.energy_model | INFO | Calculating region-aware energy accumulation for 29 layers
+2026-02-05 16:39:49,565 | src.compute.energy_model | INFO | Parameters: dissipation_factor=0.5, convection_factor=0.05, use_geometry_multiplier=True, area_ratio_power=3, gaussian_ratio_power=0.15
+2026-02-05 16:39:51,065 | src.compute.energy_model | INFO | Energy accumulation complete. Max raw E=611109.60, Max risk score=1.000
+2026-02-05 16:39:51,066 | src.compute.energy_model | INFO | Energy analysis complete: 2 HIGH, 3 MEDIUM, 24 LOW
+2026-02-05 16:39:51,388 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:39:51] "GET /api/results/5d761a7f HTTP/1.1" 200 -
+2026-02-05 16:39:54,072 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:39:54] "GET /api/slice_visualization/5d761a7f HTTP/1.1" 200 -
+2026-02-05 16:39:59,194 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:39:59] "GET /api/layer_surfaces/5d761a7f/energy HTTP/1.1" 200 -
+2026-02-05 16:40:03,877 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:40:03] "GET /api/layer_surfaces/5d761a7f/risk HTTP/1.1" 200 -
+2026-02-05 16:40:09,273 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:40:09] "GET /api/layer_surfaces/5d761a7f/area_ratio HTTP/1.1" 200 -
+2026-02-05 16:40:13,957 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:40:13] "GET /api/layer_surfaces/5d761a7f/gaussian_factor HTTP/1.1" 200 -
+2026-02-05 16:40:23,665 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 16:40:23] "GET /api/layer_surfaces/5d761a7f/regions HTTP/1.1" 200 -
