@@ -50,3 +50,31 @@
 2026-02-05 14:25:41,689 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:41] "POST /api/load_test_stl?index=2 HTTP/1.1" 200 -
 2026-02-05 14:25:42,050 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:42] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
 2026-02-05 14:25:53,851 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:53] "GET / HTTP/1.1" 200 -
+2026-02-05 15:08:15,348 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\workspaces\2026-02-05-3d-branch-coloring\uploads\Korper1173.stl
+2026-02-05 15:08:15,540 | src.data.stl_loader | INFO | Loaded STL: 37670 triangles, dimensions 96.00 x 50.00 x 28.68 mm
+2026-02-05 15:08:15,542 | __main__ | INFO | STL uploaded: Korper1173.stl, 37670 triangles
+2026-02-05 15:08:15,545 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:08:15] "POST /api/upload_stl HTTP/1.1" 200 -
+2026-02-05 15:08:15,753 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:08:15] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
+2026-02-05 15:08:16,829 | __main__ | INFO | Cleared 1 old sessions
+2026-02-05 15:08:16,830 | __main__ | INFO | Created session: ef16141a
+2026-02-05 15:08:16,832 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:08:16] "POST /api/run HTTP/1.1" 200 -
+2026-02-05 15:08:16,832 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\workspaces\2026-02-05-3d-branch-coloring\uploads\Korper1173.stl
+2026-02-05 15:08:16,987 | src.data.stl_loader | INFO | Loaded STL: 37670 triangles, dimensions 96.00 x 50.00 x 28.68 mm
+2026-02-05 15:08:16,987 | src.data.stl_loader | INFO | Slicing into 29 layers (grouping=25), grid size 962 x 502
+2026-02-05 15:08:17,088 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:08:17] "GET /api/progress/ef16141a HTTP/1.1" 200 -
+2026-02-05 15:10:28,193 | src.data.stl_loader | INFO | Slicing complete: 29 layers, 2674779 solid voxels, 29 with contours
+2026-02-05 15:10:28,273 | src.compute.geometry_score | INFO | Calculating geometry multiplier: sigma=1mm, G_max=99 (causal half-sphere)
+2026-02-05 15:10:28,346 | src.compute.geometry_score | INFO | Kernel radius: Z=20 layers, XY=15 voxels
+2026-02-05 15:10:31,192 | src.compute.geometry_score | INFO | Geometry G stats: min=-0.000, max=97.962, mean=73.665
+2026-02-05 15:10:31,210 | src.compute.energy_model | INFO | Starting energy analysis pipeline
+2026-02-05 15:10:31,254 | src.compute.energy_model | INFO | Calculating region-aware energy accumulation for 29 layers
+2026-02-05 15:10:31,255 | src.compute.energy_model | INFO | Parameters: dissipation_factor=0.5, convection_factor=0.05, use_geometry_multiplier=True, area_ratio_power=3, gaussian_ratio_power=0.15
+2026-02-05 15:10:33,436 | src.compute.energy_model | INFO | Energy accumulation complete. Max raw E=611109.60, Max risk score=1.000
+2026-02-05 15:10:33,437 | src.compute.energy_model | INFO | Energy analysis complete: 2 HIGH, 3 MEDIUM, 24 LOW
+2026-02-05 15:10:33,759 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:10:33] "GET /api/results/ef16141a HTTP/1.1" 200 -
+2026-02-05 15:10:36,707 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:10:36] "GET /api/slice_visualization/ef16141a HTTP/1.1" 200 -
+2026-02-05 15:10:41,148 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:10:41] "GET /api/layer_surfaces/ef16141a/energy HTTP/1.1" 200 -
+2026-02-05 15:10:45,971 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:10:45] "GET /api/layer_surfaces/ef16141a/risk HTTP/1.1" 200 -
+2026-02-05 15:10:50,238 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:10:50] "GET /api/layer_surfaces/ef16141a/area_ratio HTTP/1.1" 200 -
+2026-02-05 15:10:55,488 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:10:55] "GET /api/layer_surfaces/ef16141a/gaussian_factor HTTP/1.1" 200 -
+2026-02-05 15:11:21,529 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 15:11:21] "GET /api/layer_surfaces/ef16141a/regions HTTP/1.1" 200 -
