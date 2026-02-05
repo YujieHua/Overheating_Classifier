@@ -988,8 +988,25 @@ def get_layer_surfaces(session_id, data_type):
             else:
                 labeled, n_regions = ndimage.label(mask_arr > 0)
 
-            # Generate one surface per region with its 3D branch color
+            if n_regions == 0:
+                continue
+
+            # Calculate region sizes for filtering out garbage (small fragments from messy STL)
+            region_sizes = ndimage.sum(mask_arr > 0, labeled, range(1, n_regions + 1))
+            max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
+
+            # Filter threshold: 1% of largest region OR 25 voxels minimum
+            MIN_AREA_FRACTION = 0.01
+            MIN_AREA_VOXELS = 25
+            min_area_threshold = max(max_region_size * MIN_AREA_FRACTION, MIN_AREA_VOXELS)
+
+            # Generate one surface per region with its 3D branch color (skip garbage)
             for rid in range(1, n_regions + 1):
+                # Skip small regions (garbage from messy STL)
+                region_size = region_sizes[rid - 1]
+                if region_size < min_area_threshold:
+                    continue
+
                 region_mask = (labeled == rid).astype(np.uint8)
                 if region_mask.sum() == 0:
                     continue
@@ -999,7 +1016,10 @@ def get_layer_surfaces(session_id, data_type):
                 branch_id = region_info.get('branch_id', rid)
                 color = region_info.get('color', '#888888')
 
-                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z)
+                # Pass min thresholds to skip any internal small features
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
+                                                          min_area_fraction=0.0,
+                                                          min_area_voxels=1)
                 if vertices and faces:
                     layers_data.append({
                         'layer': int(layer),
@@ -1301,22 +1321,57 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
     }
 
 
-def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float) -> tuple:
-    """Generate triangulated surface from a 2D mask.
+def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
+                            min_area_fraction: float = 0.01,
+                            min_area_voxels: int = 25) -> tuple:
+    """Generate triangulated surface from a 2D mask with garbage filtering.
 
     Uses marching squares-like approach to find contours and triangulate them.
     Returns (vertices, faces) for mesh3d rendering.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        2D binary mask of the layer
+    voxel_size : float
+        Physical size of each voxel in mm
+    z : float
+        Z height of this layer in mm
+    min_area_fraction : float
+        Minimum region area as fraction of largest region (default 0.01 = 1%)
+        Regions smaller than this fraction of the largest region are filtered out
+    min_area_voxels : int
+        Absolute minimum region size in voxels (default 25 = 5x5 equivalent)
+        Regions smaller than this are always filtered out regardless of fraction
     """
     from scipy import ndimage
 
     # Find connected regions and their boundaries
     labeled, n_features = ndimage.label(mask)
 
+    if n_features == 0:
+        return [], []
+
+    # Calculate area of each region for filtering out garbage surfaces
+    region_sizes = ndimage.sum(mask > 0, labeled, range(1, n_features + 1))
+    if len(region_sizes) == 0:
+        return [], []
+
+    # Determine the minimum acceptable area
+    max_region_size = np.max(region_sizes)
+    min_area_by_fraction = max_region_size * min_area_fraction
+    min_area_threshold = max(min_area_by_fraction, min_area_voxels)
+
     all_vertices = []
     all_faces = []
     vertex_offset = 0
 
     for region_id in range(1, n_features + 1):
+        # Filter out small regions (garbage from messy STL)
+        region_size = region_sizes[region_id - 1]
+        if region_size < min_area_threshold:
+            continue
+
         region_mask = (labeled == region_id)
 
         # Find boundary pixels using erosion
