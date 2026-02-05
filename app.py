@@ -1079,13 +1079,50 @@ def get_layer_surfaces(session_id, data_type):
     })
 
 
+def _mix_colors(hex_colors: list) -> str:
+    """
+    Mix multiple hex colors by averaging their RGB values.
+
+    Parameters
+    ----------
+    hex_colors : list of str
+        List of hex color strings (e.g., ['#3b82f6', '#f97316'])
+
+    Returns
+    -------
+    str
+        Mixed color as hex string
+    """
+    if not hex_colors:
+        return '#888888'  # Default gray
+    if len(hex_colors) == 1:
+        return hex_colors[0]
+
+    # Convert hex to RGB
+    rgb_values = []
+    for hex_color in hex_colors:
+        hex_color = hex_color.lstrip('#')
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        rgb_values.append((r, g, b))
+
+    # Average RGB values
+    avg_r = int(sum(rgb[0] for rgb in rgb_values) / len(rgb_values))
+    avg_g = int(sum(rgb[1] for rgb in rgb_values) / len(rgb_values))
+    avg_b = int(sum(rgb[2] for rgb in rgb_values) / len(rgb_values))
+
+    # Convert back to hex
+    return f'#{avg_r:02x}{avg_g:02x}{avg_b:02x}'
+
+
 def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> Dict:
     """
     Build 3D connected component (branch) tracking across layers.
 
     Each 2D region on a layer is assigned to a 3D branch ID based on overlap
     with parent regions. Branches are colored consistently, with color variations
-    when branches split (Y-branching).
+    when branches split (Y-branching) or merge (multiple branches joining).
 
     Parameters
     ----------
@@ -1152,6 +1189,7 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
             # Find overlapping parent regions
             parent_branches = {}
             if prev_labeled is not None:
+                # First check for direct overlap
                 overlap = region_mask & (prev_labeled > 0)
                 if np.any(overlap):
                     parent_rids = np.unique(prev_labeled[overlap])
@@ -1164,6 +1202,33 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                             if parent_branch_id:
                                 parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + overlap_count
 
+                # If no overlap found, check for proximity (for thin bridges/overhangs)
+                if not parent_branches:
+                    # Get bounding box of current region
+                    ys, xs = np.where(region_mask)
+                    if len(xs) > 0:
+                        curr_bbox = (xs.min(), ys.min(), xs.max(), ys.max())
+
+                        # Check proximity to parent regions (within 3 voxels)
+                        proximity_threshold = 3
+                        for parent_rid in range(1, prev_labeled.max() + 1):
+                            parent_mask = (prev_labeled == parent_rid)
+                            if np.any(parent_mask):
+                                pys, pxs = np.where(parent_mask)
+                                parent_bbox = (pxs.min(), pys.min(), pxs.max(), pys.max())
+
+                                # Calculate distance between bounding boxes
+                                x_dist = max(0, curr_bbox[0] - parent_bbox[2], parent_bbox[0] - curr_bbox[2])
+                                y_dist = max(0, curr_bbox[1] - parent_bbox[3], parent_bbox[1] - curr_bbox[3])
+                                dist = np.sqrt(x_dist**2 + y_dist**2)
+
+                                if dist <= proximity_threshold:
+                                    parent_branch_id = prev_layer_branches.get(int(parent_rid))
+                                    if parent_branch_id:
+                                        # Use distance-based score (closer = higher score)
+                                        proximity_score = int((proximity_threshold - dist + 1) * 100)
+                                        parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + proximity_score
+
             region_parent_branches[rid] = parent_branches
 
             # Build parent -> children mapping
@@ -1174,7 +1239,7 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                     parent_to_children[parent_branch_id] = []
                 parent_to_children[parent_branch_id].append(rid)
 
-        # SECOND: Assign branch IDs with split detection
+        # SECOND: Assign branch IDs with split and merge detection
         for rid in range(1, n_regions + 1):
             parent_branches = region_parent_branches[rid]
 
@@ -1187,8 +1252,24 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                     'color': color,
                     'layers': [layer_idx]
                 }
+            elif len(parent_branches) > 1:
+                # MERGE DETECTED - multiple branches merging into one
+                # Create new branch with mixed color from all parent branches
+                branch_id = next_branch_id
+                next_branch_id += 1
+
+                # Mix colors from all parent branches
+                parent_colors = [branches[pb_id]['color'] for pb_id in parent_branches.keys()]
+                color = _mix_colors(parent_colors)
+
+                branches[branch_id] = {
+                    'color': color,
+                    'layers': [layer_idx],
+                    'is_merge': True,
+                    'parent_branches': list(parent_branches.keys())
+                }
             else:
-                # Has parent(s)
+                # Single parent
                 parent_branch_id = max(parent_branches, key=parent_branches.get)
                 children_of_parent = parent_to_children.get(parent_branch_id, [])
 
