@@ -1101,7 +1101,6 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         - layer_regions: {layer_idx: {region_id: {'branch_id': int, 'color': str}}}
     """
     from scipy import ndimage
-    import colorsys
 
     # Base color palette (10 distinct colors)
     BASE_COLORS = [
@@ -1117,35 +1116,7 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         '#f59e0b',  # amber
     ]
 
-    def hex_to_hsv(hex_color):
-        """Convert hex color to HSV."""
-        hex_color = hex_color.lstrip('#')
-        r, g, b = [int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
-        return colorsys.rgb_to_hsv(r, g, b)
-
-    def hsv_to_hex(h, s, v):
-        """Convert HSV to hex color."""
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        return '#{:02x}{:02x}{:02x}'.format(int(r*255), int(g*255), int(b*255))
-
-    def generate_child_colors(base_color, n_children):
-        """Generate n_children color variations of base_color by varying saturation and value."""
-        h, s, v = hex_to_hsv(base_color)
-
-        if n_children == 1:
-            return [base_color]
-
-        # Generate variations
-        colors = []
-        for i in range(n_children):
-            # Vary saturation and value
-            s_new = max(0.3, min(1.0, s + (i - n_children/2) * 0.15))
-            v_new = max(0.4, min(1.0, v + (i - n_children/2) * 0.15))
-            colors.append(hsv_to_hex(h, s_new, v_new))
-
-        return colors
-
-    branches = {}  # branch_id -> {base_color, child_colors, layers, split_count}
+    branches = {}  # branch_id -> {color, layers}
     layer_regions = {}  # layer_idx -> {region_id: {branch_id, color}}
 
     next_branch_id = 1
@@ -1171,7 +1142,7 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         curr_layer_branches = {}
         layer_regions[layer_idx] = {}
 
-        # First pass: assign branch IDs to all regions
+        # Assign branch ID to each region
         for rid in range(1, n_regions + 1):
             region_mask = (labeled == rid)
 
@@ -1195,50 +1166,21 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                 # New branch (no parent or layer 1)
                 branch_id = next_branch_id
                 next_branch_id += 1
-                if branch_id not in branches:
-                    base_color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
-                    branches[branch_id] = {
-                        'base_color': base_color,
-                        'child_colors': [base_color],
-                        'layers': [layer_idx],
-                        'split_count': 0
-                    }
+                # Assign color when branch is created
+                color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
+                branches[branch_id] = {
+                    'color': color,
+                    'layers': [layer_idx]
+                }
             else:
                 # Inherit from largest parent
                 branch_id = max(parent_branches, key=parent_branches.get)
                 if layer_idx not in branches[branch_id]['layers']:
                     branches[branch_id]['layers'].append(layer_idx)
+                # Use the color assigned when branch was created
+                color = branches[branch_id]['color']
 
             curr_layer_branches[rid] = branch_id
-
-        # Second pass: count regions per branch on this layer and assign colors
-        branch_region_counts = {}
-        for rid, branch_id in curr_layer_branches.items():
-            if branch_id not in branch_region_counts:
-                branch_region_counts[branch_id] = []
-            branch_region_counts[branch_id].append(rid)
-
-        # Assign colors
-        for rid, branch_id in curr_layer_branches.items():
-            regions_in_branch = branch_region_counts[branch_id]
-
-            if len(regions_in_branch) > 1:
-                # Multiple regions from same branch on this layer - use color variations
-                base_color = branches[branch_id]['base_color']
-                n_children = len(regions_in_branch)
-
-                # Generate child colors if not already generated
-                if len(branches[branch_id]['child_colors']) < n_children:
-                    child_colors = generate_child_colors(base_color, n_children)
-                    branches[branch_id]['child_colors'] = child_colors
-
-                # Assign color based on position in regions_in_branch list
-                color_idx = regions_in_branch.index(rid) % len(branches[branch_id]['child_colors'])
-                color = branches[branch_id]['child_colors'][color_idx]
-            else:
-                # Single region from this branch - use base color
-                color = branches[branch_id]['base_color']
-
             layer_regions[layer_idx][rid] = {
                 'branch_id': branch_id,
                 'color': color
