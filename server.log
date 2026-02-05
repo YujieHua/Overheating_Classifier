@@ -1,0 +1,52 @@
+2026-02-05 14:21:55,664 | __main__ | INFO | Starting Overheating Classifier server on {args.host}:{args.port}
+ * Serving Flask app 'app'
+ * Debug mode: off
+2026-02-05 14:21:55,686 | werkzeug | INFO | [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:7245
+2026-02-05 14:21:55,686 | werkzeug | INFO | [33mPress CTRL+C to quit[0m
+2026-02-05 14:22:43,899 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:22:43] "GET / HTTP/1.1" 200 -
+2026-02-05 14:22:44,985 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:22:44] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-02-05 14:23:17,948 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl
+2026-02-05 14:23:17,949 | src.data.stl_loader | INFO | Loaded STL: 28 triangles, dimensions 15.00 x 15.00 x 10.00 mm
+2026-02-05 14:23:17,950 | __main__ | INFO | Test STL loaded: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl
+2026-02-05 14:23:17,950 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:17] "POST /api/load_test_stl?index=1 HTTP/1.1" 200 -
+2026-02-05 14:23:18,270 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:18] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
+2026-02-05 14:23:44,576 | __main__ | INFO | Created session: f8a13f2e
+2026-02-05 14:23:44,577 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:44] "POST /api/run HTTP/1.1" 200 -
+2026-02-05 14:23:44,942 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:44] "GET /api/progress/f8a13f2e HTTP/1.1" 200 -
+2026-02-05 14:23:44,943 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl
+2026-02-05 14:23:44,944 | src.data.stl_loader | INFO | Loaded STL: 28 triangles, dimensions 15.00 x 15.00 x 10.00 mm
+2026-02-05 14:23:44,945 | src.data.stl_loader | INFO | Slicing into 10 layers (grouping=25), grid size 152 x 152
+2026-02-05 14:23:46,386 | src.data.stl_loader | INFO | Slicing complete: 10 layers, 177659 solid voxels, 10 with contours
+2026-02-05 14:23:46,389 | src.compute.geometry_score | INFO | Calculating geometry multiplier: sigma=1mm, G_max=99 (causal half-sphere)
+2026-02-05 14:23:46,390 | src.compute.geometry_score | INFO | Kernel radius: Z=9 layers, XY=15 voxels
+2026-02-05 14:23:46,438 | src.compute.geometry_score | INFO | Geometry G stats: min=-0.000, max=96.407, mean=54.953
+2026-02-05 14:23:46,439 | src.compute.energy_model | INFO | Starting energy analysis pipeline
+2026-02-05 14:23:46,440 | src.compute.energy_model | INFO | Calculating region-aware energy accumulation for 10 layers
+2026-02-05 14:23:46,440 | src.compute.energy_model | INFO | Parameters: dissipation_factor=0.5, convection_factor=0.05, use_geometry_multiplier=True, area_ratio_power=3, gaussian_ratio_power=0.15
+2026-02-05 14:23:46,507 | src.compute.energy_model | INFO | Energy accumulation complete. Max raw E=36503.90, Max risk score=1.000
+2026-02-05 14:23:46,507 | src.compute.energy_model | INFO | Energy analysis complete: 9 HIGH, 0 MEDIUM, 1 LOW
+2026-02-05 14:23:46,514 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:46] "GET /api/results/f8a13f2e HTTP/1.1" 200 -
+2026-02-05 14:23:47,523 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:47] "GET /api/slice_visualization/f8a13f2e HTTP/1.1" 200 -
+2026-02-05 14:23:49,209 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:49] "GET /api/layer_surfaces/f8a13f2e/energy HTTP/1.1" 200 -
+2026-02-05 14:23:51,557 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:51] "GET /api/layer_surfaces/f8a13f2e/risk HTTP/1.1" 200 -
+2026-02-05 14:23:53,193 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:53] "GET /api/layer_surfaces/f8a13f2e/area_ratio HTTP/1.1" 200 -
+2026-02-05 14:23:55,531 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:23:55] "GET /api/layer_surfaces/f8a13f2e/gaussian_factor HTTP/1.1" 200 -
+2026-02-05 14:24:02,233 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:24:02] "GET /api/layer_surfaces/f8a13f2e/regions HTTP/1.1" 200 -
+2026-02-05 14:24:58,667 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl
+2026-02-05 14:24:58,672 | src.data.stl_loader | INFO | Loaded STL: 2052 triangles, dimensions 43.14 x 85.00 x 43.02 mm
+2026-02-05 14:24:58,672 | __main__ | INFO | Test STL loaded: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl
+2026-02-05 14:24:58,673 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:24:58] "POST /api/load_test_stl?index=2 HTTP/1.1" 200 -
+2026-02-05 14:24:58,930 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:24:58] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
+2026-02-05 14:25:13,872 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl
+2026-02-05 14:25:13,879 | src.data.stl_loader | INFO | Loaded STL: 2052 triangles, dimensions 43.14 x 85.00 x 43.02 mm
+2026-02-05 14:25:13,879 | __main__ | INFO | Test STL loaded: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl
+2026-02-05 14:25:13,880 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:13] "POST /api/load_test_stl?index=2 HTTP/1.1" 200 -
+2026-02-05 14:25:14,239 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:14] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
+2026-02-05 14:25:18,373 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:18] "GET / HTTP/1.1" 200 -
+2026-02-05 14:25:41,683 | src.data.stl_loader | INFO | Loading STL: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl
+2026-02-05 14:25:41,688 | src.data.stl_loader | INFO | Loaded STL: 2052 triangles, dimensions 43.14 x 85.00 x 43.02 mm
+2026-02-05 14:25:41,689 | __main__ | INFO | Test STL loaded: C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl
+2026-02-05 14:25:41,689 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:41] "POST /api/load_test_stl?index=2 HTTP/1.1" 200 -
+2026-02-05 14:25:42,050 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:42] "GET /api/stl_preview?build_direction=Z HTTP/1.1" 200 -
+2026-02-05 14:25:53,851 | werkzeug | INFO | 127.0.0.1 - - [05/Feb/2026 14:25:53] "GET / HTTP/1.1" 200 -

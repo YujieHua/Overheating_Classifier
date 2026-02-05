@@ -331,6 +331,8 @@ def load_test_stl():
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl"),
         '2': os.getenv('TEST_STL_PATH_2',
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl"),
+        '3': os.getenv('TEST_STL_PATH_3',
+            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl"),
     }
 
     default_path = test_stl_paths.get(stl_index, test_stl_paths['1'])
@@ -1169,7 +1171,7 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         curr_layer_branches = {}
         layer_regions[layer_idx] = {}
 
-        # For each region, find which branch it belongs to
+        # First pass: assign branch IDs to all regions
         for rid in range(1, n_regions + 1):
             region_mask = (labeled == rid)
 
@@ -1188,52 +1190,55 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                             if parent_branch_id:
                                 parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + overlap_count
 
-            # Assign branch
+            # Assign branch ID
             if not parent_branches:
                 # New branch (no parent or layer 1)
                 branch_id = next_branch_id
                 next_branch_id += 1
-                base_color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
-                branches[branch_id] = {
-                    'base_color': base_color,
-                    'child_colors': [base_color],
-                    'layers': [layer_idx],
-                    'split_count': 0
-                }
-                color = base_color
+                if branch_id not in branches:
+                    base_color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
+                    branches[branch_id] = {
+                        'base_color': base_color,
+                        'child_colors': [base_color],
+                        'layers': [layer_idx],
+                        'split_count': 0
+                    }
             else:
                 # Inherit from largest parent
                 branch_id = max(parent_branches, key=parent_branches.get)
-                branches[branch_id]['layers'].append(layer_idx)
-
-                # Check if parent split (multiple children)
-                # Count how many regions in current layer inherit from this branch
-                siblings = sum(1 for r_id in range(1, n_regions + 1)
-                             if r_id != rid and
-                             any(prev_layer_branches.get(int(pr)) == branch_id
-                                 for pr in np.unique(prev_labeled[(labeled == r_id) & (prev_labeled > 0)])
-                                 if pr > 0))
-
-                if siblings > 0:
-                    # Split detected - generate child colors
-                    n_children = siblings + 1
-                    split_count = branches[branch_id]['split_count']
-
-                    if split_count == 0 or len(branches[branch_id]['child_colors']) < n_children:
-                        # First split or need more colors
-                        base_color = branches[branch_id]['base_color']
-                        child_colors = generate_child_colors(base_color, n_children)
-                        branches[branch_id]['child_colors'] = child_colors
-                        branches[branch_id]['split_count'] += 1
-
-                    # Assign color cyclically
-                    color_idx = rid % len(branches[branch_id]['child_colors'])
-                    color = branches[branch_id]['child_colors'][color_idx]
-                else:
-                    # No split - use base color
-                    color = branches[branch_id]['base_color']
+                if layer_idx not in branches[branch_id]['layers']:
+                    branches[branch_id]['layers'].append(layer_idx)
 
             curr_layer_branches[rid] = branch_id
+
+        # Second pass: count regions per branch on this layer and assign colors
+        branch_region_counts = {}
+        for rid, branch_id in curr_layer_branches.items():
+            if branch_id not in branch_region_counts:
+                branch_region_counts[branch_id] = []
+            branch_region_counts[branch_id].append(rid)
+
+        # Assign colors
+        for rid, branch_id in curr_layer_branches.items():
+            regions_in_branch = branch_region_counts[branch_id]
+
+            if len(regions_in_branch) > 1:
+                # Multiple regions from same branch on this layer - use color variations
+                base_color = branches[branch_id]['base_color']
+                n_children = len(regions_in_branch)
+
+                # Generate child colors if not already generated
+                if len(branches[branch_id]['child_colors']) < n_children:
+                    child_colors = generate_child_colors(base_color, n_children)
+                    branches[branch_id]['child_colors'] = child_colors
+
+                # Assign color based on position in regions_in_branch list
+                color_idx = regions_in_branch.index(rid) % len(branches[branch_id]['child_colors'])
+                color = branches[branch_id]['child_colors'][color_idx]
+            else:
+                # Single region from this branch - use base color
+                color = branches[branch_id]['base_color']
+
             layer_regions[layer_idx][rid] = {
                 'branch_id': branch_id,
                 'color': color
@@ -1954,6 +1959,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div style="display: flex; gap: 4px; margin-top: 4px;">
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(1)">Test STL 1</button>
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(2)">Test STL 2</button>
+                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(3)">Test STL 3</button>
                     </div>
 
                     <!-- STL Info (shown when loaded) -->
