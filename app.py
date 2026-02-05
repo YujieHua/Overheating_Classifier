@@ -331,6 +331,8 @@ def load_test_stl():
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl"),
         '2': os.getenv('TEST_STL_PATH_2',
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl"),
+        '3': os.getenv('TEST_STL_PATH_3',
+            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl"),
     }
 
     default_path = test_stl_paths.get(stl_index, test_stl_paths['1'])
@@ -956,27 +958,17 @@ def get_layer_surfaces(session_id, data_type):
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'regions':
-        # Region/island detection - each region gets a distinct color
+        # 3D Branch visualization - connected regions across layers colored consistently
         from scipy import ndimage
         region_data_all = results.get('region_data', {})
 
+        # Build 3D branch tracking
+        branch_info = _build_3d_branches(masks, region_data_all)
+        layer_regions = branch_info['layer_regions']
+
         layers_data = []
         sorted_layers = sorted(masks.keys())
-        max_regions_seen = 1
-
-        # 10 distinct high-contrast categorical colors
-        REGION_COLORS = [
-            '#3b82f6',  # blue
-            '#f97316',  # orange
-            '#22c55e',  # green
-            '#ef4444',  # red
-            '#a855f7',  # purple
-            '#eab308',  # yellow
-            '#06b6d4',  # cyan
-            '#ec4899',  # pink
-            '#84cc16',  # lime
-            '#f59e0b',  # amber
-        ]
+        max_branches = len(branch_info['branches'])
 
         for layer in sorted_layers:
             mask = masks.get(layer)
@@ -996,24 +988,27 @@ def get_layer_surfaces(session_id, data_type):
             else:
                 labeled, n_regions = ndimage.label(mask_arr > 0)
 
-            if n_regions > max_regions_seen:
-                max_regions_seen = n_regions
-
-            # Generate one surface per region with its own color
+            # Generate one surface per region with its 3D branch color
             for rid in range(1, n_regions + 1):
                 region_mask = (labeled == rid).astype(np.uint8)
                 if region_mask.sum() == 0:
                     continue
+
+                # Get 3D branch color for this region
+                region_info = layer_regions.get(layer, {}).get(rid, {})
+                branch_id = region_info.get('branch_id', rid)
+                color = region_info.get('color', '#888888')
 
                 vertices, faces = _generate_layer_surface(region_mask, voxel_size, z)
                 if vertices and faces:
                     layers_data.append({
                         'layer': int(layer),
                         'z': float(z),
-                        'value': int(rid),
+                        'value': int(branch_id),
                         'region_id': int(rid),
+                        'branch_id': int(branch_id),
                         'n_regions': int(n_regions),
-                        'color': REGION_COLORS[(rid - 1) % len(REGION_COLORS)],
+                        'color': color,
                         'vertices': vertices,
                         'faces': faces
                     })
@@ -1024,8 +1019,8 @@ def get_layer_surfaces(session_id, data_type):
             'n_layers': len(sorted_layers),
             'n_valid_layers': len(layers_data),
             'min_val': 1,
-            'max_val': max_regions_seen,
-            'value_label': 'Region ID',
+            'max_val': max_branches,
+            'value_label': '3D Branch ID',
             'layer_thickness': layer_thickness,
             'voxel_size': voxel_size,
             'is_categorical': True
@@ -1082,6 +1077,228 @@ def get_layer_surfaces(session_id, data_type):
         'layer_thickness': layer_thickness,
         'voxel_size': voxel_size
     })
+
+
+def _mix_colors(hex_colors: list) -> str:
+    """
+    Mix multiple hex colors by averaging their RGB values.
+
+    Parameters
+    ----------
+    hex_colors : list of str
+        List of hex color strings (e.g., ['#3b82f6', '#f97316'])
+
+    Returns
+    -------
+    str
+        Mixed color as hex string
+    """
+    if not hex_colors:
+        return '#888888'  # Default gray
+    if len(hex_colors) == 1:
+        return hex_colors[0]
+
+    # Convert hex to RGB
+    rgb_values = []
+    for hex_color in hex_colors:
+        hex_color = hex_color.lstrip('#')
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        rgb_values.append((r, g, b))
+
+    # Average RGB values
+    avg_r = int(sum(rgb[0] for rgb in rgb_values) / len(rgb_values))
+    avg_g = int(sum(rgb[1] for rgb in rgb_values) / len(rgb_values))
+    avg_b = int(sum(rgb[2] for rgb in rgb_values) / len(rgb_values))
+
+    # Convert back to hex
+    return f'#{avg_r:02x}{avg_g:02x}{avg_b:02x}'
+
+
+def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> Dict:
+    """
+    Build 3D connected component (branch) tracking across layers.
+
+    Each 2D region on a layer is assigned to a 3D branch ID based on overlap
+    with parent regions. Branches are colored consistently, with color variations
+    when branches split (Y-branching) or merge (multiple branches joining).
+
+    Parameters
+    ----------
+    masks : dict
+        Layer masks {layer_idx: 2D numpy array}
+    region_data_all : dict
+        Region data from energy calculation {layer_idx: {'labeled': array, 'n_regions': int}}
+
+    Returns
+    -------
+    dict with keys:
+        - branches: {branch_id: {'base_color': str, 'child_colors': [str], 'layers': [int]}}
+        - layer_regions: {layer_idx: {region_id: {'branch_id': int, 'color': str}}}
+    """
+    from scipy import ndimage
+
+    # Base color palette (10 distinct colors)
+    BASE_COLORS = [
+        '#3b82f6',  # blue
+        '#f97316',  # orange
+        '#22c55e',  # green
+        '#ef4444',  # red
+        '#a855f7',  # purple
+        '#eab308',  # yellow
+        '#06b6d4',  # cyan
+        '#ec4899',  # pink
+        '#84cc16',  # lime
+        '#f59e0b',  # amber
+    ]
+
+    branches = {}  # branch_id -> {color, layers}
+    layer_regions = {}  # layer_idx -> {region_id: {branch_id, color}}
+
+    next_branch_id = 1
+    prev_labeled = None
+    prev_layer_branches = {}  # region_id -> branch_id from previous layer
+
+    sorted_layers = sorted(masks.keys())
+
+    for layer_idx in sorted_layers:
+        mask = masks[layer_idx]
+        if mask is None or np.sum(mask > 0) == 0:
+            layer_regions[layer_idx] = {}
+            continue
+
+        # Get labeled regions
+        rd = region_data_all.get(layer_idx)
+        if rd and rd.get('n_regions', 0) > 0:
+            labeled = rd['labeled']
+            n_regions = rd['n_regions']
+        else:
+            labeled, n_regions = ndimage.label(mask > 0)
+
+        curr_layer_branches = {}
+        layer_regions[layer_idx] = {}
+
+        # FIRST: Build parent-to-children mapping to detect splits
+        parent_to_children = {}  # parent_branch_id -> [list of child region ids]
+        region_parent_branches = {}  # region_id -> {parent_branch_id: overlap_count}
+
+        for rid in range(1, n_regions + 1):
+            region_mask = (labeled == rid)
+
+            # Find overlapping parent regions
+            parent_branches = {}
+            if prev_labeled is not None:
+                # First check for direct overlap
+                overlap = region_mask & (prev_labeled > 0)
+                if np.any(overlap):
+                    parent_rids = np.unique(prev_labeled[overlap])
+                    parent_rids = parent_rids[parent_rids > 0]
+
+                    for parent_rid in parent_rids:
+                        overlap_count = np.sum((labeled == rid) & (prev_labeled == parent_rid))
+                        if overlap_count > 0:
+                            parent_branch_id = prev_layer_branches.get(int(parent_rid))
+                            if parent_branch_id:
+                                parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + overlap_count
+
+                # If no overlap found, check for proximity using dilation (for thin bridges/overhangs)
+                if not parent_branches:
+                    from scipy.ndimage import binary_dilation
+
+                    # Dilate current region by 5 voxels to check for nearby parent regions
+                    # This handles thin structures that shift position between layers
+                    dilation_iterations = 5
+                    dilated_region = binary_dilation(region_mask, iterations=dilation_iterations)
+
+                    # Check which parent regions overlap with dilated current region
+                    overlap_with_dilated = dilated_region & (prev_labeled > 0)
+                    if np.any(overlap_with_dilated):
+                        parent_rids = np.unique(prev_labeled[overlap_with_dilated])
+                        parent_rids = parent_rids[parent_rids > 0]
+
+                        for parent_rid in parent_rids:
+                            # Calculate overlap between dilated current region and parent
+                            proximity_overlap = np.sum(dilated_region & (prev_labeled == parent_rid))
+                            if proximity_overlap > 0:
+                                parent_branch_id = prev_layer_branches.get(int(parent_rid))
+                                if parent_branch_id:
+                                    # Score based on overlap area after dilation
+                                    parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + proximity_overlap
+
+            region_parent_branches[rid] = parent_branches
+
+            # Build parent -> children mapping
+            if parent_branches:
+                # Child belongs to largest parent
+                parent_branch_id = max(parent_branches, key=parent_branches.get)
+                if parent_branch_id not in parent_to_children:
+                    parent_to_children[parent_branch_id] = []
+                parent_to_children[parent_branch_id].append(rid)
+
+        # SECOND: Assign branch IDs with split and merge detection
+        for rid in range(1, n_regions + 1):
+            parent_branches = region_parent_branches[rid]
+
+            if not parent_branches:
+                # No parent - create new branch
+                branch_id = next_branch_id
+                next_branch_id += 1
+                color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
+                branches[branch_id] = {
+                    'color': color,
+                    'layers': [layer_idx]
+                }
+            elif len(parent_branches) > 1:
+                # MERGE DETECTED - multiple branches merging into one
+                # Create new branch with mixed color from all parent branches
+                branch_id = next_branch_id
+                next_branch_id += 1
+
+                # Mix colors from all parent branches
+                parent_colors = [branches[pb_id]['color'] for pb_id in parent_branches.keys()]
+                color = _mix_colors(parent_colors)
+
+                branches[branch_id] = {
+                    'color': color,
+                    'layers': [layer_idx],
+                    'is_merge': True,
+                    'parent_branches': list(parent_branches.keys())
+                }
+            else:
+                # Single parent
+                parent_branch_id = max(parent_branches, key=parent_branches.get)
+                children_of_parent = parent_to_children.get(parent_branch_id, [])
+
+                if len(children_of_parent) == 1:
+                    # No split - inherit parent branch ID
+                    branch_id = parent_branch_id
+                    if layer_idx not in branches[branch_id]['layers']:
+                        branches[branch_id]['layers'].append(layer_idx)
+                    color = branches[branch_id]['color']
+                else:
+                    # Split detected - create NEW branch for this child
+                    branch_id = next_branch_id
+                    next_branch_id += 1
+                    color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
+                    branches[branch_id] = {
+                        'color': color,
+                        'layers': [layer_idx]
+                    }
+
+            curr_layer_branches[rid] = branch_id
+            layer_regions[layer_idx][rid] = {
+                'branch_id': branch_id,
+                'color': color
+            }
+
+        prev_labeled = labeled
+        prev_layer_branches = curr_layer_branches
+
+    return {
+        'branches': branches,
+        'layer_regions': layer_regions
+    }
 
 
 def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float) -> tuple:
@@ -1790,6 +2007,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div style="display: flex; gap: 4px; margin-top: 4px;">
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(1)">Test STL 1</button>
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(2)">Test STL 2</button>
+                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(3)">Test STL 3</button>
                     </div>
 
                     <!-- STL Info (shown when loaded) -->
