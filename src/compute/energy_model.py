@@ -69,6 +69,7 @@ def calculate_energy_accumulation(
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
     area_ratio_power: float = 3.0,
+    gaussian_ratio_power: float = 0.15,
     progress_callback: Optional[callable] = None
 ) -> Tuple[Dict[int, float], Dict]:
     """
@@ -91,8 +92,11 @@ def calculate_energy_accumulation(
     use_geometry_multiplier : bool
         If True, use Mode B (geometry multiplier). If False, use Mode A (area-only).
     area_ratio_power : float
-        Power exponent for area ratio in Mode A (1.0-3.0, default 1.0).
+        Power exponent for area ratio in Mode A (1.0-3.0, default 3.0).
         Higher values amplify sensitivity to contact area changes.
+    gaussian_ratio_power : float
+        Power exponent for Gaussian multiplier in Mode B (0.01-1.0, default 0.15).
+        Values < 1 dampen the effect, bringing extreme values closer to 1.
     progress_callback : callable, optional
         Progress callback function(percent, message)
 
@@ -110,7 +114,8 @@ def calculate_energy_accumulation(
     logger.info(f"Parameters: dissipation_factor={dissipation_factor}, "
                 f"convection_factor={convection_factor}, "
                 f"use_geometry_multiplier={use_geometry_multiplier}, "
-                f"area_ratio_power={area_ratio_power}")
+                f"area_ratio_power={area_ratio_power}, "
+                f"gaussian_ratio_power={gaussian_ratio_power}")
 
     # Per-layer results
     E_layer_scores = {}  # layer -> raw energy (max across regions)
@@ -205,7 +210,7 @@ def calculate_energy_accumulation(
                     G_avg = float(np.mean(G_vals)) if len(G_vals) > 0 else 0.0
                 else:
                     G_avg = float(G_data)
-                geometry_factor = 1.0 / (1.0 + G_avg)
+                geometry_factor = (1.0 / (1.0 + G_avg)) ** gaussian_ratio_power
             else:
                 # Mode A: (A_contact_region / A_region) ^ area_ratio_power
                 if prev_labeled is not None:
@@ -421,6 +426,7 @@ def run_energy_analysis(
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
     area_ratio_power: float = 3.0,
+    gaussian_ratio_power: float = 0.15,
     threshold_medium: float = 0.3,
     threshold_high: float = 0.6,
     voxel_size: float = 1.0,
@@ -483,6 +489,7 @@ def run_energy_analysis(
         convection_factor=convection_factor,
         use_geometry_multiplier=use_geometry_multiplier,
         area_ratio_power=area_ratio_power,
+        gaussian_ratio_power=gaussian_ratio_power,
         progress_callback=progress_callback
     )
 
@@ -511,6 +518,7 @@ def run_energy_analysis(
             'convection_factor': convection_factor,
             'use_geometry_multiplier': use_geometry_multiplier,
             'area_ratio_power': area_ratio_power,
+            'gaussian_ratio_power': gaussian_ratio_power,
             'threshold_medium': threshold_medium,
             'threshold_high': threshold_high,
             'mode': 'geometry_multiplier' if use_geometry_multiplier else 'area_only',

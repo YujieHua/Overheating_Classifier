@@ -528,10 +528,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
 
         from src.data.stl_loader import load_stl, slice_stl
         from src.compute.energy_model import run_energy_analysis
-        from src.compute.geometry_score import (
-            calculate_geometry_multiplier_per_layer,
-            calculate_layer_averaged_G
-        )
+        from src.compute.geometry_score import calculate_geometry_multiplier_per_layer
 
         def progress_with_cancel(progress, step):
             if session.is_cancelled():
@@ -550,6 +547,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         threshold_medium = params.get('threshold_medium', 0.3)
         threshold_high = params.get('threshold_high', 0.6)
         area_ratio_power = params.get('area_ratio_power', 3.0)
+        gaussian_ratio_power = params.get('gaussian_ratio_power', 0.15)
 
         need_reslice = True
         masks = None
@@ -657,7 +655,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 progress_callback=lambda p, s: progress_with_cancel(25 + p * 0.15, s)
             )
 
-            G_layers = calculate_layer_averaged_G(G_layers_2d, masks)
+            G_layers = G_layers_2d  # Pass per-voxel 2D arrays (not pre-averaged scalars)
             progress_with_cancel(42, "[INFO] Geometry G computed")
         else:
             progress_with_cancel(42, "[INFO] Using Area-Only mode (no geometry G)")
@@ -671,6 +669,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             convection_factor=convection_factor,
             use_geometry_multiplier=use_geometry_multiplier,
             area_ratio_power=area_ratio_power,
+            gaussian_ratio_power=gaussian_ratio_power,
             threshold_medium=threshold_medium,
             threshold_high=threshold_high,
             voxel_size=voxel_size,
@@ -700,6 +699,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 'sigma_mm': sigma_mm if use_geometry_multiplier else None,
                 'G_max': G_max if use_geometry_multiplier else None,
                 'area_ratio_power': area_ratio_power,
+                'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
                 'threshold_medium': threshold_medium,
                 'threshold_high': threshold_high,
                 'mode': energy_results['params']['mode'],
@@ -937,11 +937,22 @@ def get_layer_surfaces(session_id, data_type):
         G_layers = results.get('G_layers')
         if G_layers is None:
             return jsonify({'status': 'error', 'message': 'Gaussian factor only available in Mode B'}), 400
+        grp = results.get('params_used', {}).get('gaussian_ratio_power', 0.15)
         layer_values = {}
         for k, g_val in G_layers.items():
-            g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
-            layer_values[int(k)] = 1.0 / (1.0 + g_avg)
-        value_label = 'Gaussian Multiplier 1/(1+G)'
+            if hasattr(g_val, '__len__'):
+                # 2D array: average multiplier over solid voxels only
+                solid = masks[k] > 0
+                if np.any(solid):
+                    G_solid = g_val[solid]
+                    g_avg = float(np.mean(G_solid))
+                else:
+                    g_avg = 0.0
+            else:
+                g_avg = float(g_val)
+            layer_values[int(k)] = (1.0 / (1.0 + g_avg)) ** grp
+        power_label = f'^{grp}' if grp != 1.0 else ''
+        value_label = f'Gaussian Multiplier (1/(1+G)){power_label}'
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'regions':
@@ -1868,6 +1879,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <input type="number" class="param-input" id="gMax" value="99" step="0.1" max="100">
                             <span class="param-unit"></span>
                         </div>
+                        <div class="param-row" id="gaussianPowerGroup">
+                            <span class="param-label">Gaussian Ratio Power</span>
+                            <input type="number" class="param-input" id="gaussianRatioPower" value="0.15" step="0.01" min="0.01" max="1.0">
+                            <span class="param-unit"></span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2332,7 +2348,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 G_max: parseFloat(document.getElementById('gMax').value),
                 threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
                 threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
-                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 3.0
+                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 3.0,
+                gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15
             }};
 
             const runBtn = document.getElementById('runBtn');
@@ -3090,7 +3107,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
                     <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
                     <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
-                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 3.0) + '</span></div>' : ''}}
+                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 3.0) + '</span></div>' : '<div class="summary-stat"><span class="label">Gaussian Ratio Power</span><span class="value">' + (p.gaussian_ratio_power || 0.15) + '</span></div>'}}
                 </div>
                 <div class="summary-card">
                     <h4>Thresholds</h4>
