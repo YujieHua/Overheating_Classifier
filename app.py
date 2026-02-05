@@ -1142,7 +1142,10 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         curr_layer_branches = {}
         layer_regions[layer_idx] = {}
 
-        # Assign branch ID to each region
+        # FIRST: Build parent-to-children mapping to detect splits
+        parent_to_children = {}  # parent_branch_id -> [list of child region ids]
+        region_parent_branches = {}  # region_id -> {parent_branch_id: overlap_count}
+
         for rid in range(1, n_regions + 1):
             region_mask = (labeled == rid)
 
@@ -1161,24 +1164,49 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                             if parent_branch_id:
                                 parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + overlap_count
 
-            # Assign branch ID
+            region_parent_branches[rid] = parent_branches
+
+            # Build parent -> children mapping
+            if parent_branches:
+                # Child belongs to largest parent
+                parent_branch_id = max(parent_branches, key=parent_branches.get)
+                if parent_branch_id not in parent_to_children:
+                    parent_to_children[parent_branch_id] = []
+                parent_to_children[parent_branch_id].append(rid)
+
+        # SECOND: Assign branch IDs with split detection
+        for rid in range(1, n_regions + 1):
+            parent_branches = region_parent_branches[rid]
+
             if not parent_branches:
-                # New branch (no parent or layer 1)
+                # No parent - create new branch
                 branch_id = next_branch_id
                 next_branch_id += 1
-                # Assign color when branch is created
                 color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
                 branches[branch_id] = {
                     'color': color,
                     'layers': [layer_idx]
                 }
             else:
-                # Inherit from largest parent
-                branch_id = max(parent_branches, key=parent_branches.get)
-                if layer_idx not in branches[branch_id]['layers']:
-                    branches[branch_id]['layers'].append(layer_idx)
-                # Use the color assigned when branch was created
-                color = branches[branch_id]['color']
+                # Has parent(s)
+                parent_branch_id = max(parent_branches, key=parent_branches.get)
+                children_of_parent = parent_to_children.get(parent_branch_id, [])
+
+                if len(children_of_parent) == 1:
+                    # No split - inherit parent branch ID
+                    branch_id = parent_branch_id
+                    if layer_idx not in branches[branch_id]['layers']:
+                        branches[branch_id]['layers'].append(layer_idx)
+                    color = branches[branch_id]['color']
+                else:
+                    # Split detected - create NEW branch for this child
+                    branch_id = next_branch_id
+                    next_branch_id += 1
+                    color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
+                    branches[branch_id] = {
+                        'color': color,
+                        'layers': [layer_idx]
+                    }
 
             curr_layer_branches[rid] = branch_id
             layer_regions[layer_idx][rid] = {
