@@ -318,6 +318,69 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 | **New features** | Demo the feature working end-to-end |
 | **Refactoring** | Run existing tests, show they still pass |
 
+### Rule F.1: USE CHROME EXTENSION TO RUN SIMULATIONS (NON-NEGOTIABLE)
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  When presenting a test URL to the user, do NOT just give the    │
+│  URL and ask the user to run the simulation themselves.           │
+│                                                                  │
+│  INSTEAD: Use the Chrome browser automation extension             │
+│  (mcp__claude-in-chrome__*) to:                                  │
+│  1. Navigate to the test URL                                     │
+│  2. Fill in any required inputs / upload test files               │
+│  3. Click buttons to run the simulation end-to-end               │
+│  4. Wait for results to appear                                   │
+│  5. Take screenshots of the final result                         │
+│  6. Present the screenshots as proof                             │
+│                                                                  │
+│  WHY: User should see the finished result, not do manual work    │
+│  to verify something Claude was supposed to test.                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**CRITICAL REQUIREMENTS:**
+
+1. **Always verify using Chrome extension BEFORE presenting to user**
+   - Never say "here's the URL, try it out"
+   - Always open the URL yourself using `mcp__claude-in-chrome__navigate`
+   - Always run any simulations or analyses end-to-end
+   - Always capture screenshots showing the final result
+
+2. **When presenting URLs, they must ALREADY be open in Chrome**
+   - Use `mcp__claude-in-chrome__tabs_context_mcp` to check tabs
+   - Use `mcp__claude-in-chrome__navigate` to open the URL
+   - Verify the page loaded successfully before presenting to user
+
+3. **Complete simulations/analyses before reporting**
+   - Don't ask user to "click Run" or "start the analysis"
+   - Use `mcp__claude-in-chrome__computer` or `mcp__claude-in-chrome__form_input` to click buttons
+   - Wait for results to complete
+   - Take screenshots showing completed results
+   - Present completed work, not work-in-progress
+
+**Example workflow:**
+```
+1. Start server on new port (e.g., 7234)
+2. Use mcp__claude-in-chrome__navigate to http://localhost:7234
+3. If simulation has inputs, use mcp__claude-in-chrome__form_input to fill them
+4. Use mcp__claude-in-chrome__computer to click "Run Simulation"
+5. Wait for completion (check for results appearing)
+6. Use mcp__claude-in-chrome__read_page to verify results are present
+7. Take screenshot with completed results
+8. THEN present to user: "✅ Simulation complete, see screenshot"
+```
+
+**What NOT to do:**
+- ❌ "Here's the URL: http://localhost:7234 - try uploading a file"
+- ❌ "Server is running, you can test it now"
+- ❌ "Navigate to the page and click Run"
+
+**What TO do:**
+- ✅ "I've run the simulation end-to-end. See screenshot showing [specific result]"
+- ✅ "Analysis complete. Results show [specific findings]. Screenshot attached."
+- ✅ "Tested with sample data. Here's what happens [screenshot of completed run]"
+
 ---
 
 ## Status Templates (MANDATORY)
