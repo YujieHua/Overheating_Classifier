@@ -186,9 +186,10 @@ PARAMETER_RULES = {
     'dissipation_factor': {'min': 0.0, 'max': 1.0},
     'convection_factor': {'min': 0.0, 'max': 0.5},
     'sigma_mm': {'min': 0.1, 'max': 5.0, 'unit': 'mm'},
-    'G_max': {'min': 0.5, 'max': 5.0},
+    'G_max': {'min': 0.5, 'max': 100.0},
     'threshold_medium': {'min': 0.0, 'max': 1.0},
     'threshold_high': {'min': 0.0, 'max': 1.0},
+    'area_ratio_power': {'min': 0.1},
 }
 
 def safe_float(value, default=0.0):
@@ -527,10 +528,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
 
         from src.data.stl_loader import load_stl, slice_stl
         from src.compute.energy_model import run_energy_analysis
-        from src.compute.geometry_score import (
-            calculate_geometry_multiplier_per_layer,
-            calculate_layer_averaged_G
-        )
+        from src.compute.geometry_score import calculate_geometry_multiplier_per_layer
 
         def progress_with_cancel(progress, step):
             if session.is_cancelled():
@@ -545,9 +543,11 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         convection_factor = params.get('convection_factor', 0.05)
         use_geometry_multiplier = params.get('use_geometry_multiplier', False)
         sigma_mm = params.get('sigma_mm', 1.0)
-        G_max = params.get('G_max', 2.0)
+        G_max = params.get('G_max', 99.0)
         threshold_medium = params.get('threshold_medium', 0.3)
         threshold_high = params.get('threshold_high', 0.6)
+        area_ratio_power = params.get('area_ratio_power', 3.0)
+        gaussian_ratio_power = params.get('gaussian_ratio_power', 0.15)
 
         need_reslice = True
         masks = None
@@ -655,7 +655,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 progress_callback=lambda p, s: progress_with_cancel(25 + p * 0.15, s)
             )
 
-            G_layers = calculate_layer_averaged_G(G_layers_2d, masks)
+            G_layers = G_layers_2d  # Pass per-voxel 2D arrays (not pre-averaged scalars)
             progress_with_cancel(42, "[INFO] Geometry G computed")
         else:
             progress_with_cancel(42, "[INFO] Using Area-Only mode (no geometry G)")
@@ -668,6 +668,8 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             dissipation_factor=dissipation_factor,
             convection_factor=convection_factor,
             use_geometry_multiplier=use_geometry_multiplier,
+            area_ratio_power=area_ratio_power,
+            gaussian_ratio_power=gaussian_ratio_power,
             threshold_medium=threshold_medium,
             threshold_high=threshold_high,
             voxel_size=voxel_size,
@@ -696,6 +698,8 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 'use_geometry_multiplier': use_geometry_multiplier,
                 'sigma_mm': sigma_mm if use_geometry_multiplier else None,
                 'G_max': G_max if use_geometry_multiplier else None,
+                'area_ratio_power': area_ratio_power,
+                'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
                 'threshold_medium': threshold_medium,
                 'threshold_high': threshold_high,
                 'mode': energy_results['params']['mode'],
@@ -703,6 +707,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             'computation_time_seconds': computation_time,
             'masks': masks,
             'G_layers': G_layers if use_geometry_multiplier else None,
+            'region_data': energy_results.get('region_data', {}),
         }
 
         progress_with_cancel(98, f"[INFO] Analysis complete in {computation_time:.1f}s")
@@ -779,6 +784,7 @@ def get_results(session_id):
     results = session.results.copy()
     results.pop('masks', None)
     results.pop('G_layers', None)
+    results.pop('region_data', None)
 
     return jsonify({
         'status': 'success',
@@ -915,39 +921,115 @@ def get_layer_surfaces(session_id, data_type):
     elif data_type == 'area_ratio':
         layer_areas = results.get('layer_areas', {})
         contact_areas = results.get('contact_areas', {})
+        area_ratio_power = results.get('params_used', {}).get('area_ratio_power',
+                           results.get('params', {}).get('area_ratio_power', 3.0))
         layer_values = {}
         for k in layer_areas:
             a_layer = float(layer_areas[k])
             a_contact = float(contact_areas.get(k, 0))
             ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
-            layer_values[int(k)] = ratio
-        value_label = 'Area Ratio (A_contact / A_layer)'
+            layer_values[int(k)] = ratio ** area_ratio_power
+        power_label = f'^{area_ratio_power}' if area_ratio_power != 1.0 else ''
+        value_label = f'Area Ratio (A_contact / A_layer){power_label}'
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'gaussian_factor':
         G_layers = results.get('G_layers')
         if G_layers is None:
             return jsonify({'status': 'error', 'message': 'Gaussian factor only available in Mode B'}), 400
+        grp = results.get('params_used', {}).get('gaussian_ratio_power', 0.15)
         layer_values = {}
         for k, g_val in G_layers.items():
-            g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
-            layer_values[int(k)] = 1.0 / (1.0 + g_avg)
-        value_label = 'Gaussian Factor 1/(1+G)'
+            if hasattr(g_val, '__len__'):
+                # 2D array: average multiplier over solid voxels only
+                solid = masks[k] > 0
+                if np.any(solid):
+                    G_solid = g_val[solid]
+                    g_avg = float(np.mean(G_solid))
+                else:
+                    g_avg = 0.0
+            else:
+                g_avg = float(g_val)
+            layer_values[int(k)] = (1.0 / (1.0 + g_avg)) ** grp
+        power_label = f'^{grp}' if grp != 1.0 else ''
+        value_label = f'Gaussian Multiplier (1/(1+G)){power_label}'
         min_val = 0.0
         max_val = 1.0
-    elif data_type == 'combined_factor':
-        # In Mode B, f_geometric = 1/(1+G) only (no area ratio)
-        # This tab shows what the energy model actually uses
-        G_layers = results.get('G_layers')
-        if G_layers is None:
-            return jsonify({'status': 'error', 'message': 'Combined factor only available in Mode B'}), 400
-        layer_values = {}
-        for k, g_val in G_layers.items():
-            g_avg = float(np.mean(g_val)) if hasattr(g_val, '__len__') else float(g_val)
-            layer_values[int(k)] = 1.0 / (1.0 + g_avg)
-        value_label = 'Geometry Factor f = 1/(1+G)'
-        min_val = 0.0
-        max_val = 1.0
+    elif data_type == 'regions':
+        # Region/island detection - each region gets a distinct color
+        from scipy import ndimage
+        region_data_all = results.get('region_data', {})
+
+        layers_data = []
+        sorted_layers = sorted(masks.keys())
+        max_regions_seen = 1
+
+        # 10 distinct high-contrast categorical colors
+        REGION_COLORS = [
+            '#3b82f6',  # blue
+            '#f97316',  # orange
+            '#22c55e',  # green
+            '#ef4444',  # red
+            '#a855f7',  # purple
+            '#eab308',  # yellow
+            '#06b6d4',  # cyan
+            '#ec4899',  # pink
+            '#84cc16',  # lime
+            '#f59e0b',  # amber
+        ]
+
+        for layer in sorted_layers:
+            mask = masks.get(layer)
+            if mask is None:
+                continue
+            mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+            if mask_arr.sum() == 0:
+                continue
+
+            z = layer * layer_thickness
+
+            # Use region_data if available, otherwise label on the fly
+            rd = region_data_all.get(layer)
+            if rd and rd.get('n_regions', 0) > 0:
+                labeled = rd['labeled']
+                n_regions = rd['n_regions']
+            else:
+                labeled, n_regions = ndimage.label(mask_arr > 0)
+
+            if n_regions > max_regions_seen:
+                max_regions_seen = n_regions
+
+            # Generate one surface per region with its own color
+            for rid in range(1, n_regions + 1):
+                region_mask = (labeled == rid).astype(np.uint8)
+                if region_mask.sum() == 0:
+                    continue
+
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z)
+                if vertices and faces:
+                    layers_data.append({
+                        'layer': int(layer),
+                        'z': float(z),
+                        'value': int(rid),
+                        'region_id': int(rid),
+                        'n_regions': int(n_regions),
+                        'color': REGION_COLORS[(rid - 1) % len(REGION_COLORS)],
+                        'vertices': vertices,
+                        'faces': faces
+                    })
+
+        return jsonify({
+            'status': 'success',
+            'layers': layers_data,
+            'n_layers': len(sorted_layers),
+            'n_valid_layers': len(layers_data),
+            'min_val': 1,
+            'max_val': max_regions_seen,
+            'value_label': 'Region ID',
+            'layer_thickness': layer_thickness,
+            'voxel_size': voxel_size,
+            'is_categorical': True
+        })
     else:
         return jsonify({'status': 'error', 'message': f'Unknown data type: {data_type}'}), 400
 
@@ -1781,6 +1863,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         <input type="number" class="param-input" id="convectionFactor" value="0.05" step="0.01" min="0" max="0.5">
                         <span class="param-unit"></span>
                     </div>
+                    <div class="param-row" id="powerParamGroup">
+                        <span class="param-label">Area Ratio Power</span>
+                        <input type="number" class="param-input" id="areaRatioPower" value="3.0" step="0.1" min="0.1">
+                        <span class="param-unit"></span>
+                    </div>
                     <div id="geometryParams" style="display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-color);">
                         <div class="param-row">
                             <span class="param-label">Sigma (σ)</span>
@@ -1789,7 +1876,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         </div>
                         <div class="param-row">
                             <span class="param-label">G Max</span>
-                            <input type="number" class="param-input" id="gMax" value="2.0" step="0.1">
+                            <input type="number" class="param-input" id="gMax" value="99" step="0.1" max="100">
+                            <span class="param-unit"></span>
+                        </div>
+                        <div class="param-row" id="gaussianPowerGroup">
+                            <span class="param-label">Gaussian Ratio Power</span>
+                            <input type="number" class="param-input" id="gaussianRatioPower" value="0.15" step="0.01" min="0.01" max="1.0">
                             <span class="param-unit"></span>
                         </div>
                     </div>
@@ -1829,8 +1921,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
                 <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
                 <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
-                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Factor</button>
-                <button class="tab-btn" onclick="switchTab('combined', event)">Combined Factor</button>
+                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
+                <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
@@ -1879,20 +1971,20 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- Gaussian Factor Tab -->
+                <!-- Gaussian Multiplier Tab -->
                 <div class="tab-panel" id="tab-gaussian">
                     <div class="viz-container" id="gaussianPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see Gaussian factor 1/(1+G)
+                            Run analysis (Mode B) to see Gaussian multiplier 1/(1+G)
                         </div>
                     </div>
                 </div>
 
-                <!-- Combined Factor Tab -->
-                <div class="tab-panel" id="tab-combined">
-                    <div class="viz-container" id="combinedPlot">
+                <!-- Regions Tab -->
+                <div class="tab-panel" id="tab-regions">
+                    <div class="viz-container" id="regionsPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see combined geometry factor
+                            Run analysis to see connected regions (islands)
                         </div>
                     </div>
                 </div>
@@ -2000,11 +2092,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         function updateModelVisibility() {{
             const isGeometry = document.querySelector('input[name="energyModel"]:checked').value === 'geometry_multiplier';
             document.getElementById('geometryParams').style.display = isGeometry ? 'block' : 'none';
+            document.getElementById('powerParamGroup').style.display = isGeometry ? 'none' : '';
         }}
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'combined': 'combinedPlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -2051,7 +2144,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Resize all visible Plotly plots
         function resizeAllPlots() {{
-            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'combinedPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
+            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
                 const plotEl = document.getElementById(plotId);
                 if (plotEl && plotEl.data) {{
                     Plotly.Plots.resize(plotEl);
@@ -2254,7 +2347,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 sigma_mm: parseFloat(document.getElementById('sigmaMM').value),
                 G_max: parseFloat(document.getElementById('gMax').value),
                 threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
-                threshold_high: parseFloat(document.getElementById('thresholdHigh').value)
+                threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
+                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 3.0,
+                gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15
             }};
 
             const runBtn = document.getElementById('runBtn');
@@ -2375,13 +2470,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
+            const isModeB = analysisResults.params_used && analysisResults.params_used.mode === 'geometry_multiplier';
             const vizSteps = [
                 {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
                 {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
                 {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
                 {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
-                {{ label: 'Gaussian Factor', fn: () => renderLayerSurfaces('gaussian_factor') }},
-                {{ label: 'Combined Factor', fn: () => renderLayerSurfaces('combined_factor') }},
+                ...(isModeB ? [
+                    {{ label: 'Gaussian Multiplier', fn: () => renderLayerSurfaces('gaussian_factor') }},
+                ] : []),
+                {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
                 {{ label: 'Summary', fn: () => updateSummary() }}
             ];
 
@@ -2407,8 +2505,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
                 'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }},
                 'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)' }},
-                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Factor 1/(1+G)' }},
-                'combined_factor': {{ plotId: 'combinedPlot', title: 'Combined Geometry Factor' }}
+                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)' }},
+                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)' }}
             }};
 
             const config = plotConfig[dataType];
@@ -2473,12 +2571,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                     // Get color based on data type
                     let color;
-                    if (dataType === 'risk') {{
+                    if (dataType === 'regions') {{
+                        // Regions: use categorical color from backend
+                        color = layerData.color || '#888';
+                    }} else if (dataType === 'risk') {{
                         // Risk uses categorical colors: LOW=green, MEDIUM=yellow, HIGH=red
                         if (value >= 2) color = '#f87171';  // HIGH - red
                         else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
                         else color = '#4ade80';  // LOW - green
-                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor' || dataType === 'combined_factor') {{
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
                         // Geometry factors: REVERSED - high=green (good), low=red (bad)
                         const rv = 1.0 - normalizedValue;  // Reverse: 0→1, 1→0
                         if (rv < 0.3) {{
@@ -2508,6 +2609,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         }}
                     }}
 
+                    let hoverText;
+                    if (dataType === 'regions') {{
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Region: ' + value + ' / ' + (layerData.n_regions || '?') + '<extra></extra>';
+                    }} else {{
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>';
+                    }}
+
                     traces.push({{
                         type: 'mesh3d',
                         x: x,
@@ -2521,7 +2629,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         flatshading: true,
                         lighting: {{ ambient: 0.8, diffuse: 0.5, specular: 0.1, roughness: 0.5 }},
                         lightposition: {{ x: 1000, y: 1000, z: 1000 }},
-                        hovertemplate: 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>',
+                        hovertemplate: hoverText,
                         showscale: false
                     }});
                 }});
@@ -2531,48 +2639,50 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     return;
                 }}
 
-                // Add colorbar via invisible scatter3d trace
-                let colorscale;
-                if (dataType === 'risk') {{
-                    colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
-                }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor' || dataType === 'combined_factor') {{
-                    // Reversed: red at 0 (bad), green at 1 (good)
-                    colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
-                }} else {{
-                    colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
-                }}
+                // Add colorbar via invisible scatter3d trace (skip for categorical regions)
+                if (dataType !== 'regions') {{
+                    let colorscale;
+                    if (dataType === 'risk') {{
+                        colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
+                        // Reversed: red at 0 (bad), green at 1 (good)
+                        colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
+                    }} else {{
+                        colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
+                    }}
 
-                const colorbarTrace = {{
-                    type: 'scatter3d',
-                    mode: 'markers',
-                    x: [null],
-                    y: [null],
-                    z: [null],
-                    marker: {{
-                        size: 0.001,
-                        color: layerValues,
-                        colorscale: colorscale,
-                        cmin: minVal,
-                        cmax: maxVal,
-                        colorbar: {{
-                            title: {{ text: data.value_label, font: {{ color: '#e0e0e0', size: 12 }} }},
-                            tickfont: {{ color: '#c0c0c0', size: 11 }},
-                            x: 1.02,
-                            xanchor: 'left',
-                            y: 0.5,
-                            yanchor: 'middle',
-                            len: 0.6,
-                            thickness: 15,
-                            bgcolor: 'rgba(40,40,40,0.9)',
-                            bordercolor: '#666',
-                            borderwidth: 1
+                    const colorbarTrace = {{
+                        type: 'scatter3d',
+                        mode: 'markers',
+                        x: [null],
+                        y: [null],
+                        z: [null],
+                        marker: {{
+                            size: 0.001,
+                            color: layerValues,
+                            colorscale: colorscale,
+                            cmin: minVal,
+                            cmax: maxVal,
+                            colorbar: {{
+                                title: {{ text: data.value_label, font: {{ color: '#e0e0e0', size: 11 }} }},
+                                tickfont: {{ color: '#c0c0c0', size: 10 }},
+                                x: 0.98,
+                                xanchor: 'right',
+                                y: 0.5,
+                                yanchor: 'middle',
+                                len: 0.5,
+                                thickness: 12,
+                                bgcolor: 'rgba(30,30,30,0.85)',
+                                bordercolor: '#555',
+                                borderwidth: 1
+                            }},
+                            showscale: true
                         }},
-                        showscale: true
-                    }},
-                    hoverinfo: 'skip',
-                    showlegend: false
-                }};
-                traces.push(colorbarTrace);
+                        hoverinfo: 'skip',
+                        showlegend: false
+                    }};
+                    traces.push(colorbarTrace);
+                }}
 
                 // Add kernel visualization for gaussian_factor tab
                 if (dataType === 'gaussian_factor' && sliceVizData && sliceVizData.edge_points && sliceVizData.edge_points.length > 0) {{
@@ -2601,7 +2711,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         zaxis: {{ title: 'Z (mm)', color: '#aaa', gridcolor: '#333', range: [zRange[0] - zPad, zRange[1] + zPad] }},
                         bgcolor: '{BG_MAIN}',
                         aspectmode: 'data',
-                        domain: {{ x: [0, 0.92], y: [0, 1] }}
+                        domain: {{ x: [0, 1], y: [0, 1] }}
                     }},
                     margin: {{ l: 0, r: 0, t: 30, b: 0 }},
                     autosize: true
@@ -2997,6 +3107,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
                     <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
                     <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
+                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 3.0) + '</span></div>' : '<div class="summary-stat"><span class="label">Gaussian Ratio Power</span><span class="value">' + (p.gaussian_ratio_power || 0.15) + '</span></div>'}}
                 </div>
                 <div class="summary-card">
                     <h4>Thresholds</h4>
@@ -3022,6 +3133,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {{
             logConsole('Ready - Load an STL file or use "Load Test STL"', 'info');
+            updateModelVisibility();
         }});
     </script>
 </body>
