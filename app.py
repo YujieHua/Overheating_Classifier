@@ -190,6 +190,10 @@ PARAMETER_RULES = {
     'threshold_medium': {'min': 0.0, 'max': 1.0},
     'threshold_high': {'min': 0.0, 'max': 1.0},
     'area_ratio_power': {'min': 0.1},
+    # Laser parameters for Joule calculation (literature-based ranges)
+    'laser_power': {'min': 50, 'max': 500, 'unit': 'W'},
+    'scan_speed': {'min': 100, 'max': 2000, 'unit': 'mm/s'},
+    'hatch_distance': {'min': 0.05, 'max': 0.15, 'unit': 'mm'},
 }
 
 def safe_float(value, default=0.0):
@@ -550,6 +554,10 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         threshold_high = params.get('threshold_high', 0.6)
         area_ratio_power = params.get('area_ratio_power', 3.0)
         gaussian_ratio_power = params.get('gaussian_ratio_power', 0.15)
+        # Laser parameters for Joule calculation
+        laser_power = params.get('laser_power', 200.0)
+        scan_speed = params.get('scan_speed', 800.0)
+        hatch_distance = params.get('hatch_distance', 0.1)
 
         need_reslice = True
         masks = None
@@ -664,6 +672,9 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
 
         progress_with_cancel(45, "[STAGE] Running energy accumulation analysis...")
 
+        # Effective layer thickness with grouping
+        effective_layer_thickness = layer_thickness * layer_grouping
+
         energy_results = run_energy_analysis(
             masks=masks,
             G_layers=G_layers,
@@ -675,6 +686,10 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             threshold_medium=threshold_medium,
             threshold_high=threshold_high,
             voxel_size=voxel_size,
+            layer_thickness=effective_layer_thickness,
+            laser_power=laser_power,
+            scan_speed=scan_speed,
+            hatch_distance=hatch_distance,
             progress_callback=lambda p, s: progress_with_cancel(45 + p * 0.45, s)
         )
 
@@ -685,6 +700,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         results = {
             'n_layers': n_layers,
             'risk_scores': energy_results['risk_scores'],
+            'raw_energy_scores': energy_results['raw_energy_scores'],
             'risk_levels': energy_results['risk_levels'],
             'layer_areas': energy_results['layer_areas'],
             'contact_areas': energy_results['contact_areas'],
@@ -694,7 +710,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 'layer_thickness': layer_thickness,
                 'layer_grouping': layer_grouping,
                 'build_direction': build_direction,
-                'effective_layer_thickness': layer_thickness * layer_grouping,
+                'effective_layer_thickness': effective_layer_thickness,
                 'dissipation_factor': dissipation_factor,
                 'convection_factor': convection_factor,
                 'use_geometry_multiplier': use_geometry_multiplier,
@@ -705,6 +721,9 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 'threshold_medium': threshold_medium,
                 'threshold_high': threshold_high,
                 'mode': energy_results['params']['mode'],
+                'laser_power': laser_power,
+                'scan_speed': scan_speed,
+                'hatch_distance': hatch_distance,
             },
             'computation_time_seconds': computation_time,
             'masks': masks,
@@ -902,10 +921,16 @@ def get_layer_surfaces(session_id, data_type):
 
     # Get layer values based on data type
     if data_type == 'energy':
-        layer_values = {int(k): float(v) for k, v in results.get('risk_scores', {}).items()}
-        value_label = 'Risk Score'
-        min_val = 0.0
-        max_val = 1.0
+        # Use raw energy in Joules (not normalized risk scores)
+        layer_values = {int(k): float(v) for k, v in results.get('raw_energy_scores', {}).items()}
+        value_label = 'Energy (J)'
+        # Use dynamic min/max for actual Joule values
+        if layer_values:
+            min_val = min(layer_values.values())
+            max_val = max(layer_values.values())
+        else:
+            min_val = 0.0
+            max_val = 1.0
     elif data_type == 'risk':
         # Map risk levels to numeric values: LOW=0, MEDIUM=1, HIGH=2
         risk_levels = results.get('risk_levels', {})
@@ -2262,6 +2287,25 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <span>Geometry Multiplier Mode</span>
                         </label>
                     </div>
+                    <!-- Laser Parameters for Energy Calculation -->
+                    <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border-color);">
+                        <div style="font-size: 0.7rem; color: var(--text-secondary); margin-bottom: 4px;">Laser Parameters</div>
+                        <div class="param-row">
+                            <span class="param-label">Power</span>
+                            <input type="number" class="param-input" id="laserPower" value="200" step="10" min="50" max="500">
+                            <span class="param-unit">W</span>
+                        </div>
+                        <div class="param-row">
+                            <span class="param-label">Scan Speed</span>
+                            <input type="number" class="param-input" id="scanSpeed" value="800" step="50" min="100" max="2000">
+                            <span class="param-unit">mm/s</span>
+                        </div>
+                        <div class="param-row">
+                            <span class="param-label">Hatch Distance</span>
+                            <input type="number" class="param-input" id="hatchDistance" value="0.1" step="0.01" min="0.05" max="0.15">
+                            <span class="param-unit">mm</span>
+                        </div>
+                    </div>
                     <div class="param-row">
                         <span class="param-label">Dissipation Factor</span>
                         <input type="number" class="param-input" id="dissipationFactor" value="0.5" step="0.05" min="0" max="1">
@@ -2758,7 +2802,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
                 threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
                 area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 3.0,
-                gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15
+                gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15,
+                laser_power: parseFloat(document.getElementById('laserPower').value) || 200,
+                scan_speed: parseFloat(document.getElementById('scanSpeed').value) || 800,
+                hatch_distance: parseFloat(document.getElementById('hatchDistance').value) || 0.1
             }};
 
             const runBtn = document.getElementById('runBtn');
@@ -2976,7 +3023,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     const j = faces.map(f => f[1]);
                     const k = faces.map(f => f[2]);
 
-                    const normalizedValue = (value - minVal) / valueRange;
+                    // Guard against division by zero when all values are identical
+                    let normalizedValue;
+                    if (valueRange === 0) {{
+                        normalizedValue = 0.5;  // Middle of scale when all values equal
+                    }} else {{
+                        normalizedValue = (value - minVal) / valueRange;
+                    }}
 
                     // Get color based on data type
                     let color;
@@ -3002,25 +3055,33 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
                         }}
                     }} else {{
-                        // Energy: green=low, red=high
-                        if (normalizedValue < 0.3) {{
-                            // Green range
-                            const t = normalizedValue / 0.3;
-                            color = `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
-                        }} else if (normalizedValue < 0.6) {{
-                            // Yellow range
-                            const t = (normalizedValue - 0.3) / 0.3;
-                            color = `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189 - t * 0)}}, ${{Math.round(36 - t * 0)}})`;
+                        // Energy: Jet colormap (blue → cyan → green → yellow → red)
+                        let r, g, b;
+                        if (normalizedValue < 0.125) {{
+                            const t = normalizedValue / 0.125;
+                            r = 0; g = 0; b = Math.round(128 + t * 127);
+                        }} else if (normalizedValue < 0.375) {{
+                            const t = (normalizedValue - 0.125) / 0.25;
+                            r = 0; g = Math.round(t * 255); b = 255;
+                        }} else if (normalizedValue < 0.625) {{
+                            const t = (normalizedValue - 0.375) / 0.25;
+                            r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
+                        }} else if (normalizedValue < 0.875) {{
+                            const t = (normalizedValue - 0.625) / 0.25;
+                            r = 255; g = Math.round(255 * (1 - t)); b = 0;
                         }} else {{
-                            // Red range
-                            const t = (normalizedValue - 0.6) / 0.4;
-                            color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
+                            const t = (normalizedValue - 0.875) / 0.125;
+                            r = Math.round(255 - t * 127); g = 0; b = 0;
                         }}
+                        color = `rgb(${{r}}, ${{g}}, ${{b}})`;
                     }}
 
                     let hoverText;
                     if (dataType === 'regions') {{
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Region: ' + value + ' / ' + (layerData.n_regions || '?') + '<extra></extra>';
+                    }} else if (dataType === 'energy') {{
+                        // Energy: show Joules with 2 decimal places
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Energy: ' + (typeof value === 'number' ? value.toFixed(2) : value) + ' J<extra></extra>';
                     }} else {{
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>';
                     }}
@@ -3057,7 +3118,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         // Reversed: red at 0 (bad), green at 1 (good)
                         colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
                     }} else {{
-                        colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
+                        // Energy: Jet colorscale (blue → cyan → green → yellow → red)
+                        colorscale = [
+                            [0.0, '#00007F'],    // Dark blue
+                            [0.125, '#0000FF'],  // Blue
+                            [0.375, '#00FFFF'],  // Cyan
+                            [0.5, '#00FF00'],    // Green
+                            [0.625, '#FFFF00'],  // Yellow
+                            [0.875, '#FF0000'],  // Red
+                            [1.0, '#7F0000']     // Dark red
+                        ];
                     }}
 
                     const colorbarTrace = {{
