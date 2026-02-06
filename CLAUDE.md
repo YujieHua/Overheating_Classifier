@@ -1,5 +1,45 @@
 # Claude Guidelines
 
+## ⚠️ CRITICAL: Always Sync Before Starting Work
+
+**MANDATORY FIRST STEP - NO EXCEPTIONS**
+
+Before making ANY changes, edits, or starting ANY task:
+
+1. **Fetch latest changes:**
+   ```bash
+   git fetch origin
+   ```
+
+2. **Check if behind:**
+   ```bash
+   git status
+   ```
+
+3. **If behind, pull latest:**
+   ```bash
+   git pull origin main
+   ```
+
+4. **Verify you're up-to-date:**
+   ```bash
+   git log --oneline -5  # Check recent commits
+   ```
+
+**Why this matters:**
+- Multiple coding sessions may work on this repo simultaneously
+- Working on outdated code wastes time - changes must be redone after merge
+- Conflicts are harder to resolve after significant divergence
+- Fresh start = clean work = easier merges
+
+**If you encounter conflicts during pull:**
+- STOP immediately
+- Report to Yujie with conflict details
+- Do NOT attempt to resolve complex conflicts without approval
+
+---
+
+
 ```
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                     ⚠️  STOP - READ THESE RULES FIRST  ⚠️                   ║
