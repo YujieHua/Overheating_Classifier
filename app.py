@@ -996,28 +996,40 @@ def get_layer_surfaces(session_id, data_type):
             max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
 
             # Overlap-based garbage detection:
-            # - Small regions NEAR larger regions = garbage (filter out)
-            # - Small regions that are standalone = legitimate features (keep)
-            # Threshold for "small": regions < 5% of largest region
-            SMALL_REGION_THRESHOLD = 0.05
+            # - Small regions whose BOUNDING BOX OVERLAPS with larger regions = garbage
+            # - Small regions that are standalone (no bbox overlap) = legitimate features
+            # Threshold for "small": regions < 20% of largest region
+            SMALL_REGION_THRESHOLD = 0.20
             small_region_size_limit = max_region_size * SMALL_REGION_THRESHOLD
 
-            # Pre-compute which regions are "garbage" (small AND near larger regions)
+            # Pre-compute bounding boxes for all regions
+            region_bboxes = {}
+            for rid in range(1, n_regions + 1):
+                rows, cols = np.where(labeled == rid)
+                if len(rows) > 0:
+                    region_bboxes[rid] = (rows.min(), rows.max(), cols.min(), cols.max())
+
+            # Helper function to check if two bounding boxes overlap
+            def bboxes_overlap(bbox1, bbox2):
+                r1_min, r1_max, c1_min, c1_max = bbox1
+                r2_min, r2_max, c2_min, c2_max = bbox2
+                # Check if boxes overlap (share any space)
+                return (r1_min <= r2_max and r1_max >= r2_min and
+                        c1_min <= c2_max and c1_max >= c2_min)
+
+            # Pre-compute which regions are "garbage" (small AND bbox overlaps with larger)
             garbage_regions = set()
             for rid in range(1, n_regions + 1):
                 region_size = region_sizes[rid - 1]
                 if region_size >= small_region_size_limit:
                     continue  # Not small, definitely not garbage
 
-                # This is a small region - check if it's near any larger region
-                region_mask = (labeled == rid)
+                if rid not in region_bboxes:
+                    continue
 
-                # Dilate the small region to check proximity
-                from scipy.ndimage import binary_dilation
-                dilated_small = binary_dilation(region_mask, iterations=3)
+                small_bbox = region_bboxes[rid]
 
-                # Check if dilated region overlaps with any larger region
-                is_near_larger = False
+                # Check if this small region's bbox overlaps with any larger region's bbox
                 for other_rid in range(1, n_regions + 1):
                     if other_rid == rid:
                         continue
@@ -1025,13 +1037,12 @@ def get_layer_surfaces(session_id, data_type):
                     if other_size <= region_size:
                         continue  # Only check against larger regions
 
-                    other_mask = (labeled == other_rid)
-                    if np.any(dilated_small & other_mask):
-                        is_near_larger = True
-                        break
+                    if other_rid not in region_bboxes:
+                        continue
 
-                if is_near_larger:
-                    garbage_regions.add(rid)
+                    if bboxes_overlap(small_bbox, region_bboxes[other_rid]):
+                        garbage_regions.add(rid)
+                        break
 
             # Generate one surface per region with its 3D branch color (skip garbage)
             for rid in range(1, n_regions + 1):
@@ -1228,22 +1239,35 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
             labeled, n_regions = ndimage.label(mask > 0)
 
         # Filter out garbage regions BEFORE branch tracking
-        # Garbage = small regions (< 5% of largest) that are NEAR larger regions
+        # Garbage = small regions (< 20% of largest) whose BOUNDING BOX OVERLAPS with larger regions
         garbage_regions = set()
         if n_regions > 1:
             region_sizes = ndimage.sum(np.array(mask) > 0, labeled, range(1, n_regions + 1))
             max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
-            SMALL_REGION_THRESHOLD = 0.05
+            SMALL_REGION_THRESHOLD = 0.20
+
+            # Pre-compute bounding boxes
+            region_bboxes = {}
+            for rid in range(1, n_regions + 1):
+                rows, cols = np.where(labeled == rid)
+                if len(rows) > 0:
+                    region_bboxes[rid] = (rows.min(), rows.max(), cols.min(), cols.max())
+
+            def bboxes_overlap(bbox1, bbox2):
+                r1_min, r1_max, c1_min, c1_max = bbox1
+                r2_min, r2_max, c2_min, c2_max = bbox2
+                return (r1_min <= r2_max and r1_max >= r2_min and
+                        c1_min <= c2_max and c1_max >= c2_min)
 
             for rid in range(1, n_regions + 1):
                 region_size = region_sizes[rid - 1]
                 if region_size >= max_region_size * SMALL_REGION_THRESHOLD:
                     continue  # Not small
 
-                # Check if near any larger region
-                region_mask = (labeled == rid)
-                from scipy.ndimage import binary_dilation
-                dilated_small = binary_dilation(region_mask, iterations=3)
+                if rid not in region_bboxes:
+                    continue
+
+                small_bbox = region_bboxes[rid]
 
                 for other_rid in range(1, n_regions + 1):
                     if other_rid == rid:
@@ -1251,7 +1275,9 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                     other_size = region_sizes[other_rid - 1]
                     if other_size <= region_size:
                         continue
-                    if np.any(dilated_small & (labeled == other_rid)):
+                    if other_rid not in region_bboxes:
+                        continue
+                    if bboxes_overlap(small_bbox, region_bboxes[other_rid]):
                         garbage_regions.add(rid)
                         break
 
@@ -1398,8 +1424,8 @@ def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
     Returns (vertices, faces) for mesh3d rendering.
 
     Garbage filtering logic:
-    - Small regions (< 5% of largest) that are NEAR larger regions are filtered
-    - Small regions that are standalone (isolated) are KEPT (legitimate features)
+    - Small regions (< 20% of largest) whose BOUNDING BOX OVERLAPS with larger regions are filtered
+    - Small regions that are standalone (no bbox overlap) are KEPT (legitimate features)
 
     Parameters
     ----------
@@ -1433,18 +1459,31 @@ def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
     garbage_regions = set()
     if not skip_garbage_filter and n_features > 1:
         max_region_size = np.max(region_sizes)
-        SMALL_REGION_THRESHOLD = 0.05  # 5% of largest
+        SMALL_REGION_THRESHOLD = 0.20  # 20% of largest
         small_region_size_limit = max_region_size * SMALL_REGION_THRESHOLD
+
+        # Pre-compute bounding boxes
+        region_bboxes = {}
+        for region_id in range(1, n_features + 1):
+            rows, cols = np.where(labeled == region_id)
+            if len(rows) > 0:
+                region_bboxes[region_id] = (rows.min(), rows.max(), cols.min(), cols.max())
+
+        def bboxes_overlap(bbox1, bbox2):
+            r1_min, r1_max, c1_min, c1_max = bbox1
+            r2_min, r2_max, c2_min, c2_max = bbox2
+            return (r1_min <= r2_max and r1_max >= r2_min and
+                    c1_min <= c2_max and c1_max >= c2_min)
 
         for region_id in range(1, n_features + 1):
             region_size = region_sizes[region_id - 1]
             if region_size >= small_region_size_limit:
                 continue  # Not small, not garbage
 
-            # Check if this small region is near any larger region
-            region_mask = (labeled == region_id)
-            from scipy.ndimage import binary_dilation
-            dilated_small = binary_dilation(region_mask, iterations=3)
+            if region_id not in region_bboxes:
+                continue
+
+            small_bbox = region_bboxes[region_id]
 
             for other_id in range(1, n_features + 1):
                 if other_id == region_id:
@@ -1453,7 +1492,10 @@ def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
                 if other_size <= region_size:
                     continue  # Only check against larger regions
 
-                if np.any(dilated_small & (labeled == other_id)):
+                if other_id not in region_bboxes:
+                    continue
+
+                if bboxes_overlap(small_bbox, region_bboxes[other_id]):
                     garbage_regions.add(region_id)
                     break
 
