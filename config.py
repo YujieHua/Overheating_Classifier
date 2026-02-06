@@ -25,6 +25,10 @@ class EnergyModelDefaults:
     use_geometry_multiplier: bool = False  # Mode A (False) vs Mode B (True)
     sigma_mm: float = 1.0  # Gaussian sigma for geometry multiplier
     G_max: float = 2.0  # Maximum geometry multiplier value
+    # Laser parameters for Joule calculation
+    laser_power: float = 200.0  # W (typical: 100-400W)
+    scan_speed: float = 800.0  # mm/s (typical: 500-1500 mm/s)
+    hatch_distance: float = 0.1  # mm (typical: 0.08-0.15 mm)
 
 
 @dataclass

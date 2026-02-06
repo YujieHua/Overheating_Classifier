@@ -70,10 +70,15 @@ def calculate_energy_accumulation(
     use_geometry_multiplier: bool = False,
     area_ratio_power: float = 3.0,
     gaussian_ratio_power: float = 0.15,
+    laser_power: float = 200.0,
+    scan_speed: float = 800.0,
+    hatch_distance: float = 0.1,
+    layer_thickness: float = 0.03,
+    voxel_size: float = 0.1,
     progress_callback: Optional[callable] = None
-) -> Tuple[Dict[int, float], Dict]:
+) -> Tuple[Dict[int, float], Dict[int, float], Dict]:
     """
-    Calculate normalized energy accumulation per layer using region-aware tracking.
+    Calculate energy accumulation per layer in Joules using region-aware tracking.
 
     Each layer is decomposed into connected components (regions/islands).
     Energy is tracked per-region with proper split/merge handling.
@@ -97,25 +102,51 @@ def calculate_energy_accumulation(
     gaussian_ratio_power : float
         Power exponent for Gaussian multiplier in Mode B (0.01-1.0, default 0.15).
         Values < 1 dampen the effect, bringing extreme values closer to 1.
+    laser_power : float
+        Laser power in Watts (W = J/s). Default 200W.
+    scan_speed : float
+        Scan speed in mm/s. Default 800 mm/s.
+    hatch_distance : float
+        Hatch distance in mm. Default 0.1 mm.
+    layer_thickness : float
+        Layer thickness in mm. Default 0.03 mm (30 microns).
+    voxel_size : float
+        Voxel size in mm. Default 0.1 mm.
     progress_callback : callable, optional
         Progress callback function(percent, message)
 
     Returns
     -------
-    tuple of (risk_scores, region_data)
+    tuple of (risk_scores, raw_energy_scores, region_data)
         risk_scores: dict mapping layer_number -> risk_score (0-1, normalized)
+        raw_energy_scores: dict mapping layer_number -> energy in Joules
         region_data: dict mapping layer_number -> region info for visualization
     """
     n_layers = len(masks)
     if n_layers == 0:
-        return {}, {}
+        return {}, {}, {}
+
+    # Validate laser parameters to prevent division by zero
+    if scan_speed <= 0:
+        raise ValueError(f"scan_speed must be positive, got {scan_speed}")
+    if hatch_distance <= 0:
+        raise ValueError(f"hatch_distance must be positive, got {hatch_distance}")
+    if layer_thickness <= 0:
+        raise ValueError(f"layer_thickness must be positive, got {layer_thickness}")
+
+    # Calculate Energy Density: ED = P / (v · h · Δz)  [J/mm³]
+    energy_density = laser_power / (scan_speed * hatch_distance * layer_thickness)
+    logger.info(f"Energy density: {energy_density:.2f} J/mm³ "
+                f"(P={laser_power}W, v={scan_speed}mm/s, h={hatch_distance}mm, Δz={layer_thickness}mm)")
 
     logger.info(f"Calculating region-aware energy accumulation for {n_layers} layers")
     logger.info(f"Parameters: dissipation_factor={dissipation_factor}, "
                 f"convection_factor={convection_factor}, "
                 f"use_geometry_multiplier={use_geometry_multiplier}, "
                 f"area_ratio_power={area_ratio_power}, "
-                f"gaussian_ratio_power={gaussian_ratio_power}")
+                f"gaussian_ratio_power={gaussian_ratio_power}, "
+                f"laser_power={laser_power}W, scan_speed={scan_speed}mm/s, "
+                f"hatch_distance={hatch_distance}mm")
 
     # Per-layer results
     E_layer_scores = {}  # layer -> raw energy (max across regions)
@@ -191,8 +222,9 @@ def calculate_energy_accumulation(
                         fraction = overlap_count / parent_total_to_children
                         E_inherited += parent_energy * fraction
 
-            # 2. Energy input
-            E_in = float(A_region)
+            # 2. Energy input in Joules: E_in = ED × A_region_mm² × Δz
+            A_region_mm2 = A_region * (voxel_size ** 2)  # Convert voxels to mm²
+            E_in = energy_density * A_region_mm2 * layer_thickness  # Joules
 
             # 3. Geometry factor (per-region)
             if n == 1:
@@ -262,10 +294,11 @@ def calculate_energy_accumulation(
         risk_scores = {n: 0.0 for n in range(1, n_layers + 1)}
         logger.warning("All energy dissipated - returning uniform zero risk scores")
 
-    logger.info(f"Energy accumulation complete. Max raw E={E_max:.2f}, "
+    logger.info(f"Energy accumulation complete. Max raw E={E_max:.2f} J, "
                 f"Max risk score={max(risk_scores.values()) if risk_scores else 0:.3f}")
 
-    return risk_scores, region_data
+    # Return both normalized risk_scores and raw energy in Joules
+    return risk_scores, E_layer_scores, region_data
 
 
 def classify_risk_levels(
@@ -429,14 +462,18 @@ def run_energy_analysis(
     gaussian_ratio_power: float = 0.15,
     threshold_medium: float = 0.3,
     threshold_high: float = 0.6,
-    voxel_size: float = 1.0,
+    voxel_size: float = 0.1,
+    layer_thickness: float = 0.03,
+    laser_power: float = 200.0,
+    scan_speed: float = 800.0,
+    hatch_distance: float = 0.1,
     progress_callback: Optional[callable] = None
 ) -> Dict:
     """
     Run complete energy analysis pipeline.
 
     This is the main entry point that combines:
-    1. Region-aware energy accumulation calculation
+    1. Region-aware energy accumulation calculation (in Joules)
     2. Risk classification
     3. Statistics generation
 
@@ -460,6 +497,14 @@ def run_energy_analysis(
         Risk classification threshold for HIGH
     voxel_size : float
         Voxel size in mm
+    layer_thickness : float
+        Layer thickness in mm
+    laser_power : float
+        Laser power in Watts
+    scan_speed : float
+        Scan speed in mm/s
+    hatch_distance : float
+        Hatch distance in mm
     progress_callback : callable, optional
         Progress callback function
 
@@ -467,7 +512,8 @@ def run_energy_analysis(
     -------
     dict
         Complete analysis results including:
-        - risk_scores: normalized scores per layer
+        - risk_scores: normalized scores per layer (0-1)
+        - raw_energy_scores: energy in Joules per layer
         - risk_levels: classification per layer
         - layer_areas: cross-sectional areas
         - contact_areas: contact areas with layer below
@@ -481,8 +527,8 @@ def run_energy_analysis(
     layer_areas = calculate_layer_areas(masks, voxel_size)
     contact_areas = calculate_contact_areas(masks, voxel_size)
 
-    # Calculate energy accumulation (region-aware)
-    risk_scores, region_data = calculate_energy_accumulation(
+    # Calculate energy accumulation (region-aware) in Joules
+    risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
         masks=masks,
         G_layers=G_layers,
         dissipation_factor=dissipation_factor,
@@ -490,6 +536,11 @@ def run_energy_analysis(
         use_geometry_multiplier=use_geometry_multiplier,
         area_ratio_power=area_ratio_power,
         gaussian_ratio_power=gaussian_ratio_power,
+        laser_power=laser_power,
+        scan_speed=scan_speed,
+        hatch_distance=hatch_distance,
+        layer_thickness=layer_thickness,
+        voxel_size=voxel_size,
         progress_callback=progress_callback
     )
 
@@ -508,6 +559,7 @@ def run_energy_analysis(
 
     return {
         'risk_scores': risk_scores,
+        'raw_energy_scores': raw_energy_scores,
         'risk_levels': risk_levels,
         'layer_areas': layer_areas,
         'contact_areas': contact_areas,
@@ -522,5 +574,8 @@ def run_energy_analysis(
             'threshold_medium': threshold_medium,
             'threshold_high': threshold_high,
             'mode': 'geometry_multiplier' if use_geometry_multiplier else 'area_only',
+            'laser_power': laser_power,
+            'scan_speed': scan_speed,
+            'hatch_distance': hatch_distance,
         }
     }
