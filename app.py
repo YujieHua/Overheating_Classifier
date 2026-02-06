@@ -988,8 +988,68 @@ def get_layer_surfaces(session_id, data_type):
             else:
                 labeled, n_regions = ndimage.label(mask_arr > 0)
 
-            # Generate one surface per region with its 3D branch color
+            if n_regions == 0:
+                continue
+
+            # Calculate region sizes for filtering out garbage (small fragments from messy STL)
+            region_sizes = ndimage.sum(mask_arr > 0, labeled, range(1, n_regions + 1))
+            max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
+
+            # Overlap-based garbage detection:
+            # - Small regions whose BOUNDING BOX OVERLAPS with larger regions = garbage
+            # - Small regions that are standalone (no bbox overlap) = legitimate features
+            # Threshold for "small": regions < 20% of largest region
+            SMALL_REGION_THRESHOLD = 0.20
+            small_region_size_limit = max_region_size * SMALL_REGION_THRESHOLD
+
+            # Pre-compute bounding boxes for all regions
+            region_bboxes = {}
             for rid in range(1, n_regions + 1):
+                rows, cols = np.where(labeled == rid)
+                if len(rows) > 0:
+                    region_bboxes[rid] = (rows.min(), rows.max(), cols.min(), cols.max())
+
+            # Helper function to check if two bounding boxes overlap
+            def bboxes_overlap(bbox1, bbox2):
+                r1_min, r1_max, c1_min, c1_max = bbox1
+                r2_min, r2_max, c2_min, c2_max = bbox2
+                # Check if boxes overlap (share any space)
+                return (r1_min <= r2_max and r1_max >= r2_min and
+                        c1_min <= c2_max and c1_max >= c2_min)
+
+            # Pre-compute which regions are "garbage" (small AND bbox overlaps with larger)
+            garbage_regions = set()
+            for rid in range(1, n_regions + 1):
+                region_size = region_sizes[rid - 1]
+                if region_size >= small_region_size_limit:
+                    continue  # Not small, definitely not garbage
+
+                if rid not in region_bboxes:
+                    continue
+
+                small_bbox = region_bboxes[rid]
+
+                # Check if this small region's bbox overlaps with any larger region's bbox
+                for other_rid in range(1, n_regions + 1):
+                    if other_rid == rid:
+                        continue
+                    other_size = region_sizes[other_rid - 1]
+                    if other_size <= region_size:
+                        continue  # Only check against larger regions
+
+                    if other_rid not in region_bboxes:
+                        continue
+
+                    if bboxes_overlap(small_bbox, region_bboxes[other_rid]):
+                        garbage_regions.add(rid)
+                        break
+
+            # Generate one surface per region with its 3D branch color (skip garbage)
+            for rid in range(1, n_regions + 1):
+                # Skip garbage regions (small AND near larger regions)
+                if rid in garbage_regions:
+                    continue
+
                 region_mask = (labeled == rid).astype(np.uint8)
                 if region_mask.sum() == 0:
                     continue
@@ -999,7 +1059,9 @@ def get_layer_surfaces(session_id, data_type):
                 branch_id = region_info.get('branch_id', rid)
                 color = region_info.get('color', '#888888')
 
-                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z)
+                # Skip garbage filter since we already filtered at region level
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
+                                                          skip_garbage_filter=True)
                 if vertices and faces:
                     layers_data.append({
                         'layer': int(layer),
@@ -1176,6 +1238,49 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         else:
             labeled, n_regions = ndimage.label(mask > 0)
 
+        # Filter out garbage regions BEFORE branch tracking
+        # Garbage = small regions (< 20% of largest) whose BOUNDING BOX OVERLAPS with larger regions
+        garbage_regions = set()
+        if n_regions > 1:
+            region_sizes = ndimage.sum(np.array(mask) > 0, labeled, range(1, n_regions + 1))
+            max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
+            SMALL_REGION_THRESHOLD = 0.20
+
+            # Pre-compute bounding boxes
+            region_bboxes = {}
+            for rid in range(1, n_regions + 1):
+                rows, cols = np.where(labeled == rid)
+                if len(rows) > 0:
+                    region_bboxes[rid] = (rows.min(), rows.max(), cols.min(), cols.max())
+
+            def bboxes_overlap(bbox1, bbox2):
+                r1_min, r1_max, c1_min, c1_max = bbox1
+                r2_min, r2_max, c2_min, c2_max = bbox2
+                return (r1_min <= r2_max and r1_max >= r2_min and
+                        c1_min <= c2_max and c1_max >= c2_min)
+
+            for rid in range(1, n_regions + 1):
+                region_size = region_sizes[rid - 1]
+                if region_size >= max_region_size * SMALL_REGION_THRESHOLD:
+                    continue  # Not small
+
+                if rid not in region_bboxes:
+                    continue
+
+                small_bbox = region_bboxes[rid]
+
+                for other_rid in range(1, n_regions + 1):
+                    if other_rid == rid:
+                        continue
+                    other_size = region_sizes[other_rid - 1]
+                    if other_size <= region_size:
+                        continue
+                    if other_rid not in region_bboxes:
+                        continue
+                    if bboxes_overlap(small_bbox, region_bboxes[other_rid]):
+                        garbage_regions.add(rid)
+                        break
+
         curr_layer_branches = {}
         layer_regions[layer_idx] = {}
 
@@ -1184,6 +1289,10 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         region_parent_branches = {}  # region_id -> {parent_branch_id: overlap_count}
 
         for rid in range(1, n_regions + 1):
+            # Skip garbage regions during branch tracking
+            if rid in garbage_regions:
+                continue
+
             region_mask = (labeled == rid)
 
             # Find overlapping parent regions
@@ -1238,7 +1347,11 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
 
         # SECOND: Assign branch IDs with split and merge detection
         for rid in range(1, n_regions + 1):
-            parent_branches = region_parent_branches[rid]
+            # Skip garbage regions
+            if rid in garbage_regions:
+                continue
+
+            parent_branches = region_parent_branches.get(rid, {})
 
             if not parent_branches:
                 # No parent - create new branch
@@ -1301,22 +1414,100 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
     }
 
 
-def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float) -> tuple:
-    """Generate triangulated surface from a 2D mask.
+def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
+                            min_area_fraction: float = 0.01,
+                            min_area_voxels: int = 25,
+                            skip_garbage_filter: bool = False) -> tuple:
+    """Generate triangulated surface from a 2D mask with overlap-based garbage filtering.
 
     Uses marching squares-like approach to find contours and triangulate them.
     Returns (vertices, faces) for mesh3d rendering.
+
+    Garbage filtering logic:
+    - Small regions (< 20% of largest) whose BOUNDING BOX OVERLAPS with larger regions are filtered
+    - Small regions that are standalone (no bbox overlap) are KEPT (legitimate features)
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        2D binary mask of the layer
+    voxel_size : float
+        Physical size of each voxel in mm
+    z : float
+        Z height of this layer in mm
+    min_area_fraction : float
+        (Deprecated) Not used with overlap-based filtering
+    min_area_voxels : int
+        (Deprecated) Not used with overlap-based filtering
+    skip_garbage_filter : bool
+        If True, skip garbage filtering (for pre-filtered single-region masks)
     """
     from scipy import ndimage
 
     # Find connected regions and their boundaries
     labeled, n_features = ndimage.label(mask)
 
+    if n_features == 0:
+        return [], []
+
+    # Calculate area of each region
+    region_sizes = ndimage.sum(mask > 0, labeled, range(1, n_features + 1))
+    if len(region_sizes) == 0:
+        return [], []
+
+    # Overlap-based garbage detection (unless filtering is skipped)
+    garbage_regions = set()
+    if not skip_garbage_filter and n_features > 1:
+        max_region_size = np.max(region_sizes)
+        SMALL_REGION_THRESHOLD = 0.20  # 20% of largest
+        small_region_size_limit = max_region_size * SMALL_REGION_THRESHOLD
+
+        # Pre-compute bounding boxes
+        region_bboxes = {}
+        for region_id in range(1, n_features + 1):
+            rows, cols = np.where(labeled == region_id)
+            if len(rows) > 0:
+                region_bboxes[region_id] = (rows.min(), rows.max(), cols.min(), cols.max())
+
+        def bboxes_overlap(bbox1, bbox2):
+            r1_min, r1_max, c1_min, c1_max = bbox1
+            r2_min, r2_max, c2_min, c2_max = bbox2
+            return (r1_min <= r2_max and r1_max >= r2_min and
+                    c1_min <= c2_max and c1_max >= c2_min)
+
+        for region_id in range(1, n_features + 1):
+            region_size = region_sizes[region_id - 1]
+            if region_size >= small_region_size_limit:
+                continue  # Not small, not garbage
+
+            if region_id not in region_bboxes:
+                continue
+
+            small_bbox = region_bboxes[region_id]
+
+            for other_id in range(1, n_features + 1):
+                if other_id == region_id:
+                    continue
+                other_size = region_sizes[other_id - 1]
+                if other_size <= region_size:
+                    continue  # Only check against larger regions
+
+                if other_id not in region_bboxes:
+                    continue
+
+                if bboxes_overlap(small_bbox, region_bboxes[other_id]):
+                    garbage_regions.add(region_id)
+                    break
+
     all_vertices = []
     all_faces = []
     vertex_offset = 0
 
     for region_id in range(1, n_features + 1):
+        # Skip garbage regions (small AND near larger regions)
+        if region_id in garbage_regions:
+            continue
+
         region_mask = (labeled == region_id)
 
         # Find boundary pixels using erosion
