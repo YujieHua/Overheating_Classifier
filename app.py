@@ -982,6 +982,25 @@ def get_layer_surfaces(session_id, data_type):
         value_label = f'Gaussian Multiplier (1/(1+G)){power_label}'
         min_val = 0.0
         max_val = 1.0
+    elif data_type == 'energy_per_area':
+        # Energy per area: raw_energy_scores / layer_areas (J/mm²)
+        raw_energy = {int(k): float(v) for k, v in results.get('raw_energy_scores', {}).items()}
+        layer_areas = results.get('layer_areas', {})
+        layer_values = {}
+        for k in raw_energy:
+            energy = raw_energy[k]
+            area = float(layer_areas.get(k, 0))
+            if area > 0:
+                layer_values[int(k)] = energy / area
+            else:
+                layer_values[int(k)] = 0.0
+        value_label = 'Energy/Area (J/mm²)'
+        if layer_values:
+            min_val = min(layer_values.values())
+            max_val = max(layer_values.values())
+        else:
+            min_val = 0.0
+            max_val = 1.0
     elif data_type == 'regions':
         # 3D Branch visualization - connected regions across layers colored consistently
         from scipy import ndimage
@@ -2377,6 +2396,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
                 <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
+                <button class="tab-btn" onclick="switchTab('energy_per_area', event)">Energy / Area</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
@@ -2447,6 +2467,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="viz-container" id="energyPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see energy accumulation
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Energy per Area Tab -->
+                <div class="tab-panel" id="tab-energy_per_area">
+                    <div class="viz-container" id="energyPerAreaPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see energy per area (J/mm²)
                         </div>
                     </div>
                 </div>
@@ -2550,7 +2579,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'energy_per_area': 'energyPerAreaPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -2597,7 +2626,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Resize all visible Plotly plots
         function resizeAllPlots() {{
-            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
+            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'energyPerAreaPlot', 'riskPlot'].forEach(plotId => {{
                 const plotEl = document.getElementById(plotId);
                 if (plotEl && plotEl.data) {{
                     Plotly.Plots.resize(plotEl);
@@ -2930,6 +2959,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const vizSteps = [
                 {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
                 {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
+                {{ label: 'Energy/Area', fn: () => renderLayerSurfaces('energy_per_area') }},
                 {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
                 {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
                 ...(isModeB ? [
@@ -2959,6 +2989,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             const plotConfig = {{
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
+                'energy_per_area': {{ plotId: 'energyPerAreaPlot', title: 'Energy per Area (3D)' }},
                 'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }},
                 'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)' }},
                 'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)' }},
@@ -3055,7 +3086,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
                         }}
                     }} else {{
-                        // Energy: Jet colormap (blue → cyan → green → yellow → red)
+                        // Energy and Energy/Area: Jet colormap (blue → cyan → green → yellow → red)
                         let r, g, b;
                         if (normalizedValue < 0.125) {{
                             const t = normalizedValue / 0.125;
@@ -3082,6 +3113,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     }} else if (dataType === 'energy') {{
                         // Energy: show Joules with 2 decimal places
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Energy: ' + (typeof value === 'number' ? value.toFixed(2) : value) + ' J<extra></extra>';
+                    }} else if (dataType === 'energy_per_area') {{
+                        // Energy per area: show J/mm² with 4 decimal places
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Energy/Area: ' + (typeof value === 'number' ? value.toFixed(4) : value) + ' J/mm²<extra></extra>';
                     }} else {{
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>';
                     }}
