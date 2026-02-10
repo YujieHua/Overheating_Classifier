@@ -166,39 +166,110 @@ def slice_stl(mesh_info: Dict,
     ray_directions = np.tile([0, 0, 1], (n_points, 1)).astype(np.float64)
 
     if progress_callback:
-        progress_callback(10, f"Casting {n_points} rays through mesh...")
+        progress_callback(10, f"Casting {n_points:,} rays through mesh...")
 
     # Find all ray-mesh intersections
-    # Returns: locations (Nx3), ray_indices, triangle_indices
+    # For large grids, batch the ray casting to show progress
+    # Batch size of 100k rays balances speed vs responsiveness
+    BATCH_SIZE = 100000
+
     try:
         intersector = mesh.ray
-        locations, ray_indices, _ = intersector.intersects_location(
-            ray_origins=ray_origins,
-            ray_directions=ray_directions
-        )
+
+        if n_points <= BATCH_SIZE:
+            # Small grid - process all at once
+            locations, ray_indices, _ = intersector.intersects_location(
+                ray_origins=ray_origins,
+                ray_directions=ray_directions
+            )
+        else:
+            # Large grid - batch process with progress updates
+            all_locations = []
+            all_ray_indices = []
+            n_batches = (n_points + BATCH_SIZE - 1) // BATCH_SIZE
+
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, n_points)
+
+                batch_origins = ray_origins[start_idx:end_idx]
+                batch_directions = ray_directions[start_idx:end_idx]
+
+                batch_locs, batch_rays, _ = intersector.intersects_location(
+                    ray_origins=batch_origins,
+                    ray_directions=batch_directions
+                )
+
+                # Adjust ray indices to global indices
+                if len(batch_rays) > 0:
+                    all_locations.append(batch_locs)
+                    all_ray_indices.append(batch_rays + start_idx)
+
+                # Update progress (10% to 30% range for ray casting)
+                batch_progress = 10 + int(20 * (batch_idx + 1) / n_batches)
+                if progress_callback:
+                    progress_callback(batch_progress,
+                        f"Ray casting batch {batch_idx + 1}/{n_batches} ({end_idx:,}/{n_points:,} rays)...")
+
+            # Combine batches
+            if all_locations:
+                locations = np.vstack(all_locations)
+                ray_indices = np.concatenate(all_ray_indices)
+            else:
+                locations = np.empty((0, 3))
+                ray_indices = np.empty(0, dtype=np.int64)
 
         if progress_callback:
-            progress_callback(30, f"Found {len(locations)} intersections, building Z-lists...")
+            progress_callback(30, f"Found {len(locations):,} intersections, building Z-hit matrix...")
 
-        # Build a list of Z-intersection values for each ray
-        # ray_z_hits[i] = sorted list of Z coordinates where ray i hits the mesh
-        ray_z_hits = [[] for _ in range(n_points)]
-        for loc, ray_idx in zip(locations, ray_indices):
-            ray_z_hits[ray_idx].append(loc[2])  # Z coordinate of intersection
+        # VECTORIZED APPROACH: Build padded 2D array of Z-hits for fast processing
+        # First, count hits per ray to determine max_hits
+        hit_counts = np.bincount(ray_indices, minlength=n_points)
+        max_hits = hit_counts.max() if len(hit_counts) > 0 else 0
 
-        # Sort each list
-        for i in range(n_points):
-            ray_z_hits[i].sort()
+        if max_hits == 0:
+            # No intersections at all
+            z_hits_padded = None
+            ray_casting_success = True
+        else:
+            # Create padded 2D array: shape (n_points, max_hits), padded with inf
+            z_hits_padded = np.full((n_points, max_hits), np.inf, dtype=np.float64)
 
-        ray_casting_success = True
+            # Fill in the z-values using advanced indexing
+            # First, get the position within each ray's hit list
+            ray_order = np.argsort(ray_indices, kind='stable')
+            sorted_ray_indices = ray_indices[ray_order]
+            sorted_z_values = locations[ray_order, 2]
+
+            # Calculate position within each ray's hits
+            hit_positions = np.zeros(len(ray_indices), dtype=np.int32)
+            current_ray = -1
+            current_pos = 0
+            for idx in range(len(ray_order)):
+                ray_idx = sorted_ray_indices[idx]
+                if ray_idx != current_ray:
+                    current_ray = ray_idx
+                    current_pos = 0
+                hit_positions[idx] = current_pos
+                current_pos += 1
+
+            # Assign z-values to the padded array
+            z_hits_padded[sorted_ray_indices, hit_positions] = sorted_z_values
+
+            # Sort each row (only the non-inf values matter)
+            z_hits_padded.sort(axis=1)
+
+            ray_casting_success = True
+
+        logger.info(f"Ray casting complete: max {max_hits} hits/ray, ready for vectorized layer processing")
 
     except Exception as e:
         logger.warning(f"Ray casting failed: {e}, falling back to mesh.contains()")
         ray_casting_success = False
-        ray_z_hits = None
+        z_hits_padded = None
 
     if progress_callback:
-        progress_callback(40, "Extracting layer masks...")
+        progress_callback(40, "Extracting layer masks (vectorized)...")
 
     masks = {}
     layer_contours = {}
@@ -213,26 +284,19 @@ def slice_stl(mesh_info: Dict,
         z = z_min + (layer - 0.5) * effective_layer_thickness
         z_heights.append(z)
 
-        # ===== DETERMINE INSIDE/OUTSIDE using ray casting =====
-        if ray_casting_success and ray_z_hits is not None:
-            # For each XY point, count intersections ABOVE z
-            # Odd count = inside, even count = outside
-            mask_flat = np.zeros(n_points, dtype=np.uint8)
+        # ===== VECTORIZED INSIDE/OUTSIDE determination =====
+        if ray_casting_success and z_hits_padded is not None:
+            # Count intersections ABOVE z for all points at once using broadcasting
+            # z_hits_padded shape: (n_points, max_hits)
+            # Comparison creates boolean array, sum along axis=1 gives count
+            count_above = np.sum(z_hits_padded > z, axis=1)  # Shape: (n_points,)
 
-            for i in range(n_points):
-                z_hits = ray_z_hits[i]
-                if len(z_hits) == 0:
-                    continue  # No intersections = outside
-
-                # Count how many intersections are above z
-                # Using binary search for efficiency
-                count_above = len(z_hits) - np.searchsorted(z_hits, z)
-
-                # Odd count = inside
-                if count_above % 2 == 1:
-                    mask_flat[i] = 1
-
+            # Odd count = inside, vectorized
+            mask_flat = ((count_above % 2) == 1).astype(np.uint8)
             mask = mask_flat.reshape(nx, ny)
+        elif ray_casting_success and z_hits_padded is None:
+            # No intersections at all - empty layer
+            mask = np.zeros((nx, ny), dtype=np.uint8)
         else:
             # Fallback to mesh.contains() - slower but works
             points_3d = np.column_stack([

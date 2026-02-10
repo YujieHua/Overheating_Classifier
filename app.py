@@ -393,16 +393,22 @@ def load_test_stl():
 
 @app.route('/api/slice', methods=['POST'])
 def api_slice():
+    """Slice-only endpoint: slices STL and detects regions without running energy analysis."""
+    params = request.json or {}
+
     try:
-        voxel_size = float(request.form.get('voxel_size', 0.1))
-        layer_thickness = float(request.form.get('layer_thickness', 0.04))
+        voxel_size = float(params.get('voxel_size', 0.1))
+        layer_thickness = float(params.get('layer_thickness', 0.04))
+        layer_grouping = int(params.get('layer_grouping', 25))
+        build_direction = params.get('build_direction', 'Z')
     except (ValueError, TypeError) as e:
         logger.warning(f"Invalid parameter format: {e}")
         return jsonify({'status': 'error', 'message': 'Invalid parameter format'}), 400
 
     is_valid, errors = validate_parameters({
         'voxel_size': voxel_size,
-        'layer_thickness': layer_thickness
+        'layer_thickness': layer_thickness,
+        'layer_grouping': layer_grouping
     })
     if not is_valid:
         return jsonify({'status': 'error', 'message': str(errors)}), 400
@@ -418,7 +424,7 @@ def api_slice():
 
     thread = threading.Thread(
         target=slice_worker,
-        args=(session, stl_path, voxel_size, layer_thickness)
+        args=(session, stl_path, voxel_size, layer_thickness, layer_grouping, build_direction)
     )
     thread.daemon = True
     thread.start()
@@ -429,10 +435,14 @@ def api_slice():
     })
 
 
-def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, layer_thickness: float):
+def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, layer_thickness: float,
+                  layer_grouping: int = 25, build_direction: str = 'Z'):
+    """Slice STL and detect connected regions (islands) per layer."""
     try:
         start_time = time.time()
         from src.data.stl_loader import load_stl, slice_stl
+        from scipy import ndimage
+        import numpy as np
 
         def progress_with_cancel(progress, step):
             if session.is_cancelled():
@@ -444,13 +454,52 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
         # Load mesh first (slice_stl expects mesh_info dict, not path)
         mesh_info = load_stl(stl_path)
 
+        # Apply build direction transformation if needed
+        if build_direction != 'Z':
+            import trimesh
+            mesh = mesh_info['mesh']
+            if build_direction == 'Y':
+                # Y-down: rotate so Y becomes Z, then flip
+                rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
+                mesh.apply_transform(rotation)
+                flip = trimesh.transformations.reflection_matrix([0, 0, 0], [0, 0, 1])
+                mesh.apply_transform(flip)
+            elif build_direction == 'Y-':
+                # Y-up: rotate so Y becomes Z (no flip)
+                rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
+                mesh.apply_transform(rotation)
+            elif build_direction == 'X':
+                rotation = trimesh.transformations.rotation_matrix(-np.pi/2, [0, 1, 0])
+                mesh.apply_transform(rotation)
+            # Update mesh_info with transformed mesh
+            mesh_info['mesh'] = mesh
+            mesh_info['bounds'] = mesh.bounds
+            mesh_info['dimensions'] = mesh.bounds[1] - mesh.bounds[0]
+
         slice_result = slice_stl(
             mesh_info=mesh_info,
             voxel_size=voxel_size,
             layer_thickness=layer_thickness,
-            layer_grouping=25,  # Default grouping for preview slicing
+            layer_grouping=layer_grouping,
             progress_callback=progress_with_cancel
         )
+
+        # Detect regions (connected components) per layer
+        session.update_progress(92, "[STAGE] Detecting regions per layer...")
+        masks = slice_result['masks']
+        region_data = {}
+        for layer_num, mask in masks.items():
+            labeled, n_regions = ndimage.label(mask > 0)
+            region_areas = {}
+            for rid in range(1, n_regions + 1):
+                region_areas[rid] = int(np.sum(labeled == rid))
+            region_data[layer_num] = {
+                'n_regions': n_regions,
+                'labeled': labeled,
+                'region_areas': region_areas,
+            }
+
+        slice_result['region_data'] = region_data
 
         if not session.is_cancelled():
             with current_state['lock']:
@@ -458,7 +507,7 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 current_state['cached_slice_params'] = {
                     'voxel_size': voxel_size,
                     'layer_thickness': layer_thickness,
-                    'layer_grouping': 25  # Default for preview slicing
+                    'layer_grouping': layer_grouping
                 }
                 current_state['cached_slice_info'] = {
                     'n_layers': slice_result['n_layers'],
@@ -472,6 +521,7 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 'grid_shape': slice_result['grid_shape'],
                 'voxel_size': voxel_size,
                 'layer_thickness': layer_thickness,
+                'layer_grouping': layer_grouping,
             }, computation_time)
 
     except CancelledException:
@@ -479,6 +529,42 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
     except Exception as e:
         logger.error(f"Slicing error: {e}", exc_info=True)
         session.set_error(str(e))
+
+
+@app.route('/api/slice_results/<session_id>', methods=['GET'])
+def get_slice_results(session_id: str):
+    """Get slice results including region data for visualization."""
+    session = session_registry.get_session(session_id)
+    if not session:
+        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
+
+    if session.status != 'complete':
+        return jsonify({'status': 'error', 'message': f'Session status: {session.status}'}), 400
+
+    if not session.slice_data:
+        return jsonify({'status': 'error', 'message': 'No slice data available'}), 400
+
+    slice_data = session.slice_data
+
+    # Prepare region summary for each layer (without sending full labeled arrays)
+    region_summary = {}
+    region_data = slice_data.get('region_data', {})
+    for layer_num, rd in region_data.items():
+        region_summary[layer_num] = {
+            'n_regions': rd['n_regions'],
+            'region_areas': rd['region_areas'],
+        }
+
+    return jsonify({
+        'status': 'success',
+        'results': {
+            'n_layers': slice_data['n_layers'],
+            'grid_shape': slice_data['grid_shape'],
+            'voxel_size': slice_data['voxel_size'],
+            'layer_thickness': slice_data['layer_thickness'],
+            'region_summary': region_summary,
+        }
+    })
 
 
 @app.route('/api/run', methods=['POST'])
@@ -903,17 +989,38 @@ def export_results(session_id):
 def get_layer_surfaces(session_id, data_type):
     """Get 3D layer surfaces with per-layer values for different data types.
 
-    Supports: energy (risk scores), risk (risk levels)
+    Supports: energy (risk scores), risk (risk levels), slices, regions
 
     Each layer is rendered as a surface with color based on its value.
+    Also supports slice-only mode where only masks and regions are available.
     """
     session = session_registry.get_session(session_id)
-    if not session or not session.results:
-        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+    if not session:
+        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
 
+    # Support both full analysis results and slice-only data
+    # Check slice_data first since set_complete may set session.results to metadata without masks
     results = session.results
-    masks = results.get('masks', {})
-    params = results.get('params_used', {})
+    slice_data = session.slice_data
+
+    # Prefer slice_data if it has masks (slice-only mode or slice from full analysis)
+    if slice_data and slice_data.get('masks'):
+        # Slice-only mode: use slice_data for slices/regions visualization
+        masks = slice_data.get('masks', {})
+        params = {
+            'voxel_size': slice_data.get('voxel_size', 0.1),
+            'layer_thickness': slice_data.get('layer_thickness', 0.04),
+        }
+        # For slice-only mode, only slices and regions are available
+        if data_type not in ['slices', 'regions']:
+            return jsonify({'status': 'error',
+                           'message': f'{data_type} requires full analysis (Run Analysis), not just slicing'}), 400
+    elif results and results.get('masks'):
+        # Full analysis mode with masks in results
+        masks = results.get('masks', {})
+        params = results.get('params_used', {})
+    else:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
 
     if not masks:
         return jsonify({'status': 'error', 'message': 'No mask data available'}), 404
@@ -985,10 +1092,88 @@ def get_layer_surfaces(session_id, data_type):
         min_val = 0.0
         max_val = 1.0
     elif data_type == 'regions':
-        # 3D Branch visualization - connected regions across layers colored consistently
+        # Regions visualization - supports two view modes
         from scipy import ndimage
-        region_data_all = results.get('region_data', {})
+        view_mode = request.args.get('view_mode', 'branches_3d')  # 'per_layer' or 'branches_3d'
+        # Get region_data from either full results or slice-only data
+        if results:
+            region_data_all = results.get('region_data', {})
+        elif slice_data:
+            region_data_all = slice_data.get('region_data', {})
+        else:
+            region_data_all = {}
 
+        # Color palette for per-layer view (distinct colors)
+        REGION_COLORS = [
+            '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
+            '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5',
+            '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854', '#ffd92f'
+        ]
+
+        if view_mode == 'per_layer':
+            # Per-layer view: each region colored by its local region ID
+            layers_data = []
+            sorted_layers = sorted(masks.keys())
+            max_regions = 1
+
+            for layer in sorted_layers:
+                mask = masks.get(layer)
+                if mask is None:
+                    continue
+                mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+                if mask_arr.sum() == 0:
+                    continue
+
+                z = layer * layer_thickness
+
+                # Use region_data if available, otherwise label on the fly
+                rd = region_data_all.get(layer)
+                if rd and rd.get('n_regions', 0) > 0:
+                    labeled = rd['labeled']
+                    n_regions = rd['n_regions']
+                else:
+                    labeled, n_regions = ndimage.label(mask_arr > 0)
+
+                if n_regions == 0:
+                    continue
+
+                max_regions = max(max_regions, n_regions)
+
+                # Generate one surface per region with color based on region ID
+                for rid in range(1, n_regions + 1):
+                    region_mask = (labeled == rid).astype(np.uint8)
+                    if region_mask.sum() == 0:
+                        continue
+
+                    color = REGION_COLORS[(rid - 1) % len(REGION_COLORS)]
+                    vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
+                                                              skip_garbage_filter=True)
+                    if vertices and faces:
+                        layers_data.append({
+                            'layer': int(layer),
+                            'z': float(z),
+                            'value': int(rid),
+                            'region_id': int(rid),
+                            'n_regions': int(n_regions),
+                            'color': color,
+                            'vertices': vertices,
+                            'faces': faces
+                        })
+
+            return jsonify({
+                'status': 'success',
+                'layers': layers_data,
+                'n_layers': len(sorted_layers),
+                'n_valid_layers': len(layers_data),
+                'min_val': 1,
+                'max_val': max_regions,
+                'value_label': 'Region ID (per layer)',
+                'layer_thickness': layer_thickness,
+                'voxel_size': voxel_size,
+                'is_categorical': True
+            })
+
+        # Default: 3D Branch visualization - connected regions across layers colored consistently
         # Build 3D branch tracking
         branch_info = _build_3d_branches(masks, region_data_all)
         layer_regions = branch_info['layer_regions']
@@ -1616,14 +1801,32 @@ def get_slice_visualization(session_id):
 
     Returns layer surfaces and edge points where kernels can be placed.
     The frontend handles kernel rendering, updating when sigma changes.
+    Also supports slice-only mode (from Slice button).
     """
     session = session_registry.get_session(session_id)
-    if not session or not session.results:
-        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+    if not session:
+        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
 
+    # Support both full analysis results and slice-only data
+    # Check slice_data first (for slice-only mode) since set_complete may set
+    # session.results to metadata without masks
     results = session.results
-    masks = results.get('masks', {})
-    params = results.get('params_used', {})
+    slice_data = session.slice_data
+
+    # Prefer slice_data if it has masks, otherwise use results
+    if slice_data and slice_data.get('masks'):
+        # Slice-only mode (or slice_data available from full analysis)
+        masks = slice_data.get('masks', {})
+        params = {
+            'voxel_size': slice_data.get('voxel_size', 0.1),
+            'layer_thickness': slice_data.get('layer_thickness', 0.04),
+        }
+    elif results and results.get('masks'):
+        # Full analysis mode with masks in results
+        masks = results.get('masks', {})
+        params = results.get('params_used', {})
+    else:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
 
     if not masks:
         return jsonify({'status': 'error', 'message': 'No mask data available'}), 404
@@ -2269,6 +2472,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                                 <option value="X">X-up (rotate X→Z)</option>
                             </select>
                         </div>
+
+                        <!-- Slice Button -->
+                        <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color);">
+                            <button class="btn btn-primary" id="sliceBtn" style="width: 100%; padding: 6px 12px; font-size: 0.8rem;" onclick="runSliceOnly()" disabled>
+                                Slice (Preview Regions)
+                            </button>
+                            <div style="font-size: 0.65rem; color: var(--text-secondary); margin-top: 2px; text-align: center;">
+                                Slices STL and detects regions without running full analysis
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2376,9 +2589,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             <nav class="tab-nav">
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
                 <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
+                <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
                 <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
                 <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
-                <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
@@ -2413,7 +2626,29 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <div class="tab-panel" id="tab-slices">
                     <div class="viz-container" id="slicesPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see sliced layers
+                            Click "Slice" or "Run Analysis" to see sliced layers
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Regions Tab (moved after Sliced Layers) -->
+                <div class="tab-panel" id="tab-regions">
+                    <div class="regions-controls" style="position: absolute; top: 10px; left: 10px; z-index: 100; display: none;" id="regionsControls">
+                        <div style="background: var(--bg-secondary); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; gap: 8px; align-items: center;">
+                            <label style="font-size: 0.75rem; color: var(--text-secondary);">View:</label>
+                            <label class="radio-option" style="font-size: 0.75rem; margin: 0;">
+                                <input type="radio" name="regionsView" value="per_layer" checked onchange="updateRegionsView()">
+                                <span>Per-Layer</span>
+                            </label>
+                            <label class="radio-option" style="font-size: 0.75rem; margin: 0;">
+                                <input type="radio" name="regionsView" value="branches_3d" onchange="updateRegionsView()">
+                                <span>3D Branches</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="viz-container" id="regionsPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Click "Slice" or "Run Analysis" to see connected regions (islands)
                         </div>
                     </div>
                 </div>
@@ -2432,15 +2667,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="viz-container" id="gaussianPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis (Mode B) to see Gaussian multiplier 1/(1+G)
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Regions Tab -->
-                <div class="tab-panel" id="tab-regions">
-                    <div class="viz-container" id="regionsPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see connected regions (islands)
                         </div>
                     </div>
                 </div>
@@ -2516,9 +2742,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
     <script>
         // Global state
         let currentSessionId = null;
+        let sliceSessionId = null;  // Session ID for slice-only operations
         let analysisResults = null;
+        let sliceResults = null;  // Stores slice-only results (masks, regions)
         let stlLoaded = false;
         let currentEventSource = null;  // Track EventSource for cleanup
+        let currentRegionsView = 'per_layer';  // 'per_layer' or 'branches_3d'
 
         // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
@@ -2699,6 +2928,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     stlLoaded = true;
                     stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
+                    document.getElementById('sliceBtn').disabled = false;
                     document.getElementById('fileUpload').classList.add('loaded');
                     document.getElementById('fileUploadText').textContent = data.filename || 'Test STL';
 
@@ -2746,6 +2976,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     stlLoaded = true;
                     stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
+                    document.getElementById('sliceBtn').disabled = false;
                     document.getElementById('fileUpload').classList.add('loaded');
                     document.getElementById('fileUploadText').textContent = file.name;
 
@@ -2769,6 +3000,145 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }} catch (err) {{
                 logConsole('Upload failed: ' + err.message, 'error');
             }}
+        }}
+
+        // Run slice-only (no energy analysis, just slicing and region detection)
+        async function runSliceOnly() {{
+            if (!stlLoaded) {{
+                logConsole('Please upload an STL file first', 'warning');
+                return;
+            }}
+
+            const params = {{
+                voxel_size: parseFloat(document.getElementById('voxelSize').value),
+                layer_thickness: parseFloat(document.getElementById('layerThickness').value),
+                layer_grouping: parseInt(document.getElementById('layerGroupingValue').value) || 1,
+                build_direction: document.getElementById('buildDirection').value
+            }};
+
+            const sliceBtn = document.getElementById('sliceBtn');
+            sliceBtn.disabled = true;
+            sliceBtn.textContent = 'Slicing...';
+
+            try {{
+                logConsole('Starting slice operation (layer grouping: ' + params.layer_grouping + 'x)...', 'info');
+
+                const response = await fetch('/api/slice', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify(params)
+                }});
+
+                const data = await response.json();
+
+                if (data.status === 'started') {{
+                    monitorSliceProgress(data.session_id);
+                }} else {{
+                    logConsole('Error: ' + data.message, 'error');
+                    sliceBtn.disabled = false;
+                    sliceBtn.textContent = 'Slice (Preview Regions)';
+                }}
+            }} catch (err) {{
+                logConsole('Slice failed: ' + err.message, 'error');
+                sliceBtn.disabled = false;
+                sliceBtn.textContent = 'Slice (Preview Regions)';
+            }}
+        }}
+
+        // Monitor slice progress via SSE
+        function monitorSliceProgress(sessionId) {{
+            const evtSource = new EventSource('/api/progress/' + sessionId);
+
+            evtSource.onmessage = function(event) {{
+                const data = JSON.parse(event.data);
+                const sliceBtn = document.getElementById('sliceBtn');
+
+                if (data.heartbeat) return;
+
+                if (data.progress !== undefined) {{
+                    logConsole('[' + data.progress + '%] ' + (data.message || ''), 'info');
+                }}
+
+                if (data.status === 'complete') {{
+                    evtSource.close();
+                    sliceBtn.disabled = false;
+                    sliceBtn.textContent = 'Slice (Preview Regions)';
+                    logConsole('Slice completed! Fetching results...', 'success');
+                    // Store session ID for visualization
+                    sliceSessionId = sessionId;
+                    fetchSliceResults(sessionId);
+                }}
+
+                if (data.status === 'error' || data.status === 'cancelled') {{
+                    evtSource.close();
+                    sliceBtn.disabled = false;
+                    sliceBtn.textContent = 'Slice (Preview Regions)';
+                    logConsole('Slice failed: ' + (data.message || 'Unknown error'), 'error');
+                }}
+            }};
+
+            evtSource.onerror = function() {{
+                evtSource.close();
+                document.getElementById('sliceBtn').disabled = false;
+                document.getElementById('sliceBtn').textContent = 'Slice (Preview Regions)';
+            }};
+        }}
+
+        // Fetch slice results after completion
+        async function fetchSliceResults(sessionId) {{
+            try {{
+                const response = await fetch('/api/slice_results/' + sessionId);
+                const data = await response.json();
+
+                if (data.status === 'success') {{
+                    sliceResults = data.results;
+                    logConsole('Slice data ready: ' + sliceResults.n_layers + ' layers', 'success');
+
+                    // Update layer slider
+                    const slider = document.getElementById('layerSlider');
+                    slider.max = sliceResults.n_layers;
+                    slider.value = 1;
+                    document.getElementById('layerVal').textContent = '1 / ' + sliceResults.n_layers;
+
+                    // Show regions controls
+                    document.getElementById('regionsControls').style.display = 'block';
+
+                    // Render sliced layers and regions
+                    updateSlicesVisualization();
+                    updateRegionsVisualization();
+
+                    // Switch to Regions tab
+                    switchTab('regions');
+                }} else {{
+                    logConsole('Error fetching slice results: ' + data.message, 'error');
+                }}
+            }} catch (err) {{
+                logConsole('Error fetching slice results: ' + err.message, 'error');
+            }}
+        }}
+
+        // Update regions view toggle
+        function updateRegionsView() {{
+            currentRegionsView = document.querySelector('input[name="regionsView"]:checked').value;
+            updateRegionsVisualization();
+        }}
+
+        // Render slices visualization (used by both Slice and Run Analysis)
+        function updateSlicesVisualization() {{
+            const results = analysisResults || sliceResults;
+            if (!results) return;
+
+            // Re-render the slices tab
+            fetchAndRenderVisualization('slices', document.getElementById('layerSlider').value);
+        }}
+
+        // Render regions visualization based on current view mode
+        function updateRegionsVisualization() {{
+            const results = analysisResults || sliceResults;
+            if (!results) return;
+
+            const layer = parseInt(document.getElementById('layerSlider').value);
+            fetchAndRenderVisualization('regions', layer, currentRegionsView);
         }}
 
         // Run analysis (can be called during existing run to restart with new params)
@@ -2956,9 +3326,21 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             logConsole('All visualizations loaded', 'success');
         }}
 
+        // Helper to fetch and render visualization with optional view mode
+        async function fetchAndRenderVisualization(dataType, layer, viewMode) {{
+            if (dataType === 'slices') {{
+                renderSlicesPlot();
+            }} else if (dataType === 'regions') {{
+                renderLayerSurfaces('regions', viewMode || currentRegionsView);
+            }} else {{
+                renderLayerSurfaces(dataType);
+            }}
+        }}
+
         // Unified layer surface rendering for 3D visualization
-        async function renderLayerSurfaces(dataType) {{
-            if (!currentSessionId) return;
+        async function renderLayerSurfaces(dataType, viewMode) {{
+            const sessionId = currentSessionId || sliceSessionId;
+            if (!sessionId) return;
 
             const plotConfig = {{
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
@@ -2977,7 +3359,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             logConsole('Loading ' + config.title + ' surfaces...', 'info');
 
             try {{
-                const response = await fetch('/api/layer_surfaces/' + currentSessionId + '/' + dataType);
+                let url = '/api/layer_surfaces/' + sessionId + '/' + dataType;
+                if (viewMode) {{
+                    url += '?view_mode=' + viewMode;
+                }}
+                const response = await fetch(url);
                 if (!response.ok) {{
                     logConsole('Failed to load ' + config.title + ': HTTP ' + response.status, 'error');
                     return;
@@ -3222,12 +3608,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Render sliced layers with kernel visualization
         async function renderSlicesPlot() {{
-            if (!currentSessionId) return;
+            const sessionId = currentSessionId || sliceSessionId;
+            if (!sessionId) return;
 
             logConsole('Loading sliced layers visualization...', 'info');
 
             try {{
-                const response = await fetch('/api/slice_visualization/' + currentSessionId);
+                const response = await fetch('/api/slice_visualization/' + sessionId);
                 if (!response.ok) {{
                     logConsole('Failed to load slices: HTTP ' + response.status, 'error');
                     return;
