@@ -2400,6 +2400,39 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         .summary-stat {{ display: flex; justify-content: space-between; padding: 6px 0; font-size: 0.85rem; }}
         .summary-stat .label {{ color: var(--text-secondary); }}
         .summary-stat .value {{ color: var(--text-primary); font-weight: 500; }}
+        /* Loading overlay for visualization tabs */
+        .loading-overlay {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(10, 15, 25, 0.85);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }}
+        .loading-overlay.hidden {{
+            display: none;
+        }}
+        .loading-spinner {{
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--border-color);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }}
+        @keyframes spin {{
+            to {{ transform: rotate(360deg); }}
+        }}
+        .loading-text {{
+            margin-top: 12px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }}
     </style>
 </head>
 <body>
@@ -2476,11 +2509,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         <!-- Slice Button -->
                         <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color);">
                             <button class="btn btn-primary" id="sliceBtn" style="width: 100%; padding: 6px 12px; font-size: 0.8rem;" onclick="runSliceOnly()" disabled>
-                                Slice (Preview Regions)
+                                Slice
                             </button>
-                            <div style="font-size: 0.65rem; color: var(--text-secondary); margin-top: 2px; text-align: center;">
-                                Slices STL and detects regions without running full analysis
-                            </div>
                         </div>
                     </div>
                 </div>
@@ -2625,7 +2655,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Sliced Layers Tab -->
                 <div class="tab-panel" id="tab-slices">
                     <div class="viz-container" id="slicesPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                        <div class="loading-overlay hidden" id="slicesLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Loading sliced layers...</div>
+                        </div>
+                        <div id="slicesPlaceholder" style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Click "Slice" or "Run Analysis" to see sliced layers
                         </div>
                     </div>
@@ -2633,21 +2667,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
                 <!-- Regions Tab (moved after Sliced Layers) -->
                 <div class="tab-panel" id="tab-regions">
-                    <div class="regions-controls" style="position: absolute; top: 10px; left: 10px; z-index: 100; display: none;" id="regionsControls">
-                        <div style="background: var(--bg-secondary); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; gap: 8px; align-items: center;">
-                            <label style="font-size: 0.75rem; color: var(--text-secondary);">View:</label>
-                            <label class="radio-option" style="font-size: 0.75rem; margin: 0;">
-                                <input type="radio" name="regionsView" value="per_layer" checked onchange="updateRegionsView()">
-                                <span>Per-Layer</span>
-                            </label>
-                            <label class="radio-option" style="font-size: 0.75rem; margin: 0;">
-                                <input type="radio" name="regionsView" value="branches_3d" onchange="updateRegionsView()">
-                                <span>3D Branches</span>
-                            </label>
-                        </div>
-                    </div>
                     <div class="viz-container" id="regionsPlot">
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                        <div class="loading-overlay hidden" id="regionsLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Loading regions...</div>
+                        </div>
+                        <div id="regionsPlaceholder" style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Click "Slice" or "Run Analysis" to see connected regions (islands)
                         </div>
                     </div>
@@ -2722,6 +2747,20 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <div class="control-group">
                     <label>Marker Size <span class="value" id="markerSizeVal">4</span></label>
                     <input type="range" id="markerSize" min="1" max="10" value="4" onchange="updateMarkerSize(this.value)">
+                </div>
+            </div>
+
+            <div class="viz-block" id="regionsViewBlock" style="display: none;">
+                <div class="block-title">View Mode</div>
+                <div class="control-group" style="margin-bottom: 0;">
+                    <label class="radio-option" style="margin-bottom: 6px;">
+                        <input type="radio" name="regionsView" value="per_layer" checked onchange="updateRegionsView()">
+                        <span>Per-Layer Colors</span>
+                    </label>
+                    <label class="radio-option">
+                        <input type="radio" name="regionsView" value="branches_3d" onchange="updateRegionsView()">
+                        <span>3D Branch Tracking</span>
+                    </label>
                 </div>
             </div>
 
@@ -2824,6 +2863,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const kernelBlock = document.getElementById('kernelVizBlock');
             if (kernelBlock) {{
                 kernelBlock.style.display = (tabName === 'gaussian') ? 'block' : 'none';
+            }}
+
+            // Show/hide regions view mode controls
+            const regionsViewBlock = document.getElementById('regionsViewBlock');
+            if (regionsViewBlock) {{
+                regionsViewBlock.style.display = (tabName === 'regions') ? 'block' : 'none';
             }}
         }}
 
@@ -3036,12 +3081,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 }} else {{
                     logConsole('Error: ' + data.message, 'error');
                     sliceBtn.disabled = false;
-                    sliceBtn.textContent = 'Slice (Preview Regions)';
+                    sliceBtn.textContent = 'Slice';
                 }}
             }} catch (err) {{
                 logConsole('Slice failed: ' + err.message, 'error');
                 sliceBtn.disabled = false;
-                sliceBtn.textContent = 'Slice (Preview Regions)';
+                sliceBtn.textContent = 'Slice';
             }}
         }}
 
@@ -3062,7 +3107,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 if (data.status === 'complete') {{
                     evtSource.close();
                     sliceBtn.disabled = false;
-                    sliceBtn.textContent = 'Slice (Preview Regions)';
+                    sliceBtn.textContent = 'Slice';
                     logConsole('Slice completed! Fetching results...', 'success');
                     // Store session ID for visualization
                     sliceSessionId = sessionId;
@@ -3072,7 +3117,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 if (data.status === 'error' || data.status === 'cancelled') {{
                     evtSource.close();
                     sliceBtn.disabled = false;
-                    sliceBtn.textContent = 'Slice (Preview Regions)';
+                    sliceBtn.textContent = 'Slice';
                     logConsole('Slice failed: ' + (data.message || 'Unknown error'), 'error');
                 }}
             }};
@@ -3080,7 +3125,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             evtSource.onerror = function() {{
                 evtSource.close();
                 document.getElementById('sliceBtn').disabled = false;
-                document.getElementById('sliceBtn').textContent = 'Slice (Preview Regions)';
+                document.getElementById('sliceBtn').textContent = 'Slice';
             }};
         }}
 
@@ -3099,9 +3144,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     slider.max = sliceResults.n_layers;
                     slider.value = 1;
                     document.getElementById('layerVal').textContent = '1 / ' + sliceResults.n_layers;
-
-                    // Show regions controls
-                    document.getElementById('regionsControls').style.display = 'block';
 
                     // Render sliced layers and regions
                     updateSlicesVisualization();
@@ -3343,17 +3385,28 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             if (!sessionId) return;
 
             const plotConfig = {{
-                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
-                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }},
-                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)' }},
-                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)' }},
-                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)' }}
+                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: null, placeholderId: null }},
+                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: null, placeholderId: null }},
+                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: null, placeholderId: null }},
+                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: null, placeholderId: null }},
+                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)', loadingId: 'regionsLoading', placeholderId: 'regionsPlaceholder' }}
             }};
 
             const config = plotConfig[dataType];
             if (!config) {{
                 logConsole('Unknown data type: ' + dataType, 'error');
                 return;
+            }}
+
+            // Show loading overlay if available
+            if (config.loadingId) {{
+                const loadingEl = document.getElementById(config.loadingId);
+                if (loadingEl) loadingEl.classList.remove('hidden');
+            }}
+            // Hide placeholder
+            if (config.placeholderId) {{
+                const placeholderEl = document.getElementById(config.placeholderId);
+                if (placeholderEl) placeholderEl.style.display = 'none';
             }}
 
             logConsole('Loading ' + config.title + ' surfaces...', 'info');
@@ -3595,11 +3648,22 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     }}
                 }}, 100);
 
+                // Hide loading overlay
+                if (config.loadingId) {{
+                    const loadingEl = document.getElementById(config.loadingId);
+                    if (loadingEl) loadingEl.classList.add('hidden');
+                }}
+
                 logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
 
             }} catch (e) {{
                 console.error(e);
                 logConsole('Error loading ' + config.title + ': ' + e.message, 'error');
+                // Hide loading overlay on error too
+                if (config.loadingId) {{
+                    const loadingEl = document.getElementById(config.loadingId);
+                    if (loadingEl) loadingEl.classList.add('hidden');
+                }}
             }}
         }}
 
@@ -3611,18 +3675,26 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const sessionId = currentSessionId || sliceSessionId;
             if (!sessionId) return;
 
+            // Show loading overlay, hide placeholder
+            const slicesLoading = document.getElementById('slicesLoading');
+            const slicesPlaceholder = document.getElementById('slicesPlaceholder');
+            if (slicesLoading) slicesLoading.classList.remove('hidden');
+            if (slicesPlaceholder) slicesPlaceholder.style.display = 'none';
+
             logConsole('Loading sliced layers visualization...', 'info');
 
             try {{
                 const response = await fetch('/api/slice_visualization/' + sessionId);
                 if (!response.ok) {{
                     logConsole('Failed to load slices: HTTP ' + response.status, 'error');
+                    if (slicesLoading) slicesLoading.classList.add('hidden');
                     return;
                 }}
 
                 const data = await response.json();
                 if (data.status !== 'success') {{
                     logConsole('Slices error: ' + (data.message || 'Unknown'), 'error');
+                    if (slicesLoading) slicesLoading.classList.add('hidden');
                     return;
                 }}
 
@@ -3632,11 +3704,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 // Actually render the plot
                 updateSlicesPlotWithKernels();
 
+                // Hide loading overlay
+                if (slicesLoading) slicesLoading.classList.add('hidden');
+
                 logConsole('Sliced layers loaded: ' + data.n_valid_layers + ' layers', 'success');
 
             }} catch (e) {{
                 console.error(e);
                 logConsole('Error loading slices: ' + e.message, 'error');
+                if (slicesLoading) slicesLoading.classList.add('hidden');
             }}
         }}
 
