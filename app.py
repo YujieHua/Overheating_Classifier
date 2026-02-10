@@ -1053,16 +1053,103 @@ def get_layer_surfaces(session_id, data_type):
             min_val = 0.0
             max_val = 1.0
     elif data_type == 'density':
-        # Energy density in J/mm² - normalized by scan area for objective comparison
-        layer_values = {int(k): float(v) for k, v in results.get('energy_density_scores', {}).items()}
-        value_label = 'Energy Density (J/mm²)'
-        # Use dynamic min/max for actual density values
-        if layer_values:
-            min_val = min(layer_values.values())
-            max_val = max(layer_values.values())
+        # Per-region energy density visualization in J/mm²
+        # Each region displays its OWN density, not aggregated per layer
+        from scipy import ndimage
+
+        region_data_all = results.get('region_data', {})
+        voxel_size_sq = voxel_size ** 2  # For area conversion
+
+        if not region_data_all:
+            return jsonify({'status': 'error', 'message': 'No region data available for density visualization'}), 400
+
+        # Collect all region densities to find global min/max
+        # Calculate density on-the-fly: energy / (area_voxels * voxel_size²)
+        all_densities = []
+        for layer_idx, rd in region_data_all.items():
+            region_energies = rd.get('region_energies', {})
+            region_areas = rd.get('region_areas', {})
+            for rid, energy in region_energies.items():
+                area_voxels = region_areas.get(rid, 0)
+                if area_voxels > 0:
+                    density = energy / (area_voxels * voxel_size_sq)
+                    all_densities.append(density)
+
+        if all_densities:
+            min_val = min(all_densities)
+            max_val = max(all_densities)
         else:
             min_val = 0.0
             max_val = 1.0
+
+        # Generate per-region surfaces with density-based coloring
+        layers_data = []
+        sorted_layers = sorted(masks.keys())
+
+        for layer in sorted_layers:
+            mask = masks.get(layer)
+            if mask is None:
+                continue
+            mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+            if mask_arr.sum() == 0:
+                continue
+
+            z = layer * layer_thickness
+
+            # Get region data for this layer
+            rd = region_data_all.get(layer)
+            if rd and rd.get('n_regions', 0) > 0:
+                labeled = rd['labeled']
+                n_regions = rd['n_regions']
+                region_energies = rd.get('region_energies', {})
+                region_areas = rd.get('region_areas', {})
+            else:
+                labeled, n_regions = ndimage.label(mask_arr > 0)
+                region_energies = {}
+                region_areas = {}
+
+            if n_regions == 0:
+                continue
+
+            # Generate one surface per region with density-based color
+            for rid in range(1, n_regions + 1):
+                region_mask = (labeled == rid).astype(np.uint8)
+                if region_mask.sum() == 0:
+                    continue
+
+                # Calculate density on-the-fly
+                energy = region_energies.get(rid, 0.0)
+                area_voxels = region_areas.get(rid, 0)
+                if area_voxels > 0:
+                    density_value = energy / (area_voxels * voxel_size_sq)
+                else:
+                    density_value = 0.0
+
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
+                                                          skip_garbage_filter=True)
+                if vertices and faces:
+                    layers_data.append({
+                        'layer': int(layer),
+                        'z': float(z),
+                        'value': float(density_value),
+                        'region_id': int(rid),
+                        'n_regions': int(n_regions),
+                        'vertices': vertices,
+                        'faces': faces
+                    })
+
+        return jsonify({
+            'status': 'success',
+            'layers': layers_data,
+            'n_layers': len(sorted_layers),
+            'n_valid_layers': len(layers_data),
+            'min_val': float(min_val),
+            'max_val': float(max_val),
+            'value_label': 'Energy Density (J/mm²)',
+            'layer_thickness': layer_thickness,
+            'voxel_size': voxel_size,
+            'per_region': True  # Flag indicating per-region visualization
+        })
     elif data_type == 'risk':
         # Map risk levels to numeric values: LOW=0, MEDIUM=1, HIGH=2
         risk_levels = results.get('risk_levels', {})
