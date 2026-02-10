@@ -27,7 +27,7 @@ class TestEnergyAccumulation:
 
     def test_uniform_cylinder_increases_monotonically(self, simple_cylinder_masks, default_params):
         """Uniform cylinder should show monotonic energy increase."""
-        risk_scores, region_data = calculate_energy_accumulation(
+        risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
             masks=simple_cylinder_masks,
             dissipation_factor=default_params['dissipation_factor'],
             convection_factor=default_params['convection_factor'],
@@ -49,7 +49,7 @@ class TestEnergyAccumulation:
 
     def test_cone_tip_down_high_accumulation(self, cone_tip_down_masks, default_params):
         """Cone with tip down should show high energy accumulation (thermal bottleneck)."""
-        risk_scores, region_data = calculate_energy_accumulation(
+        risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
             masks=cone_tip_down_masks,
             dissipation_factor=default_params['dissipation_factor'],
             convection_factor=default_params['convection_factor'],
@@ -64,13 +64,13 @@ class TestEnergyAccumulation:
 
     def test_cone_base_down_low_accumulation(self, cone_base_down_masks, cone_tip_down_masks, default_params):
         """Cone with base down should show LOWER energy accumulation than tip down."""
-        base_down_scores, _ = calculate_energy_accumulation(
+        base_down_scores, _, _ = calculate_energy_accumulation(
             masks=cone_base_down_masks,
             dissipation_factor=default_params['dissipation_factor'],
             convection_factor=default_params['convection_factor'],
         )
 
-        tip_down_scores, _ = calculate_energy_accumulation(
+        tip_down_scores, _, _ = calculate_energy_accumulation(
             masks=cone_tip_down_masks,
             dissipation_factor=default_params['dissipation_factor'],
             convection_factor=default_params['convection_factor'],
@@ -88,7 +88,7 @@ class TestEnergyAccumulation:
 
     def test_single_layer_geometry(self, single_layer_masks, default_params):
         """Single layer should work without errors."""
-        risk_scores, region_data = calculate_energy_accumulation(
+        risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
             masks=single_layer_masks,
             dissipation_factor=default_params['dissipation_factor'],
             convection_factor=default_params['convection_factor'],
@@ -101,7 +101,7 @@ class TestEnergyAccumulation:
 
     def test_empty_middle_layer_applies_convection(self, empty_middle_layer_masks, default_params):
         """Empty layers should still apply convection loss."""
-        risk_scores, region_data = calculate_energy_accumulation(
+        risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
             masks=empty_middle_layer_masks,
             dissipation_factor=default_params['dissipation_factor'],
             convection_factor=default_params['convection_factor'],
@@ -120,7 +120,7 @@ class TestEnergyAccumulation:
         # Layer 2: columns 4-9 (6 columns)
         # Overlap: columns 4-5 (2 columns) at rows 2-7 (6 rows) = 12 voxels
 
-        risk_scores, region_data = calculate_energy_accumulation(
+        risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
             masks=offset_layers_masks,
             dissipation_factor=0.5,
             convection_factor=0.05,
@@ -133,19 +133,19 @@ class TestEnergyAccumulation:
 
     def test_empty_masks_returns_empty(self):
         """Empty masks dict should return empty result."""
-        risk_scores, region_data = calculate_energy_accumulation(masks={})
+        risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(masks={})
         assert risk_scores == {}
         assert region_data == {}
 
     def test_dissipation_factor_effect(self, simple_cylinder_masks):
         """Higher dissipation factor should affect the accumulation pattern."""
-        low_dissipation, _ = calculate_energy_accumulation(
+        low_dissipation, _, _ = calculate_energy_accumulation(
             masks=simple_cylinder_masks,
             dissipation_factor=0.2,
             convection_factor=0.05,
         )
 
-        high_dissipation, _ = calculate_energy_accumulation(
+        high_dissipation, _, _ = calculate_energy_accumulation(
             masks=simple_cylinder_masks,
             dissipation_factor=0.8,
             convection_factor=0.05,
@@ -168,13 +168,13 @@ class TestEnergyAccumulation:
 
     def test_convection_factor_effect(self, simple_cylinder_masks):
         """Higher convection factor should result in lower accumulation."""
-        low_convection, _ = calculate_energy_accumulation(
+        low_convection, _, _ = calculate_energy_accumulation(
             masks=simple_cylinder_masks,
             dissipation_factor=0.5,
             convection_factor=0.01,
         )
 
-        high_convection, _ = calculate_energy_accumulation(
+        high_convection, _, _ = calculate_energy_accumulation(
             masks=simple_cylinder_masks,
             dissipation_factor=0.5,
             convection_factor=0.2,

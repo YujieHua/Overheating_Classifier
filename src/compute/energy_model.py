@@ -359,6 +359,40 @@ def calculate_layer_areas(
     }
 
 
+def calculate_energy_density(
+    raw_energy_scores: Dict[int, float],
+    layer_areas: Dict[int, float]
+) -> Dict[int, float]:
+    """
+    Calculate energy density (J/mm²) for each layer.
+
+    Energy density is a more objective metric for overheating risk because
+    it normalizes by scan area, preventing larger layers from artificially
+    appearing as higher risk simply due to having more total energy.
+
+    Parameters
+    ----------
+    raw_energy_scores : dict
+        Maps layer_number -> accumulated energy in Joules
+    layer_areas : dict
+        Maps layer_number -> scan area in mm²
+
+    Returns
+    -------
+    dict
+        Maps layer_number -> energy density in J/mm²
+    """
+    energy_density = {}
+    for layer in raw_energy_scores:
+        energy = raw_energy_scores.get(layer, 0.0)
+        area = layer_areas.get(layer, 0.0)
+        if area > 0:
+            energy_density[layer] = energy / area
+        else:
+            energy_density[layer] = 0.0
+    return energy_density
+
+
 def calculate_contact_areas(
     masks: Dict[int, np.ndarray],
     voxel_size: float = 1.0
@@ -528,7 +562,8 @@ def run_energy_analysis(
     contact_areas = calculate_contact_areas(masks, voxel_size)
 
     # Calculate energy accumulation (region-aware) in Joules
-    risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
+    # Note: risk_scores from this function are based on total energy (legacy)
+    energy_risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
         masks=masks,
         G_layers=G_layers,
         dissipation_factor=dissipation_factor,
@@ -544,23 +579,38 @@ def run_energy_analysis(
         progress_callback=progress_callback
     )
 
-    # Classify risk levels
+    # Calculate energy density (J/mm²) - more objective metric
+    energy_density_scores = calculate_energy_density(raw_energy_scores, layer_areas)
+
+    # Normalize energy density to 0-1 range for risk classification
+    max_density = max(energy_density_scores.values()) if energy_density_scores else 0
+    if max_density > 0:
+        risk_scores = {n: d / max_density for n, d in energy_density_scores.items()}
+    else:
+        risk_scores = {n: 0.0 for n in energy_density_scores}
+        logger.warning("All energy density is zero - returning uniform zero risk scores")
+
+    logger.info(f"Energy density: max={max_density:.4f} J/mm², "
+                f"mean={np.mean(list(energy_density_scores.values())):.4f} J/mm²")
+
+    # Classify risk levels based on energy density (not total energy)
     risk_levels = classify_risk_levels(
         risk_scores=risk_scores,
         threshold_medium=threshold_medium,
         threshold_high=threshold_high
     )
 
-    # Get statistics
+    # Get statistics (now based on energy density)
     summary = get_energy_statistics(risk_scores, risk_levels)
 
-    logger.info(f"Energy analysis complete: {summary['n_high']} HIGH, "
+    logger.info(f"Energy analysis complete (density-based): {summary['n_high']} HIGH, "
                 f"{summary['n_medium']} MEDIUM, {summary['n_low']} LOW")
 
     return {
-        'risk_scores': risk_scores,
-        'raw_energy_scores': raw_energy_scores,
-        'risk_levels': risk_levels,
+        'risk_scores': risk_scores,  # Normalized energy density (0-1) - used for risk classification
+        'raw_energy_scores': raw_energy_scores,  # Total energy in Joules
+        'energy_density_scores': energy_density_scores,  # Energy density in J/mm²
+        'risk_levels': risk_levels,  # Classification based on energy density
         'layer_areas': layer_areas,
         'contact_areas': contact_areas,
         'region_data': region_data,
