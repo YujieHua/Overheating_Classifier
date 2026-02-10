@@ -337,6 +337,8 @@ def load_test_stl():
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl"),
         '3': os.getenv('TEST_STL_PATH_3',
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl"),
+        '4': os.getenv('TEST_STL_PATH_4',
+            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Test_Geo_Group_20260210.STL"),
     }
 
     default_path = test_stl_paths.get(stl_index, test_stl_paths['1'])
@@ -2224,6 +2226,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(1)">Test STL 1</button>
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(2)">Test STL 2</button>
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(3)">Test STL 3</button>
+                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(4)">Test STL 4</button>
                     </div>
 
                     <!-- STL Info (shown when loaded) -->
@@ -2261,8 +2264,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <span class="param-label">Build Direction</span>
                             <select class="param-input" id="buildDirection" style="flex: 1;" onchange="onBuildDirectionChange()">
                                 <option value="Z">Z-up (default)</option>
-                                <option value="Y">Y-up (rotate Y→Z)</option>
-                                <option value="Y-">Y-down (rotate Y→Z, flip)</option>
+                                <option value="Y-">Y-up (rotate Y→Z)</option>
+                                <option value="Y">Y-down (rotate Y→Z, flip)</option>
                                 <option value="X">X-up (rotate X→Z)</option>
                             </select>
                         </div>
@@ -2279,11 +2282,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <div class="section-content">
                     <div style="margin-bottom: 6px;">
                         <label class="radio-option">
-                            <input type="radio" name="energyModel" value="area_only" onchange="updateModelVisibility()">
+                            <input type="radio" name="energyModel" value="area_only" checked onchange="updateModelVisibility()">
                             <span>Area-Only Mode (faster)</span>
                         </label>
                         <label class="radio-option">
-                            <input type="radio" name="energyModel" value="geometry_multiplier" checked onchange="updateModelVisibility()">
+                            <input type="radio" name="energyModel" value="geometry_multiplier" onchange="updateModelVisibility()">
                             <span>Geometry Multiplier Mode</span>
                         </label>
                     </div>
@@ -3611,8 +3614,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {{
-            logConsole('Ready - Load an STL file or use "Load Test STL"', 'info');
+            logConsole('Auto-loading Test STL 4...', 'info');
             updateModelVisibility();
+            // Auto-load Test STL 4 by default
+            loadTestSTL(4);
         }});
     </script>
 </body>
