@@ -241,8 +241,55 @@ current_state = {
     'cached_masks': None,
     'cached_slice_params': None,
     'cached_slice_info': None,
+    'cached_region_data': None,  # Region detection results from slicing
     'lock': threading.RLock()
 }
+
+
+# =============================================================================
+# SHARED GEOMETRY UTILITIES
+# =============================================================================
+def apply_build_direction_rotation(mesh, build_direction: str):
+    """Apply rotation to mesh based on build direction.
+
+    This is a shared function used by both slice_worker and run_analysis_worker
+    to ensure consistent rotation behavior.
+
+    Args:
+        mesh: trimesh mesh object
+        build_direction: 'Z' (default), 'Y', 'Y-', or 'X'
+
+    Returns:
+        Rotated mesh (copy of original)
+    """
+    import trimesh
+
+    if build_direction == 'Z':
+        return mesh  # No rotation needed
+
+    rotated_mesh = mesh.copy()
+
+    if build_direction == 'Y':
+        # Y-down: rotate so Y becomes Z, then flip Z
+        rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
+        rotated_mesh.apply_transform(rotation)
+        flip = trimesh.transformations.reflection_matrix([0, 0, 0], [0, 0, 1])
+        rotated_mesh.apply_transform(flip)
+        logger.debug(f"Applied Y→Z rotation + Z flip (Y-down)")
+    elif build_direction == 'Y-':
+        # Y-up: rotate so Y becomes Z (no flip)
+        rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
+        rotated_mesh.apply_transform(rotation)
+        logger.debug(f"Applied Y→Z rotation (Y-up)")
+    elif build_direction == 'X':
+        # X-up: rotate so X becomes Z
+        rotation = trimesh.transformations.rotation_matrix(-np.pi/2, [0, 1, 0])
+        rotated_mesh.apply_transform(rotation)
+        logger.debug(f"Applied X→Z rotation")
+    else:
+        logger.warning(f"Unknown build_direction '{build_direction}', no rotation applied")
+
+    return rotated_mesh
 
 
 @app.after_request
@@ -437,12 +484,15 @@ def api_slice():
 
 def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, layer_thickness: float,
                   layer_grouping: int = 25, build_direction: str = 'Z'):
-    """Slice STL and detect connected regions (islands) per layer."""
+    """Slice STL and detect connected regions (islands) per layer.
+
+    This worker handles the slicing pipeline that is shared between the Slice button
+    and the Run Analysis button. Results are cached for reuse.
+    """
     try:
         start_time = time.time()
         from src.data.stl_loader import load_stl, slice_stl
         from scipy import ndimage
-        import numpy as np
 
         def progress_with_cancel(progress, step):
             if session.is_cancelled():
@@ -454,34 +504,24 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
         # Load mesh first (slice_stl expects mesh_info dict, not path)
         mesh_info = load_stl(stl_path)
 
-        # Apply build direction transformation if needed
+        # Apply build direction transformation using shared function
         if build_direction != 'Z':
-            import trimesh
+            session.update_progress(6, f"[STAGE] Rotating mesh ({build_direction}→Z)...")
             mesh = mesh_info['mesh']
-            if build_direction == 'Y':
-                # Y-down: rotate so Y becomes Z, then flip
-                rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
-                mesh.apply_transform(rotation)
-                flip = trimesh.transformations.reflection_matrix([0, 0, 0], [0, 0, 1])
-                mesh.apply_transform(flip)
-            elif build_direction == 'Y-':
-                # Y-up: rotate so Y becomes Z (no flip)
-                rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
-                mesh.apply_transform(rotation)
-            elif build_direction == 'X':
-                rotation = trimesh.transformations.rotation_matrix(-np.pi/2, [0, 1, 0])
-                mesh.apply_transform(rotation)
+            rotated_mesh = apply_build_direction_rotation(mesh, build_direction)
             # Update mesh_info with transformed mesh
-            mesh_info['mesh'] = mesh
-            mesh_info['bounds'] = mesh.bounds
-            mesh_info['dimensions'] = mesh.bounds[1] - mesh.bounds[0]
+            mesh_info['mesh'] = rotated_mesh
+            mesh_info['bounds'] = rotated_mesh.bounds
+            mesh_info['dimensions'] = rotated_mesh.bounds[1] - rotated_mesh.bounds[0]
+            session.update_progress(8, f"[INFO] Rotated dimensions: {mesh_info['dimensions'][0]:.1f} x {mesh_info['dimensions'][1]:.1f} x {mesh_info['dimensions'][2]:.1f} mm")
 
+        session.update_progress(10, "[STAGE] Slicing geometry into layers...")
         slice_result = slice_stl(
             mesh_info=mesh_info,
             voxel_size=voxel_size,
             layer_thickness=layer_thickness,
             layer_grouping=layer_grouping,
-            progress_callback=progress_with_cancel
+            progress_callback=lambda p, s: progress_with_cancel(10 + p * 0.80, s)
         )
 
         # Detect regions (connected components) per layer
@@ -500,6 +540,8 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
             }
 
         slice_result['region_data'] = region_data
+        n_layers = len(masks)
+        session.update_progress(95, f"[INFO] {n_layers} layers sliced, regions detected")
 
         if not session.is_cancelled():
             with current_state['lock']:
@@ -507,12 +549,15 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 current_state['cached_slice_params'] = {
                     'voxel_size': voxel_size,
                     'layer_thickness': layer_thickness,
-                    'layer_grouping': layer_grouping
+                    'layer_grouping': layer_grouping,
+                    'build_direction': build_direction,  # Now cached!
                 }
                 current_state['cached_slice_info'] = {
                     'n_layers': slice_result['n_layers'],
                     'grid_shape': slice_result['grid_shape'],
                 }
+                current_state['cached_region_data'] = region_data  # Cache region data!
+                logger.info(f"Cached slice results: {n_layers} layers, build_direction={build_direction}")
 
             session.slice_data = slice_result
             computation_time = time.time() - start_time
@@ -522,6 +567,7 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 'voxel_size': voxel_size,
                 'layer_thickness': layer_thickness,
                 'layer_grouping': layer_grouping,
+                'build_direction': build_direction,
             }, computation_time)
 
     except CancelledException:
@@ -587,6 +633,7 @@ def run_analysis():
         cached_masks = current_state.get('cached_masks')
         cached_slice_params = current_state.get('cached_slice_params')
         cached_slice_info = current_state.get('cached_slice_info')
+        cached_region_data = current_state.get('cached_region_data')
 
     session_registry.cleanup_all_except(None)
     session = session_registry.create_session()
@@ -596,7 +643,8 @@ def run_analysis():
         slice_cache = {
             'masks': cached_masks,
             'params': cached_slice_params,
-            'info': cached_slice_info
+            'info': cached_slice_info,
+            'region_data': cached_region_data,  # Include cached region data
         }
 
     thread = threading.Thread(
@@ -663,76 +711,39 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 progress_with_cancel(20, "[INFO] Using cached slice data")
 
         if need_reslice:
-            import trimesh
-
             progress_with_cancel(5, "[STAGE] Loading STL mesh...")
             mesh_info = load_stl(stl_path)
 
-            # Apply rotation if build direction is not Z
+            # Apply rotation using shared function (same as slice_worker)
             if build_direction != 'Z':
                 progress_with_cancel(6, f"[STAGE] Rotating mesh ({build_direction}→Z)...")
-
                 mesh = mesh_info['mesh']
-
-                if build_direction == 'Y':
-                    rotation_matrix = trimesh.transformations.rotation_matrix(
-                        np.radians(-90), [1, 0, 0]
-                    )
-                    progress_with_cancel(7, "[INFO] Applying Y→Z rotation (-90 deg around X)")
-                elif build_direction == 'Y-':
-                    # Y-down: rotate Y→Z then flip Z
-                    rotation_matrix = trimesh.transformations.rotation_matrix(
-                        np.radians(-90), [1, 0, 0]
-                    )
-                    flip_matrix = np.array([
-                        [1, 0, 0, 0],
-                        [0, 1, 0, 0],
-                        [0, 0, -1, 0],
-                        [0, 0, 0, 1]
-                    ])
-                    rotation_matrix = flip_matrix @ rotation_matrix
-                    progress_with_cancel(7, "[INFO] Applying Y→Z rotation + Z flip (Y-down)")
-                elif build_direction == 'X':
-                    rotation_matrix = trimesh.transformations.rotation_matrix(
-                        np.radians(90), [0, 1, 0]
-                    )
-                    progress_with_cancel(7, "[INFO] Applying X→Z rotation (90 deg around Y)")
-                else:
-                    rotation_matrix = np.eye(4)
-
-                rotated_mesh = mesh.copy()
-                rotated_mesh.apply_transform(rotation_matrix)
-
-                bounds = rotated_mesh.bounds
-                mesh_info = {
-                    'vertices': np.array(rotated_mesh.vertices),
-                    'faces': np.array(rotated_mesh.faces),
-                    'bounds': bounds,
-                    'dimensions': bounds[1] - bounds[0],
-                    'n_triangles': len(rotated_mesh.faces),
-                    'n_vertices': len(rotated_mesh.vertices),
-                    'is_watertight': rotated_mesh.is_watertight,
-                    'volume': rotated_mesh.volume if rotated_mesh.is_watertight else None,
-                    'mesh': rotated_mesh,
-                }
+                rotated_mesh = apply_build_direction_rotation(mesh, build_direction)
+                # Update mesh_info with transformed mesh
+                mesh_info['mesh'] = rotated_mesh
+                mesh_info['bounds'] = rotated_mesh.bounds
+                mesh_info['dimensions'] = rotated_mesh.bounds[1] - rotated_mesh.bounds[0]
                 progress_with_cancel(8, f"[INFO] Rotated dimensions: {mesh_info['dimensions'][0]:.1f} x {mesh_info['dimensions'][1]:.1f} x {mesh_info['dimensions'][2]:.1f} mm")
 
-            progress_with_cancel(8, "[STAGE] Slicing geometry into layers...")
+            progress_with_cancel(10, "[STAGE] Slicing geometry into layers...")
             slice_result = slice_stl(
                 mesh_info=mesh_info,
                 voxel_size=voxel_size,
                 layer_thickness=layer_thickness,
                 layer_grouping=layer_grouping,
-                progress_callback=lambda p, s: progress_with_cancel(8 + p * 0.12, s)
+                progress_callback=lambda p, s: progress_with_cancel(10 + p * 0.10, s)
             )
             masks = slice_result['masks']
             slice_info = {
                 'n_layers': slice_result['n_layers'],
                 'grid_shape': slice_result['grid_shape'],
             }
+            logger.info(f"run_analysis_worker: Re-sliced geometry ({len(masks)} layers)")
+        else:
+            logger.info(f"run_analysis_worker: Using cached slice data ({len(masks)} layers)")
 
         n_layers = len(masks)
-        progress_with_cancel(22, f"[INFO] {n_layers} layers sliced")
+        progress_with_cancel(22, f"[INFO] {n_layers} layers ready")
 
         G_layers = None
         if use_geometry_multiplier:
@@ -2983,6 +2994,20 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
 
                     updateLayerGroupingDisplay();
+
+                    // Auto-select build direction based on test STL
+                    // STL 1, 3 → Z-up; STL 2, 4 → Y-up
+                    const buildDirSelect = document.getElementById('buildDirection');
+                    if (stlIndex === 1 || stlIndex === 3) {{
+                        buildDirSelect.value = 'Z';
+                        logConsole('Build direction auto-set to: Z-up', 'info');
+                    }} else if (stlIndex === 2 || stlIndex === 4) {{
+                        buildDirSelect.value = 'Y-';
+                        logConsole('Build direction auto-set to: Y-up', 'info');
+                    }}
+                    // Trigger change event to update preview
+                    buildDirSelect.dispatchEvent(new Event('change'));
+
                     logConsole('Test STL loaded: ' + data.info.n_triangles + ' triangles', 'success');
 
                     // Render 3D STL preview
