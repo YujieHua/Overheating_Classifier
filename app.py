@@ -800,6 +800,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             'n_layers': n_layers,
             'risk_scores': energy_results['risk_scores'],
             'raw_energy_scores': energy_results['raw_energy_scores'],
+            'energy_density_scores': energy_results['energy_density_scores'],
             'risk_levels': energy_results['risk_levels'],
             'layer_areas': energy_results['layer_areas'],
             'contact_areas': energy_results['contact_areas'],
@@ -1045,6 +1046,17 @@ def get_layer_surfaces(session_id, data_type):
         layer_values = {int(k): float(v) for k, v in results.get('raw_energy_scores', {}).items()}
         value_label = 'Energy (J)'
         # Use dynamic min/max for actual Joule values
+        if layer_values:
+            min_val = min(layer_values.values())
+            max_val = max(layer_values.values())
+        else:
+            min_val = 0.0
+            max_val = 1.0
+    elif data_type == 'density':
+        # Energy density in J/mm² - normalized by scan area for objective comparison
+        layer_values = {int(k): float(v) for k, v in results.get('energy_density_scores', {}).items()}
+        value_label = 'Energy Density (J/mm²)'
+        # Use dynamic min/max for actual density values
         if layer_values:
             min_val = min(layer_values.values())
             max_val = max(layer_values.values())
@@ -2634,6 +2646,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
                 <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
                 <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
+                <button class="tab-btn" onclick="switchTab('density', event)">Energy Density</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
@@ -2712,6 +2725,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="viz-container" id="energyPlot">
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see energy accumulation
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Energy Density Tab -->
+                <div class="tab-panel" id="tab-density">
+                    <div class="viz-container" id="densityPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see energy density (J/mm²)
                         </div>
                     </div>
                 </div>
@@ -2832,7 +2854,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'density': 'densityPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -3370,6 +3392,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const vizSteps = [
                 {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
                 {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
+                {{ label: 'Density', fn: () => renderLayerSurfaces('density') }},
                 {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
                 {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
                 ...(isModeB ? [
@@ -3411,6 +3434,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             const plotConfig = {{
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: null, placeholderId: null }},
+                'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: null, placeholderId: null }},
                 'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: null, placeholderId: null }},
                 'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: null, placeholderId: null }},
                 'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: null, placeholderId: null }},
@@ -4055,13 +4079,20 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const s = r.summary;
             const p = r.params_used;
 
+            // Calculate max energy density for display
+            const densityScores = r.energy_density_scores || {{}};
+            const densityValues = Object.values(densityScores);
+            const maxDensity = densityValues.length > 0 ? Math.max(...densityValues) : 0;
+            const meanDensity = densityValues.length > 0 ? densityValues.reduce((a, b) => a + b, 0) / densityValues.length : 0;
+
             document.getElementById('summaryContent').innerHTML = `
                 <div class="summary-card">
-                    <h4>Analysis Results</h4>
+                    <h4>Analysis Results (Density-Based)</h4>
                     <div class="summary-stat"><span class="label">Total Layers</span><span class="value">${{s.n_layers}}</span></div>
                     <div class="summary-stat"><span class="label">Max Risk Score</span><span class="value">${{s.max_risk_score.toFixed(3)}}</span></div>
                     <div class="summary-stat"><span class="label">Max Risk Layer</span><span class="value">${{s.max_risk_layer}}</span></div>
-                    <div class="summary-stat"><span class="label">Mean Risk Score</span><span class="value">${{s.mean_risk_score.toFixed(3)}}</span></div>
+                    <div class="summary-stat"><span class="label">Max Density</span><span class="value">${{maxDensity.toFixed(4)}} J/mm²</span></div>
+                    <div class="summary-stat"><span class="label">Mean Density</span><span class="value">${{meanDensity.toFixed(4)}} J/mm²</span></div>
                 </div>
                 <div class="summary-card">
                     <h4>Risk Distribution</h4>
