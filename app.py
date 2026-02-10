@@ -2742,6 +2742,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
     <script>
         // Global state
         let currentSessionId = null;
+        let sliceSessionId = null;  // Session ID for slice-only operations
         let analysisResults = null;
         let sliceResults = null;  // Stores slice-only results (masks, regions)
         let stlLoaded = false;
@@ -3058,11 +3059,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     logConsole('[' + data.progress + '%] ' + (data.message || ''), 'info');
                 }}
 
-                if (data.status === 'completed') {{
+                if (data.status === 'complete') {{
                     evtSource.close();
                     sliceBtn.disabled = false;
                     sliceBtn.textContent = 'Slice (Preview Regions)';
                     logConsole('Slice completed! Fetching results...', 'success');
+                    // Store session ID for visualization
+                    sliceSessionId = sessionId;
                     fetchSliceResults(sessionId);
                 }}
 
@@ -3336,7 +3339,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Unified layer surface rendering for 3D visualization
         async function renderLayerSurfaces(dataType, viewMode) {{
-            if (!currentSessionId) return;
+            const sessionId = currentSessionId || sliceSessionId;
+            if (!sessionId) return;
 
             const plotConfig = {{
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
@@ -3355,7 +3359,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             logConsole('Loading ' + config.title + ' surfaces...', 'info');
 
             try {{
-                let url = '/api/layer_surfaces/' + currentSessionId + '/' + dataType;
+                let url = '/api/layer_surfaces/' + sessionId + '/' + dataType;
                 if (viewMode) {{
                     url += '?view_mode=' + viewMode;
                 }}
@@ -3604,12 +3608,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Render sliced layers with kernel visualization
         async function renderSlicesPlot() {{
-            if (!currentSessionId) return;
+            const sessionId = currentSessionId || sliceSessionId;
+            if (!sessionId) return;
 
             logConsole('Loading sliced layers visualization...', 'info');
 
             try {{
-                const response = await fetch('/api/slice_visualization/' + currentSessionId);
+                const response = await fetch('/api/slice_visualization/' + sessionId);
                 if (!response.ok) {{
                     logConsole('Failed to load slices: HTTP ' + response.status, 'error');
                     return;
