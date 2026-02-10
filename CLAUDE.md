@@ -430,6 +430,8 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 ╔══════════════════════════════════════════════════════════════════╗
 ║  ⏳ NEEDS YOUR INPUT                                              ║
 ╠══════════════════════════════════════════════════════════════════╣
+║  📊 TOKEN USAGE: [X,XXX] this task | [XX,XXX] session total       ║
+╠══════════════════════════════════════════════════════════════════╣
 ║  QUESTION:                                                       ║
 ║  [What decision/input is needed]                                 ║
 ║                                                                  ║
@@ -443,6 +445,8 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 ```
 ╔══════════════════════════════════════════════════════════════════╗
 ║  ✅ READY FOR REVIEW                                              ║
+╠══════════════════════════════════════════════════════════════════╣
+║  📊 TOKEN USAGE: [X,XXX] this task | [XX,XXX] session total       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  TEST URL: http://localhost:XXXX/                                ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -468,6 +472,8 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 ╔══════════════════════════════════════════════════════════════════╗
 ║  🎉 MERGED & COMPLETE                                             ║
 ╠══════════════════════════════════════════════════════════════════╣
+║  📊 TOKEN USAGE: [X,XXX] this task | [XX,XXX] session total       ║
+╠══════════════════════════════════════════════════════════════════╣
 ║  SUMMARY:                                                        ║
 ║  • [What was accomplished]                                       ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -479,6 +485,8 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 ```
 ╔══════════════════════════════════════════════════════════════════╗
 ║  🚫 BLOCKED                                                       ║
+╠══════════════════════════════════════════════════════════════════╣
+║  📊 TOKEN USAGE: [X,XXX] this task | [XX,XXX] session total       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  PROBLEM:                                                        ║
 ║  [What's blocking progress]                                      ║
