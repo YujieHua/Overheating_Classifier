@@ -18,7 +18,7 @@ Before making ANY changes, edits, or starting ANY task:
 
 3. **If behind, pull latest:**
    ```bash
-   git pull origin main
+   git pull origin master
    ```
 
 4. **Verify you're up-to-date:**
@@ -84,10 +84,10 @@ Before making ANY changes, edits, or starting ANY task:
 ║  RULE 3: NEVER PUSH DIRECTLY - ALWAYS USE PR                               ║
 ║  ───────────────────────────────────────────                               ║
 ║  No matter how small the change:                                           ║
-║  1. Commit to a feature branch (NEVER to main)                             ║
+║  1. Commit to a feature branch (NEVER to master)                           ║
 ║  2. Push the feature branch to origin                                      ║
 ║  3. Create a Pull Request                                                  ║
-║  4. Merge via PR (NEVER git push origin main)                              ║
+║  4. Merge via PR (NEVER git push origin master)                            ║
 ║                                                                            ║
 ║  WHY: PRs keep a record of all changes with context and review.            ║
 ║  Even typo fixes get PRs. No exceptions.                                   ║
@@ -210,7 +210,7 @@ C:\Users\huayu\Local\Desktop\Overheating_Classifier\
 ┌─────────────────────────────────────────────────────────────────┐
 │  WHY THIS WORKS:                                                │
 │  • git fetch origin = Downloads LATEST commits from GitHub      │
-│  • git worktree add ... origin/main = Creates from REMOTE       │
+│  • git worktree add ... origin/master = Creates from REMOTE     │
 │  • You ALWAYS get the latest code, not outdated local code      │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -231,8 +231,8 @@ Set-TerminalTitle "$TASK_DESC (starting)"
 Set-Location "C:\Users\huayu\Local\Desktop\Overheating_Classifier\base-repo"
 git fetch origin
 
-# 4. Create worktree from origin/main (REMOTE = latest GitHub code)
-git worktree add "..\workspaces\$WORKSPACE_NAME" -b "feature/$TASK_DESC" origin/main
+# 4. Create worktree from origin/master (REMOTE = latest GitHub code)
+git worktree add "..\workspaces\$WORKSPACE_NAME" -b "feature/$TASK_DESC" origin/master
 
 # 5. Enter worktree
 Set-Location "..\workspaces\$WORKSPACE_NAME"
@@ -500,8 +500,8 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 
 ## Git Workflow
 
-- Always work on feature branches (never commit to main)
-- **NEVER run `git push origin main`** - always push feature branch and create PR
+- Always work on feature branches (never commit to master)
+- **NEVER run `git push origin master`** - always push feature branch and create PR
 - Merge only via PR with user approval
 - Test code before creating PR
 - Even single-line typo fixes require a PR
