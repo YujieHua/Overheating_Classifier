@@ -1221,10 +1221,15 @@ def get_layer_surfaces(session_id, data_type):
         ]
 
         if view_mode == 'per_layer':
-            # Per-layer view: each region colored by its local region ID
+            # Per-layer view: use 3D branch tracking to ensure consistent coloring
+            # across layers (same physical object = same color, even if scipy
+            # assigns different region IDs on different layers)
+            branch_info = _build_3d_branches(masks, region_data_all)
+            layer_regions = branch_info['layer_regions']
+
             layers_data = []
             sorted_layers = sorted(masks.keys())
-            max_regions = 1
+            max_branches = len(branch_info['branches'])
 
             for layer in sorted_layers:
                 mask = masks.get(layer)
@@ -1247,23 +1252,28 @@ def get_layer_surfaces(session_id, data_type):
                 if n_regions == 0:
                     continue
 
-                max_regions = max(max_regions, n_regions)
-
-                # Generate one surface per region with color based on region ID
+                # Generate one surface per region with color based on BRANCH ID
+                # (tracked across layers for consistency)
                 for rid in range(1, n_regions + 1):
                     region_mask = (labeled == rid).astype(np.uint8)
                     if region_mask.sum() == 0:
                         continue
 
-                    color = REGION_COLORS[(rid - 1) % len(REGION_COLORS)]
+                    # Get branch color from layer_regions (consistent tracking)
+                    region_info = layer_regions.get(layer, {}).get(rid, {})
+                    branch_id = region_info.get('branch_id', rid)
+                    # Use REGION_COLORS palette but indexed by branch_id
+                    color = REGION_COLORS[(branch_id - 1) % len(REGION_COLORS)]
+
                     vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
                                                               skip_garbage_filter=True)
                     if vertices and faces:
                         layers_data.append({
                             'layer': int(layer),
                             'z': float(z),
-                            'value': int(rid),
+                            'value': int(branch_id),
                             'region_id': int(rid),
+                            'branch_id': int(branch_id),
                             'n_regions': int(n_regions),
                             'color': color,
                             'vertices': vertices,
@@ -1276,8 +1286,8 @@ def get_layer_surfaces(session_id, data_type):
                 'n_layers': len(sorted_layers),
                 'n_valid_layers': len(layers_data),
                 'min_val': 1,
-                'max_val': max_regions,
-                'value_label': 'Region ID (per layer)',
+                'max_val': max_branches,
+                'value_label': 'Region ID (tracked)',
                 'layer_thickness': layer_thickness,
                 'voxel_size': voxel_size,
                 'is_categorical': True
@@ -1543,8 +1553,12 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
     next_branch_id = 1
     prev_labeled = None
     prev_layer_branches = {}  # region_id -> branch_id from previous layer
+    prev_layer_idx = None  # Track previous layer index for debugging
 
     sorted_layers = sorted(masks.keys())
+
+    # Debug: Track branch assignments for debugging first/last layer issues
+    branch_debug_info = {}  # branch_id -> {'first_layer': int, 'last_layer': int, 'layers': []}
 
     for layer_idx in sorted_layers:
         mask = masks[layer_idx]
@@ -1727,12 +1741,36 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
                 'color': color
             }
 
+            # Track branch first/last layer info
+            if branch_id not in branch_debug_info:
+                # Calculate centroid for this region
+                rows, cols = np.where(labeled == rid)
+                centroid_r, centroid_c = np.mean(rows), np.mean(cols)
+                branch_debug_info[branch_id] = {
+                    'first_layer': layer_idx,
+                    'first_layer_centroid': (centroid_r, centroid_c),
+                    'last_layer': layer_idx,
+                    'layers': [layer_idx]
+                }
+            else:
+                branch_debug_info[branch_id]['last_layer'] = layer_idx
+                branch_debug_info[branch_id]['layers'].append(layer_idx)
+
         prev_labeled = labeled
         prev_layer_branches = curr_layer_branches
+        prev_layer_idx = layer_idx
+
+    # Log branch debug info
+    logger.debug(f"Branch tracking complete: {len(branches)} branches")
+    for bid in sorted(branch_debug_info.keys())[:10]:  # Log first 10 branches
+        info = branch_debug_info[bid]
+        logger.debug(f"  Branch {bid}: layers {info['first_layer']}-{info['last_layer']} "
+                    f"(centroid at first: {info.get('first_layer_centroid', 'N/A')})")
 
     return {
         'branches': branches,
-        'layer_regions': layer_regions
+        'layer_regions': layer_regions,
+        'branch_debug_info': branch_debug_info
     }
 
 
