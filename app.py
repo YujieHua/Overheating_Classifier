@@ -1165,20 +1165,90 @@ def get_layer_surfaces(session_id, data_type):
         min_val = 0
         max_val = 2
     elif data_type == 'area_ratio':
-        layer_areas = results.get('layer_areas', {})
-        contact_areas = results.get('contact_areas', {})
+        # Per-region area ratio visualization
+        from scipy import ndimage as scipy_ndimage
+
         area_ratio_power = results.get('params_used', {}).get('area_ratio_power',
                            results.get('params', {}).get('area_ratio_power', 3.0))
-        layer_values = {}
-        for k in layer_areas:
-            a_layer = float(layer_areas[k])
-            a_contact = float(contact_areas.get(k, 0))
-            ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
-            layer_values[int(k)] = ratio ** area_ratio_power
         power_label = f'^{area_ratio_power}' if area_ratio_power != 1.0 else ''
         value_label = f'Area Ratio (A_contact / A_layer){power_label}'
         min_val = 0.0
         max_val = 1.0
+
+        # Get region data from results
+        region_data_all = results.get('region_data', {})
+
+        layers_data = []
+        sorted_layers = sorted(masks.keys())
+        voxel_size_sq = voxel_size ** 2
+
+        for layer in sorted_layers:
+            mask = masks.get(layer)
+            if mask is None:
+                continue
+            mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+            if mask_arr.sum() == 0:
+                continue
+
+            z = layer * layer_thickness
+
+            # Use region_data if available, otherwise label on the fly
+            rd = region_data_all.get(layer)
+            if rd and rd.get('n_regions', 0) > 0:
+                labeled = rd['labeled']
+                n_regions = rd['n_regions']
+                region_areas = rd.get('region_areas', {})
+                region_contact_areas = rd.get('region_contact_areas', {})
+            else:
+                labeled, n_regions = scipy_ndimage.label(mask_arr > 0)
+                region_areas = {}
+                region_contact_areas = {}
+
+            if n_regions == 0:
+                continue
+
+            # Generate one surface per region with per-region area ratio
+            for rid in range(1, n_regions + 1):
+                region_mask = (labeled == rid).astype(np.uint8)
+                if region_mask.sum() == 0:
+                    continue
+
+                # Calculate area ratio for this specific region
+                a_region = region_areas.get(rid, 0)
+                a_contact = region_contact_areas.get(rid, 0)
+
+                if a_region > 0:
+                    ratio = min(1.0, a_contact / a_region)
+                else:
+                    ratio = 0.0
+
+                area_ratio_value = ratio ** area_ratio_power
+
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
+                                                          skip_garbage_filter=True)
+                if vertices and faces:
+                    layers_data.append({
+                        'layer': int(layer),
+                        'z': float(z),
+                        'value': float(area_ratio_value),
+                        'region_id': int(rid),
+                        'n_regions': int(n_regions),
+                        'vertices': vertices,
+                        'faces': faces
+                    })
+
+        return jsonify({
+            'status': 'success',
+            'layers': layers_data,
+            'n_layers': len(sorted_layers),
+            'n_valid_layers': len(layers_data),
+            'min_val': float(min_val),
+            'max_val': float(max_val),
+            'value_label': value_label,
+            'layer_thickness': layer_thickness,
+            'voxel_size': voxel_size,
+            'per_region': True  # Flag indicating per-region visualization
+        })
     elif data_type == 'gaussian_factor':
         G_layers = results.get('G_layers')
         if G_layers is None:

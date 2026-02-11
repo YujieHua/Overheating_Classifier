@@ -199,6 +199,7 @@ def calculate_energy_accumulation(
         # --- Per-region energy calculation ---
         curr_region_energies = {}
         curr_region_areas = {}
+        curr_region_contact_areas = {}
         curr_region_geo_factors = {}
 
         for rid in range(1, n_regions + 1):
@@ -226,6 +227,13 @@ def calculate_energy_accumulation(
             A_region_mm2 = A_region * (voxel_size ** 2)  # Convert voxels to mm²
             E_in = energy_density * A_region_mm2 * layer_thickness  # Joules
 
+            # Compute contact area (overlap with previous layer) for every region
+            if prev_labeled is not None:
+                A_contact_region = int(np.sum(region_mask & (prev_labeled > 0)))
+            else:
+                A_contact_region = A_region  # First layer: full contact with baseplate
+            curr_region_contact_areas[rid] = A_contact_region
+
             # 3. Geometry factor (per-region)
             if n == 1:
                 # Layer 1: baseplate = perfect heat sink
@@ -245,10 +253,6 @@ def calculate_energy_accumulation(
                 geometry_factor = (1.0 / (1.0 + G_avg)) ** gaussian_ratio_power
             else:
                 # Mode A: (A_contact_region / A_region) ^ area_ratio_power
-                if prev_labeled is not None:
-                    A_contact_region = int(np.sum(region_mask & (prev_labeled > 0)))
-                else:
-                    A_contact_region = A_region
                 ratio = A_contact_region / A_region if A_region > 0 else 1.0
                 ratio = min(ratio, 1.0)
                 geometry_factor = ratio ** area_ratio_power
@@ -275,6 +279,7 @@ def calculate_energy_accumulation(
             'labeled': curr_labeled,
             'region_energies': dict(curr_region_energies),
             'region_areas': dict(curr_region_areas),
+            'region_contact_areas': dict(curr_region_contact_areas),
         }
 
         # --- Update previous-layer state ---
