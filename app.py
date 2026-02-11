@@ -2908,6 +2908,21 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
+            <div class="viz-block" id="colorScaleBlock" style="display: none;">
+                <div class="block-title">Color Scale</div>
+                <div class="control-group">
+                    <label>Min Value</label>
+                    <input type="number" id="colorScaleMin" step="any" style="width: 100%; padding: 4px 8px; background: {BG_CARD}; border: 1px solid #444; border-radius: 4px; color: #e0e0e0;" onchange="updateColorScaleMin(this.value)">
+                </div>
+                <div class="control-group">
+                    <label>Max Value</label>
+                    <input type="number" id="colorScaleMax" step="any" style="width: 100%; padding: 4px 8px; background: {BG_CARD}; border: 1px solid #444; border-radius: 4px; color: #e0e0e0;" onchange="updateColorScaleMax(this.value)">
+                </div>
+                <button id="colorScaleResetBtn" style="display: none; width: 100%; padding: 6px 12px; margin-top: 8px; background: #4a5568; border: none; border-radius: 4px; color: #e0e0e0; cursor: pointer; font-size: 12px;" onclick="resetColorScale()">
+                    Reset to Adaptive
+                </button>
+            </div>
+
             <div class="viz-block" id="regionsViewBlock" style="display: none;">
                 <div class="block-title">View Mode</div>
                 <div class="control-group" style="margin-bottom: 0;">
@@ -2945,6 +2960,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         let stlLoaded = false;
         let currentEventSource = null;  // Track EventSource for cleanup
         let currentRegionsView = 'per_layer';  // 'per_layer' or 'branches_3d'
+
+        // Color scale state (null = use adaptive from data)
+        let manualColorMin = null;
+        let manualColorMax = null;
+        let lastAdaptiveMin = null;  // Store adaptive values for reset
+        let lastAdaptiveMax = null;
+        let currentColorDataType = null;  // Track which data type color scale applies to
 
         // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
@@ -3027,6 +3049,22 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const regionsViewBlock = document.getElementById('regionsViewBlock');
             if (regionsViewBlock) {{
                 regionsViewBlock.style.display = (tabName === 'regions') ? 'block' : 'none';
+            }}
+
+            // Show/hide color scale controls (for tabs with continuous color scales)
+            const colorScaleBlock = document.getElementById('colorScaleBlock');
+            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
+            if (colorScaleBlock) {{
+                colorScaleBlock.style.display = colorScaleTabs.includes(tabName) ? 'block' : 'none';
+            }}
+
+            // Reset color scale when switching to a different visualization type
+            if (colorScaleTabs.includes(tabName) && currentColorDataType !== tabName) {{
+                currentColorDataType = tabName;
+                // Reset to adaptive when switching tabs
+                manualColorMin = null;
+                manualColorMax = null;
+                updateColorScaleResetButton();
             }}
         }}
 
@@ -3610,8 +3648,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 // Create mesh3d traces for each layer
                 const traces = [];
                 const allX = [], allY = [], allZ = [];
-                const minVal = data.min_val;
-                const maxVal = data.max_val;
+
+                // Store adaptive values and update color scale inputs
+                updateColorScaleInputs(data.min_val, data.max_val);
+
+                // Use manual values if set, otherwise use adaptive from data
+                const minVal = manualColorMin !== null ? manualColorMin : data.min_val;
+                const maxVal = manualColorMax !== null ? manualColorMax : data.max_val;
                 const valueRange = maxVal - minVal || 1;
 
                 const layerValues = [];
@@ -3645,6 +3688,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         normalizedValue = 0.5;  // Middle of scale when all values equal
                     }} else {{
                         normalizedValue = (value - minVal) / valueRange;
+                        // Clamp to [0, 1] when using manual color scale
+                        normalizedValue = Math.max(0, Math.min(1, normalizedValue));
                     }}
 
                     // Get color based on data type
@@ -4254,6 +4299,77 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         // Update marker size
         function updateMarkerSize(size) {{
             document.getElementById('markerSizeVal').textContent = size;
+        }}
+
+        // Color scale control functions
+        function updateColorScaleMin(value) {{
+            const numVal = parseFloat(value);
+            if (!isNaN(numVal)) {{
+                manualColorMin = numVal;
+                updateColorScaleResetButton();
+                refreshCurrentVisualization();
+            }}
+        }}
+
+        function updateColorScaleMax(value) {{
+            const numVal = parseFloat(value);
+            if (!isNaN(numVal)) {{
+                manualColorMax = numVal;
+                updateColorScaleResetButton();
+                refreshCurrentVisualization();
+            }}
+        }}
+
+        function resetColorScale() {{
+            manualColorMin = null;
+            manualColorMax = null;
+            // Restore adaptive values to input fields
+            if (lastAdaptiveMin !== null) {{
+                document.getElementById('colorScaleMin').value = lastAdaptiveMin.toFixed(4);
+            }}
+            if (lastAdaptiveMax !== null) {{
+                document.getElementById('colorScaleMax').value = lastAdaptiveMax.toFixed(4);
+            }}
+            updateColorScaleResetButton();
+            refreshCurrentVisualization();
+        }}
+
+        function updateColorScaleResetButton() {{
+            const resetBtn = document.getElementById('colorScaleResetBtn');
+            if (resetBtn) {{
+                // Show button if either min or max is manually set
+                resetBtn.style.display = (manualColorMin !== null || manualColorMax !== null) ? 'block' : 'none';
+            }}
+        }}
+
+        function updateColorScaleInputs(minVal, maxVal) {{
+            // Store adaptive values for reset
+            lastAdaptiveMin = minVal;
+            lastAdaptiveMax = maxVal;
+
+            // Update input fields with current effective values
+            const minInput = document.getElementById('colorScaleMin');
+            const maxInput = document.getElementById('colorScaleMax');
+            if (minInput) {{
+                minInput.value = (manualColorMin !== null ? manualColorMin : minVal).toFixed(4);
+            }}
+            if (maxInput) {{
+                maxInput.value = (manualColorMax !== null ? manualColorMax : maxVal).toFixed(4);
+            }}
+        }}
+
+        function refreshCurrentVisualization() {{
+            // Find the currently active tab and refresh its visualization
+            const activePanel = document.querySelector('.tab-panel.active');
+            if (!activePanel) return;
+
+            const tabId = activePanel.id.replace('tab-', '');
+            // Only refresh tabs that use color scale (energy, density, risk, area_ratio, gaussian)
+            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
+            if (colorScaleTabs.includes(tabId)) {{
+                const dataType = tabId === 'gaussian' ? 'gaussian_factor' : tabId;
+                renderLayerSurfaces(dataType);
+            }}
         }}
 
         // Initialize on page load
