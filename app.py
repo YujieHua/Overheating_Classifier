@@ -688,7 +688,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         G_max = params.get('G_max', 99.0)
         threshold_medium = params.get('threshold_medium', 0.3)
         threshold_high = params.get('threshold_high', 0.6)
-        area_ratio_power = params.get('area_ratio_power', 3.0)
+        area_ratio_power = params.get('area_ratio_power', 1.0)
         gaussian_ratio_power = params.get('gaussian_ratio_power', 0.15)
         # Laser parameters for Joule calculation
         laser_power = params.get('laser_power', 200.0)
@@ -1169,7 +1169,7 @@ def get_layer_surfaces(session_id, data_type):
         from scipy import ndimage as scipy_ndimage
 
         area_ratio_power = results.get('params_used', {}).get('area_ratio_power',
-                           results.get('params', {}).get('area_ratio_power', 3.0))
+                           results.get('params', {}).get('area_ratio_power', 1.0))
         power_label = f'^{area_ratio_power}' if area_ratio_power != 1.0 else ''
         value_label = f'Area Ratio (A_contact / A_layer){power_label}'
         min_val = 0.0
@@ -2782,7 +2782,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                     <div class="param-row" id="powerParamGroup">
                         <span class="param-label">Area Ratio Power</span>
-                        <input type="number" class="param-input" id="areaRatioPower" value="3.0" step="0.1" min="0.1">
+                        <input type="number" class="param-input" id="areaRatioPower" value="1.0" step="0.1" min="0.1">
                         <span class="param-unit"></span>
                     </div>
                     <div id="geometryParams" style="display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-color);">
@@ -3531,7 +3531,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 G_max: parseFloat(document.getElementById('gMax').value),
                 threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
                 threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
-                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 3.0,
+                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 1.0,
                 gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15,
                 laser_power: parseFloat(document.getElementById('laserPower').value) || 200,
                 scan_speed: parseFloat(document.getElementById('scanSpeed').value) || 800,
@@ -4390,7 +4390,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
                     <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
                     <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
-                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 3.0) + '</span></div>' : '<div class="summary-stat"><span class="label">Gaussian Ratio Power</span><span class="value">' + (p.gaussian_ratio_power || 0.15) + '</span></div>'}}
+                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 1.0) + '</span></div>' : '<div class="summary-stat"><span class="label">Gaussian Ratio Power</span><span class="value">' + (p.gaussian_ratio_power || 0.15) + '</span></div>'}}
                 </div>
                 <div class="summary-card">
                     <h4>Thresholds</h4>
