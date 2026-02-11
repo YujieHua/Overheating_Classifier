@@ -423,6 +423,49 @@ powershell.exe -Command "Expand-Archive -Path 'C:\path\to\archive.zip' -Destinat
 
 ---
 
+## Rule G: Token Efficiency (No Quality Compromise)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  These rules reduce token usage WITHOUT compromising quality.   │
+│  They are about efficiency, not shortcuts.                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Don't Re-Read Unchanged Files
+
+If you read a file earlier in this session and it hasn't been modified:
+- **Reference your memory** instead of reading again
+- Only re-read if YOU made changes to the file and need to verify
+
+**Why:** Reading a 400KB file costs ~50K tokens. Reading it 55 times = 2.75M tokens wasted.
+
+### 2. Use Offset/Limit for Targeted Reads
+
+When you only need a specific function or section:
+
+**BAD** - reads entire 5000-line file:
+```
+Read file_path="app.py"
+```
+
+**GOOD** - reads only the lines you need:
+```
+Read file_path="app.py" offset=100 limit=50
+```
+
+**Why:** Reading 50 lines instead of 5000 = 99% token savings for that operation.
+
+### 3. Reference by Line Number
+
+After reading a file once, reference specific locations:
+- "The bug is in `process_data()` at line 342"
+- "See the validation logic at lines 150-165"
+
+This avoids re-reading just to point at code.
+
+---
+
 ## Status Templates (MANDATORY)
 
 ### NEEDS YOUR INPUT
