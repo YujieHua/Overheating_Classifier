@@ -2900,6 +2900,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Area Ratio Tab -->
                 <div class="tab-panel" id="tab-area_ratio">
                     <div class="viz-container" id="areaRatioPlot">
+                        <div class="loading-overlay hidden" id="areaRatioLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Updating visualization...</div>
+                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see area ratio (A_contact / A_layer)
                         </div>
@@ -2909,6 +2913,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Gaussian Multiplier Tab -->
                 <div class="tab-panel" id="tab-gaussian">
                     <div class="viz-container" id="gaussianPlot">
+                        <div class="loading-overlay hidden" id="gaussianLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Updating visualization...</div>
+                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis (Mode B) to see Gaussian multiplier 1/(1+G)
                         </div>
@@ -2918,6 +2926,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Energy Accumulation Tab -->
                 <div class="tab-panel" id="tab-energy">
                     <div class="viz-container" id="energyPlot">
+                        <div class="loading-overlay hidden" id="energyLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Updating visualization...</div>
+                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see energy accumulation
                         </div>
@@ -2927,6 +2939,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Energy Density Tab -->
                 <div class="tab-panel" id="tab-density">
                     <div class="viz-container" id="densityPlot">
+                        <div class="loading-overlay hidden" id="densityLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Updating visualization...</div>
+                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see energy density (J/mm²)
                         </div>
@@ -2936,6 +2952,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Risk Map Tab -->
                 <div class="tab-panel" id="tab-risk">
                     <div class="viz-container" id="riskPlot">
+                        <div class="loading-overlay hidden" id="riskLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Updating visualization...</div>
+                        </div>
                         <div class="risk-legend" style="display: none;" id="riskLegend">
                             <div class="risk-item"><div class="risk-color low"></div> LOW (safe)</div>
                             <div class="risk-item"><div class="risk-color medium"></div> MEDIUM (caution)</div>
@@ -3040,6 +3060,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Per-tab cache for adaptive min/max values (for instant switching)
         const tabAdaptiveRanges = {{}};
+
+        // Per-tab cache for full layer data (avoids re-fetching on color scale change)
+        const layerDataCache = {{}};
 
         // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
@@ -3678,11 +3701,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             if (!sessionId) return;
 
             const plotConfig = {{
-                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: null, placeholderId: null }},
-                'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: null, placeholderId: null }},
-                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: null, placeholderId: null }},
-                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: null, placeholderId: null }},
-                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: null, placeholderId: null }},
+                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: 'energyLoading', placeholderId: null }},
+                'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
+                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
+                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: 'areaRatioLoading', placeholderId: null }},
+                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }},
                 'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)', loadingId: 'regionsLoading', placeholderId: 'regionsPlaceholder' }}
             }};
 
@@ -3727,18 +3750,44 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     return;
                 }}
 
-                // Create mesh3d traces for each layer
-                const traces = [];
-                const allX = [], allY = [], allZ = [];
+                // Cache the fetched data for instant recoloring
+                layerDataCache[dataType] = data;
 
                 // Store adaptive values and update color scale inputs (with dataType for caching)
                 updateColorScaleInputs(data.min_val, data.max_val, dataType);
 
+                // Render from cached data
+                renderFromData(dataType, data, config);
+
+                // Hide loading overlay
+                if (config.loadingId) {{
+                    const loadingEl = document.getElementById(config.loadingId);
+                    if (loadingEl) loadingEl.classList.add('hidden');
+                }}
+
+                logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
+
+            }} catch (e) {{
+                console.error(e);
+                logConsole('Error loading ' + config.title + ': ' + e.message, 'error');
+                // Hide loading overlay on error too
+                if (config.loadingId) {{
+                    const loadingEl = document.getElementById(config.loadingId);
+                    if (loadingEl) loadingEl.classList.add('hidden');
+                }}
+            }}
+        }}
+
+        // Render visualization from data object (no network request)
+        // Used both by renderLayerSurfaces (after fetch) and recolorFromCache (instant)
+        function renderFromData(dataType, data, config) {{
                 // Use manual values if set, otherwise use adaptive from data
                 const minVal = manualColorMin !== null ? manualColorMin : data.min_val;
                 const maxVal = manualColorMax !== null ? manualColorMax : data.max_val;
                 const valueRange = maxVal - minVal || 1;
 
+                const traces = [];
+                const allX = [], allY = [], allZ = [];
                 const layerValues = [];
 
                 data.layers.forEach((layerData) => {{
@@ -3848,7 +3897,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 }});
 
                 if (traces.length === 0) {{
-                    logConsole('No valid layer geometry to display', 'warning');
                     return;
                 }}
 
@@ -3948,24 +3996,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         Plotly.Plots.resize(plotEl);
                     }}
                 }}, 100);
-
-                // Hide loading overlay
-                if (config.loadingId) {{
-                    const loadingEl = document.getElementById(config.loadingId);
-                    if (loadingEl) loadingEl.classList.add('hidden');
-                }}
-
-                logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
-
-            }} catch (e) {{
-                console.error(e);
-                logConsole('Error loading ' + config.title + ': ' + e.message, 'error');
-                // Hide loading overlay on error too
-                if (config.loadingId) {{
-                    const loadingEl = document.getElementById(config.loadingId);
-                    if (loadingEl) loadingEl.classList.add('hidden');
-                }}
-            }}
         }}
 
         // Global storage for slice visualization data (to update kernels without re-fetching)
@@ -4445,17 +4475,113 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }}
         }}
 
+        // Compute color for a single layer value given dataType, minVal, maxVal
+        function computeLayerColor(dataType, value, minVal, maxVal) {{
+            const valueRange = maxVal - minVal || 1;
+            let normalizedValue;
+            if (valueRange === 0) {{
+                normalizedValue = 0.5;
+            }} else {{
+                normalizedValue = (value - minVal) / valueRange;
+                normalizedValue = Math.max(0, Math.min(1, normalizedValue));
+            }}
+
+            if (dataType === 'risk') {{
+                if (value >= 2) return '#f87171';
+                else if (value >= 1) return '#fbbf24';
+                else return '#4ade80';
+            }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
+                const rv = 1.0 - normalizedValue;
+                if (rv < 0.3) {{
+                    const t = rv / 0.3;
+                    return `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
+                }} else if (rv < 0.6) {{
+                    const t = (rv - 0.3) / 0.3;
+                    return `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189 - t * 0)}}, ${{Math.round(36 - t * 0)}})`;
+                }} else {{
+                    const t = (rv - 0.6) / 0.4;
+                    return `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
+                }}
+            }} else {{
+                let r, g, b;
+                if (normalizedValue < 0.125) {{
+                    const t = normalizedValue / 0.125;
+                    r = 0; g = 0; b = Math.round(128 + t * 127);
+                }} else if (normalizedValue < 0.375) {{
+                    const t = (normalizedValue - 0.125) / 0.25;
+                    r = 0; g = Math.round(t * 255); b = 255;
+                }} else if (normalizedValue < 0.625) {{
+                    const t = (normalizedValue - 0.375) / 0.25;
+                    r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
+                }} else if (normalizedValue < 0.875) {{
+                    const t = (normalizedValue - 0.625) / 0.25;
+                    r = 255; g = Math.round(255 * (1 - t)); b = 0;
+                }} else {{
+                    const t = (normalizedValue - 0.875) / 0.125;
+                    r = Math.round(255 - t * 127); g = 0; b = 0;
+                }}
+                return `rgb(${{r}}, ${{g}}, ${{b}})`;
+            }}
+        }}
+
         function refreshCurrentVisualization() {{
             // Find the currently active tab and refresh its visualization
             const activePanel = document.querySelector('.tab-panel.active');
             if (!activePanel) return;
 
             const tabId = activePanel.id.replace('tab-', '');
-            // Only refresh tabs that use color scale (energy, density, risk, area_ratio, gaussian)
             const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
-            if (colorScaleTabs.includes(tabId)) {{
-                const dataType = tabId === 'gaussian' ? 'gaussian_factor' : tabId;
+            if (!colorScaleTabs.includes(tabId)) return;
+
+            const dataType = tabId === 'gaussian' ? 'gaussian_factor' : tabId;
+            const cachedData = layerDataCache[dataType];
+
+            if (!cachedData) {{
+                // No cache: full fetch
                 renderLayerSurfaces(dataType);
+                return;
+            }}
+
+            // Fast path: use Plotly.restyle() to update only colors (no geometry rebuild)
+            const plotIdMap = {{
+                'energy': 'energyPlot',
+                'density': 'densityPlot',
+                'risk': 'riskPlot',
+                'area_ratio': 'areaRatioPlot',
+                'gaussian_factor': 'gaussianPlot'
+            }};
+            const plotId = plotIdMap[dataType];
+            const plotEl = document.getElementById(plotId);
+
+            // Check that plot exists and has traces
+            if (!plotEl || !plotEl.data || plotEl.data.length === 0) {{
+                // Plot not initialized yet, do full render from cache
+                const plotConfigMap = {{
+                    'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: 'energyLoading', placeholderId: null }},
+                    'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
+                    'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
+                    'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: 'areaRatioLoading', placeholderId: null }},
+                    'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }}
+                }};
+                renderFromData(dataType, cachedData, plotConfigMap[dataType]);
+                return;
+            }}
+
+            const minVal = manualColorMin !== null ? manualColorMin : cachedData.min_val;
+            const maxVal = manualColorMax !== null ? manualColorMax : cachedData.max_val;
+
+            // Count valid layer traces (skip empty layers and the colorbar trace at the end)
+            const validLayers = cachedData.layers.filter(l => l.vertices && l.vertices.length > 0);
+
+            // Batch all color updates into a single Plotly.restyle call (much faster than per-trace)
+            const newColors = validLayers.map(l => computeLayerColor(dataType, l.value, minVal, maxVal));
+            const traceIndices = validLayers.map((_, i) => i);
+            Plotly.restyle(plotId, {{ color: newColors }}, traceIndices);
+
+            // Update the colorbar trace (last trace, after all mesh3d traces)
+            const colorbarIdx = validLayers.length;
+            if (plotEl.data[colorbarIdx] && plotEl.data[colorbarIdx].type === 'scatter3d') {{
+                Plotly.restyle(plotId, {{ 'marker.cmin': minVal, 'marker.cmax': maxVal }}, [colorbarIdx]);
             }}
         }}
 
