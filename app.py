@@ -2964,9 +2964,12 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         // Color scale state (null = use adaptive from data)
         let manualColorMin = null;
         let manualColorMax = null;
-        let lastAdaptiveMin = null;  // Store adaptive values for reset
+        let lastAdaptiveMin = null;  // Store adaptive values for reset (current tab)
         let lastAdaptiveMax = null;
         let currentColorDataType = null;  // Track which data type color scale applies to
+
+        // Per-tab cache for adaptive min/max values (for instant switching)
+        const tabAdaptiveRanges = {{}};
 
         // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
@@ -3065,6 +3068,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 manualColorMin = null;
                 manualColorMax = null;
                 updateColorScaleResetButton();
+
+                // Immediately restore cached adaptive values for this tab (responsive switching)
+                const cacheKey = tabName === 'gaussian' ? 'gaussian_factor' : tabName;
+                if (tabAdaptiveRanges[cacheKey]) {{
+                    const cached = tabAdaptiveRanges[cacheKey];
+                    lastAdaptiveMin = cached.min;
+                    lastAdaptiveMax = cached.max;
+                    updateColorScaleInputs(cached.min, cached.max);
+                }}
             }}
         }}
 
@@ -3649,8 +3661,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 const traces = [];
                 const allX = [], allY = [], allZ = [];
 
-                // Store adaptive values and update color scale inputs
-                updateColorScaleInputs(data.min_val, data.max_val);
+                // Store adaptive values and update color scale inputs (with dataType for caching)
+                updateColorScaleInputs(data.min_val, data.max_val, dataType);
 
                 // Use manual values if set, otherwise use adaptive from data
                 const minVal = manualColorMin !== null ? manualColorMin : data.min_val;
@@ -4342,10 +4354,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }}
         }}
 
-        function updateColorScaleInputs(minVal, maxVal) {{
+        function updateColorScaleInputs(minVal, maxVal, dataType) {{
             // Store adaptive values for reset
             lastAdaptiveMin = minVal;
             lastAdaptiveMax = maxVal;
+
+            // Cache adaptive values per data type for instant tab switching
+            if (dataType) {{
+                tabAdaptiveRanges[dataType] = {{ min: minVal, max: maxVal }};
+            }}
 
             // Update input fields with current effective values
             const minInput = document.getElementById('colorScaleMin');
