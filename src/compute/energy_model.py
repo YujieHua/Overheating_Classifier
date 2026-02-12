@@ -69,6 +69,7 @@ def calculate_energy_accumulation(
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
     area_ratio_power: float = 1.0,
+    area_ratio_method: str = 'layer_scan',
     gaussian_ratio_power: float = 0.15,
     laser_power: float = 200.0,
     scan_speed: float = 800.0,
@@ -97,8 +98,9 @@ def calculate_energy_accumulation(
     use_geometry_multiplier : bool
         If True, use Mode B (geometry multiplier). If False, use Mode A (area-only).
     area_ratio_power : float
-        Power exponent for area ratio in Mode A (1.0-3.0, default 3.0).
-        Higher values amplify sensitivity to contact area changes.
+        Power exponent for area ratio in Mode A (1.0-3.0, default 1.0).
+        Ratio = (prev layer scan area / curr layer scan area).
+        Higher values amplify sensitivity to layer area changes.
     gaussian_ratio_power : float
         Power exponent for Gaussian multiplier in Mode B (0.01-1.0, default 0.15).
         Values < 1 dampen the effect, bringing extreme values closer to 1.
@@ -156,6 +158,7 @@ def calculate_energy_accumulation(
     prev_labeled = None
     prev_region_energies = {}    # rid -> energy
     prev_region_geo_factors = {} # rid -> geometry_factor (for empty layer decay)
+    prev_region_areas = {}       # rid -> area (voxels) of previous non-empty layer
 
     for n in range(1, n_layers + 1):
         if progress_callback and n % 50 == 0:
@@ -201,6 +204,7 @@ def calculate_energy_accumulation(
         curr_region_areas = {}
         curr_region_contact_areas = {}
         curr_region_geo_factors = {}
+        curr_region_area_ratios = {}  # rid -> parent_area / region_area
 
         for rid in range(1, n_regions + 1):
             region_mask = (curr_labeled == rid)
@@ -252,12 +256,31 @@ def calculate_energy_accumulation(
                     G_avg = float(G_data)
                 geometry_factor = (1.0 / (1.0 + G_avg)) ** gaussian_ratio_power
             else:
-                # Mode A: (A_contact_region / A_region) ^ area_ratio_power
-                ratio = A_contact_region / A_region if A_region > 0 else 1.0
-                ratio = min(ratio, 1.0)
+                # Mode A: area ratio based geometry factor
+                if area_ratio_method == 'contact':
+                    # Legacy: contact area / region area
+                    ratio = A_contact_region / A_region if A_region > 0 else 1.0
+                    ratio = min(ratio, 1.0)
+                else:
+                    # Default (layer_scan): parent scan areas / region area
+                    # Reduces bias towards ramps. Ratio can exceed 1.0.
+                    parent_total_area = sum(
+                        prev_region_areas.get(pid, 0) for pid in parents.keys()
+                    )
+                    ratio = parent_total_area / A_region if A_region > 0 else 1.0
                 geometry_factor = ratio ** area_ratio_power
 
             curr_region_geo_factors[rid] = geometry_factor
+
+            # Store area ratio for visualization
+            if n == 1:
+                curr_region_area_ratios[rid] = 1.0  # Baseplate = full support
+            elif not parents:
+                curr_region_area_ratios[rid] = 0.0  # Orphan = no support
+            elif not (use_geometry_multiplier and G_layers is not None and n in G_layers):
+                curr_region_area_ratios[rid] = ratio  # Mode A ratio
+            else:
+                curr_region_area_ratios[rid] = 1.0  # Mode B doesn't use area ratio
 
             # 4. Dissipation
             R_total = min(dissipation_factor * geometry_factor + convection_factor, 1.0)
@@ -280,12 +303,14 @@ def calculate_energy_accumulation(
             'region_energies': dict(curr_region_energies),
             'region_areas': dict(curr_region_areas),
             'region_contact_areas': dict(curr_region_contact_areas),
+            'region_area_ratios': dict(curr_region_area_ratios),
         }
 
         # --- Update previous-layer state ---
         prev_labeled = curr_labeled
         prev_region_energies = curr_region_energies
         prev_region_geo_factors = curr_region_geo_factors
+        prev_region_areas = curr_region_areas
 
         logger.debug(f"Layer {n}: regions={n_regions}, "
                      f"E_max={E_layer_scores[n]:.2f}, "
@@ -498,6 +523,7 @@ def run_energy_analysis(
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
     area_ratio_power: float = 1.0,
+    area_ratio_method: str = 'layer_scan',
     gaussian_ratio_power: float = 0.15,
     threshold_medium: float = 0.3,
     threshold_high: float = 0.6,
@@ -529,7 +555,7 @@ def run_energy_analysis(
     use_geometry_multiplier : bool
         If True, use Mode B. If False, use Mode A.
     area_ratio_power : float
-        Power exponent for area ratio in Mode A (1.0-3.0)
+        Power exponent for layer area ratio in Mode A (1.0-3.0)
     threshold_medium : float
         Risk classification threshold for MEDIUM
     threshold_high : float
@@ -575,6 +601,7 @@ def run_energy_analysis(
         convection_factor=convection_factor,
         use_geometry_multiplier=use_geometry_multiplier,
         area_ratio_power=area_ratio_power,
+        area_ratio_method=area_ratio_method,
         gaussian_ratio_power=gaussian_ratio_power,
         laser_power=laser_power,
         scan_speed=scan_speed,

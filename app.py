@@ -689,6 +689,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         threshold_medium = params.get('threshold_medium', 0.3)
         threshold_high = params.get('threshold_high', 0.6)
         area_ratio_power = params.get('area_ratio_power', 1.0)
+        area_ratio_method = params.get('area_ratio_method', 'layer_scan')
         gaussian_ratio_power = params.get('gaussian_ratio_power', 0.15)
         # Laser parameters for Joule calculation
         laser_power = params.get('laser_power', 200.0)
@@ -781,6 +782,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
             convection_factor=convection_factor,
             use_geometry_multiplier=use_geometry_multiplier,
             area_ratio_power=area_ratio_power,
+            area_ratio_method=area_ratio_method,
             gaussian_ratio_power=gaussian_ratio_power,
             threshold_medium=threshold_medium,
             threshold_high=threshold_high,
@@ -817,6 +819,7 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 'sigma_mm': sigma_mm if use_geometry_multiplier else None,
                 'G_max': G_max if use_geometry_multiplier else None,
                 'area_ratio_power': area_ratio_power,
+                'area_ratio_method': area_ratio_method,
                 'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
                 'threshold_medium': threshold_medium,
                 'threshold_high': threshold_high,
@@ -1171,16 +1174,15 @@ def get_layer_surfaces(session_id, data_type):
         area_ratio_power = results.get('params_used', {}).get('area_ratio_power',
                            results.get('params', {}).get('area_ratio_power', 1.0))
         power_label = f'^{area_ratio_power}' if area_ratio_power != 1.0 else ''
-        value_label = f'Area Ratio (A_contact / A_layer){power_label}'
+        value_label = f'Area Ratio (A_below / A_region){power_label}'
         min_val = 0.0
-        max_val = 1.0
+        max_val = 2.0  # Ratio can exceed 1.0 for narrowing features
 
         # Get region data from results
         region_data_all = results.get('region_data', {})
 
         layers_data = []
         sorted_layers = sorted(masks.keys())
-        voxel_size_sq = voxel_size ** 2
 
         for layer in sorted_layers:
             mask = masks.get(layer)
@@ -1197,12 +1199,10 @@ def get_layer_surfaces(session_id, data_type):
             if rd and rd.get('n_regions', 0) > 0:
                 labeled = rd['labeled']
                 n_regions = rd['n_regions']
-                region_areas = rd.get('region_areas', {})
-                region_contact_areas = rd.get('region_contact_areas', {})
+                region_area_ratios = rd.get('region_area_ratios', {})
             else:
                 labeled, n_regions = scipy_ndimage.label(mask_arr > 0)
-                region_areas = {}
-                region_contact_areas = {}
+                region_area_ratios = {}
 
             if n_regions == 0:
                 continue
@@ -1213,15 +1213,8 @@ def get_layer_surfaces(session_id, data_type):
                 if region_mask.sum() == 0:
                     continue
 
-                # Calculate area ratio for this specific region
-                a_region = region_areas.get(rid, 0)
-                a_contact = region_contact_areas.get(rid, 0)
-
-                if a_region > 0:
-                    ratio = min(1.0, a_contact / a_region)
-                else:
-                    ratio = 0.0
-
+                # Use precomputed area ratio from energy model
+                ratio = region_area_ratios.get(rid, region_area_ratios.get(str(rid), 1.0))
                 area_ratio_value = ratio ** area_ratio_power
 
                 vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
@@ -2751,6 +2744,18 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <span>Geometry Multiplier Mode</span>
                         </label>
                     </div>
+                    <!-- Area Ratio Method (only visible in Area-Only mode) -->
+                    <div id="areaRatioMethodGroup" style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border-color);">
+                        <div style="font-size: 0.7rem; color: var(--text-secondary); margin-bottom: 4px;">Area Ratio Method</div>
+                        <label class="radio-option">
+                            <input type="radio" name="areaRatioMethod" value="layer_scan" checked>
+                            <span>Layer Scan Area (default)</span>
+                        </label>
+                        <label class="radio-option">
+                            <input type="radio" name="areaRatioMethod" value="contact">
+                            <span>Contact Area (legacy)</span>
+                        </label>
+                    </div>
                     <!-- Laser Parameters for Energy Calculation -->
                     <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border-color);">
                         <div style="font-size: 0.7rem; color: var(--text-secondary); margin-bottom: 4px;">Laser Parameters</div>
@@ -2905,7 +2910,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <div class="loading-text">Updating visualization...</div>
                         </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see area ratio (A_contact / A_layer)
+                            Run analysis to see area ratio (A_below / A_region)
                         </div>
                     </div>
                 </div>
@@ -3093,6 +3098,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const isGeometry = document.querySelector('input[name="energyModel"]:checked').value === 'geometry_multiplier';
             document.getElementById('geometryParams').style.display = isGeometry ? 'block' : 'none';
             document.getElementById('powerParamGroup').style.display = isGeometry ? 'none' : '';
+            document.getElementById('areaRatioMethodGroup').style.display = isGeometry ? 'none' : 'block';
         }}
 
         // Shared 3D camera state across tabs
@@ -3532,6 +3538,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
                 threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
                 area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 1.0,
+                area_ratio_method: document.querySelector('input[name="areaRatioMethod"]:checked').value,
                 gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15,
                 laser_power: parseFloat(document.getElementById('laserPower').value) || 200,
                 scan_speed: parseFloat(document.getElementById('scanSpeed').value) || 800,
@@ -3704,7 +3711,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: 'energyLoading', placeholderId: null }},
                 'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
                 'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
-                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: 'areaRatioLoading', placeholderId: null }},
+                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_below / A_region)', loadingId: 'areaRatioLoading', placeholderId: null }},
                 'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }},
                 'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)', loadingId: 'regionsLoading', placeholderId: 'regionsPlaceholder' }}
             }};
@@ -3833,9 +3840,30 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         if (value >= 2) color = '#f87171';  // HIGH - red
                         else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
                         else color = '#4ade80';  // LOW - green
-                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
-                        // Geometry factors: REVERSED - high=green (good), low=red (bad)
-                        const rv = 1.0 - normalizedValue;  // Reverse: 0→1, 1→0
+                    }} else if (dataType === 'area_ratio') {{
+                        // Area ratio: Inverted Jet (red=low, blue=high)
+                        const iv = 1.0 - normalizedValue;  // Invert so red=min, blue=max
+                        let r, g, b;
+                        if (iv < 0.125) {{
+                            const t = iv / 0.125;
+                            r = 0; g = 0; b = Math.round(128 + t * 127);
+                        }} else if (iv < 0.375) {{
+                            const t = (iv - 0.125) / 0.25;
+                            r = 0; g = Math.round(t * 255); b = 255;
+                        }} else if (iv < 0.625) {{
+                            const t = (iv - 0.375) / 0.25;
+                            r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
+                        }} else if (iv < 0.875) {{
+                            const t = (iv - 0.625) / 0.25;
+                            r = 255; g = Math.round(255 * (1 - t)); b = 0;
+                        }} else {{
+                            const t = (iv - 0.875) / 0.125;
+                            r = Math.round(255 - t * 127); g = 0; b = 0;
+                        }}
+                        color = `rgb(${{r}}, ${{g}}, ${{b}})`;
+                    }} else if (dataType === 'gaussian_factor') {{
+                        // Gaussian: keep old green-red scale
+                        const rv = 1.0 - normalizedValue;
                         if (rv < 0.3) {{
                             const t = rv / 0.3;
                             color = `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
@@ -3905,8 +3933,19 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     let colorscale;
                     if (dataType === 'risk') {{
                         colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
-                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
-                        // Reversed: red at 0 (bad), green at 1 (good)
+                    }} else if (dataType === 'area_ratio') {{
+                        // Inverted Jet: red at min (bad), blue at max (good)
+                        colorscale = [
+                            [0.0, '#7F0000'],    // Dark red
+                            [0.125, '#FF0000'],  // Red
+                            [0.375, '#FFFF00'],  // Yellow
+                            [0.5, '#00FF00'],    // Green
+                            [0.625, '#00FFFF'],  // Cyan
+                            [0.875, '#0000FF'],  // Blue
+                            [1.0, '#00007F']     // Dark blue
+                        ];
+                    }} else if (dataType === 'gaussian_factor') {{
+                        // Gaussian: keep old green-red scale
                         colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
                     }} else {{
                         // Energy: Jet colorscale (blue → cyan → green → yellow → red)
@@ -4490,18 +4529,21 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 if (value >= 2) return '#f87171';
                 else if (value >= 1) return '#fbbf24';
                 else return '#4ade80';
-            }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
+            }} else if (dataType === 'area_ratio') {{
+                // Inverted Jet: red=low, blue=high
+                const iv = 1.0 - normalizedValue;
+                let r, g, b;
+                if (iv < 0.125) {{ const t = iv / 0.125; r = 0; g = 0; b = Math.round(128 + t * 127); }}
+                else if (iv < 0.375) {{ const t = (iv - 0.125) / 0.25; r = 0; g = Math.round(t * 255); b = 255; }}
+                else if (iv < 0.625) {{ const t = (iv - 0.375) / 0.25; r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t)); }}
+                else if (iv < 0.875) {{ const t = (iv - 0.625) / 0.25; r = 255; g = Math.round(255 * (1 - t)); b = 0; }}
+                else {{ const t = (iv - 0.875) / 0.125; r = Math.round(255 - t * 127); g = 0; b = 0; }}
+                return `rgb(${{r}}, ${{g}}, ${{b}})`;
+            }} else if (dataType === 'gaussian_factor') {{
                 const rv = 1.0 - normalizedValue;
-                if (rv < 0.3) {{
-                    const t = rv / 0.3;
-                    return `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
-                }} else if (rv < 0.6) {{
-                    const t = (rv - 0.3) / 0.3;
-                    return `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189 - t * 0)}}, ${{Math.round(36 - t * 0)}})`;
-                }} else {{
-                    const t = (rv - 0.6) / 0.4;
-                    return `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
-                }}
+                if (rv < 0.3) {{ const t = rv / 0.3; return `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`; }}
+                else if (rv < 0.6) {{ const t = (rv - 0.3) / 0.3; return `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189)}}, ${{Math.round(36)}})`; }}
+                else {{ const t = (rv - 0.6) / 0.4; return `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`; }}
             }} else {{
                 let r, g, b;
                 if (normalizedValue < 0.125) {{
@@ -4560,7 +4602,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: 'energyLoading', placeholderId: null }},
                     'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
                     'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
-                    'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)', loadingId: 'areaRatioLoading', placeholderId: null }},
+                    'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_below / A_region)', loadingId: 'areaRatioLoading', placeholderId: null }},
                     'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }}
                 }};
                 renderFromData(dataType, cachedData, plotConfigMap[dataType]);
