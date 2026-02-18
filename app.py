@@ -696,6 +696,221 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         scan_speed = params.get('scan_speed', 800.0)
         hatch_distance = params.get('hatch_distance', 0.1)
 
+        # ----------------------------------------------------------------
+        # MODE DISPATCH: check if thermal simulation is requested
+        # ----------------------------------------------------------------
+        mode = params.get('mode', 'energy')
+
+        if mode == 'thermal':
+            # ---- Thermal simulation path ----
+            from src.compute.thermal_model import run_thermal_analysis
+            from src.compute.region_detect import detect_all_layer_regions, compute_cross_layer_connectivity
+            import importlib.util as _ilu
+            _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.py')
+            _cfg_spec = _ilu.spec_from_file_location('_root_config', _cfg_path)
+            _cfg_mod = _ilu.module_from_spec(_cfg_spec)
+            _cfg_spec.loader.exec_module(_cfg_mod)
+
+            # Extract thermal-specific params
+            # JS sends 'material_key' for material preset name
+            mat_name = params.get('material_key', params.get('material', 'SS316L'))
+            mat_db = getattr(_cfg_mod, 'MATERIAL_DATABASE', {})
+            mat_props = mat_db.get(mat_name, mat_db.get('SS316L'))
+
+            # Override with any user-specified material properties
+            # JS sends 'thermal_Tm' (capital T and m) for melting point
+            thermal_k   = params.get('thermal_k',           mat_props.thermal_conductivity)
+            thermal_cp  = params.get('thermal_cp',          mat_props.specific_heat)
+            thermal_rho = params.get('thermal_rho',         mat_props.density)
+            thermal_tm  = params.get('thermal_Tm', params.get('thermal_tm', mat_props.melting_point))
+            thermal_abs = params.get('thermal_absorptivity', mat_props.absorptivity)
+
+            material_props = _cfg_mod.MaterialProperties(
+                name=mat_name,
+                thermal_conductivity=thermal_k,
+                specific_heat=thermal_cp,
+                density=thermal_rho,
+                melting_point=thermal_tm,
+                absorptivity=thermal_abs,
+            )
+
+            process_params = _cfg_mod.ProcessDefaults(
+                laser_power=params.get('thermal_laser_power', 280.0),
+                scan_velocity=params.get('thermal_scan_velocity', 960.0),
+                hatch_spacing=params.get('thermal_hatch_spacing', 0.1),
+                recoat_time=params.get('thermal_recoat_time', 8.0),
+                scan_efficiency=params.get('thermal_scan_efficiency', 0.1),
+            )
+
+            thermal_params = _cfg_mod.ThermalSimDefaults(
+                convection_coefficient=params.get('thermal_h_conv', 10.0),
+                substrate_influence=params.get('thermal_substrate_inf', 0.3),
+                preheat_temp=params.get('thermal_preheat', 80.0),
+            )
+
+            # ---- Slicing (reuse cache or re-slice) ----
+            t_need_reslice = True
+            t_masks = None
+            t_slice_info = None
+
+            if slice_cache is not None:
+                cached_params = slice_cache.get('params', {})
+                if (cached_params.get('voxel_size') == voxel_size and
+                    cached_params.get('layer_thickness') == layer_thickness and
+                    cached_params.get('layer_grouping') == layer_grouping and
+                    cached_params.get('build_direction') == build_direction):
+                    t_masks = slice_cache['masks']
+                    t_slice_info = slice_cache['info']
+                    t_need_reslice = False
+                    progress_with_cancel(20, "[INFO] Thermal: Using cached slice data")
+
+            if t_need_reslice:
+                progress_with_cancel(5, "[STAGE] Thermal: Loading STL mesh...")
+                mesh_info = load_stl(stl_path)
+
+                if build_direction != 'Z':
+                    progress_with_cancel(6, f"[STAGE] Rotating mesh ({build_direction}→Z)...")
+                    mesh = mesh_info['mesh']
+                    rotated_mesh = apply_build_direction_rotation(mesh, build_direction)
+                    mesh_info['mesh'] = rotated_mesh
+                    mesh_info['bounds'] = rotated_mesh.bounds
+                    mesh_info['dimensions'] = rotated_mesh.bounds[1] - rotated_mesh.bounds[0]
+
+                progress_with_cancel(10, "[STAGE] Thermal: Slicing geometry...")
+                from src.data.stl_loader import slice_stl
+                slice_result = slice_stl(
+                    mesh_info=mesh_info,
+                    voxel_size=voxel_size,
+                    layer_thickness=layer_thickness,
+                    layer_grouping=layer_grouping,
+                    progress_callback=lambda p, s: progress_with_cancel(10 + p * 0.10, s)
+                )
+                t_masks = slice_result['masks']
+                t_slice_info = {
+                    'n_layers': slice_result['n_layers'],
+                    'grid_shape': slice_result['grid_shape'],
+                }
+
+            t_n_layers = len(t_masks)
+            progress_with_cancel(22, f"[INFO] Thermal: {t_n_layers} layers ready")
+
+            # ---- Region detection ----
+            progress_with_cancel(25, "[STAGE] Detecting 2D regions per layer...")
+            regions_per_layer = detect_all_layer_regions(
+                masks=t_masks,
+                voxel_size=voxel_size,
+                layer_thickness=layer_thickness,
+            )
+            progress_with_cancel(45, "[INFO] Region detection complete")
+
+            # ---- Cross-layer connectivity ----
+            progress_with_cancel(48, "[STAGE] Computing cross-layer connectivity...")
+            _, conn_below_lookup, conn_above_lookup = compute_cross_layer_connectivity(
+                regions_per_layer=regions_per_layer,
+                voxel_size=voxel_size,
+            )
+            progress_with_cancel(55, "[INFO] Connectivity computed")
+
+            # ---- Thermal simulation ----
+            progress_with_cancel(58, "[STAGE] Running thermal simulation...")
+
+            def thermal_progress(frac):
+                progress_with_cancel(58 + frac * 30, f"[INFO] Thermal simulation {frac*100:.0f}%")
+                if session.is_cancelled():
+                    raise CancelledException("Thermal simulation cancelled")
+
+            thermal_results = run_thermal_analysis(
+                masks=t_masks,
+                regions_per_layer=regions_per_layer,
+                conn_below_lookup=conn_below_lookup,
+                conn_above_lookup=conn_above_lookup,
+                material_props=material_props,
+                process_params=process_params,
+                thermal_params=thermal_params,
+                layer_grouping=layer_grouping,
+                voxel_size=voxel_size,
+                layer_thickness=layer_thickness,
+                progress_callback=thermal_progress,
+            )
+            progress_with_cancel(90, "[STAGE] Thermal: Preparing results...")
+
+            computation_time = time.time() - start_time
+
+            # Convert numpy values to JSON-serializable Python types
+            temp_per_layer_ser = {
+                int(layer): {int(rid): float(t) for rid, t in region_temps.items()}
+                for layer, region_temps in thermal_results['temperature_per_layer'].items()
+            }
+            risk_per_layer_ser = {
+                int(layer): risk
+                for layer, risk in thermal_results['risk_per_layer'].items()
+            }
+            energy_cons = {k: float(v) for k, v in thermal_results['energy_conservation'].items()}
+            melting_ser = [(int(l), int(r)) for l, r in thermal_results['melting_detected']]
+
+            # Build region_data (needs 'labeled' and 'n_regions' for visualization endpoint)
+            region_data = {}
+            for layer, ldata in regions_per_layer.items():
+                region_data[layer] = {
+                    'n_regions': ldata['n_regions'],
+                    'labeled': ldata['label_map'],
+                    'region_areas': {
+                        rid: rinfo['pixel_count']
+                        for rid, rinfo in ldata['regions'].items()
+                    },
+                }
+
+            # Compute summary stats
+            all_temps_ser = [
+                t for layer_temps in temp_per_layer_ser.values()
+                for t in layer_temps.values()
+            ]
+            max_temp_ser = float(max(all_temps_ser)) if all_temps_ser else 0.0
+            mean_temp_ser = float(sum(all_temps_ser) / len(all_temps_ser)) if all_temps_ser else 0.0
+            n_safe_ser = sum(1 for v in risk_per_layer_ser.values() if v == 'SAFE')
+            n_warning_ser = sum(1 for v in risk_per_layer_ser.values() if v == 'WARNING')
+            n_critical_ser = sum(1 for v in risk_per_layer_ser.values() if v == 'CRITICAL')
+
+            results = {
+                'mode': 'thermal',
+                'n_layers': t_n_layers,
+                'masks': t_masks,
+                'temperature_per_layer': temp_per_layer_ser,
+                'risk_per_layer': risk_per_layer_ser,
+                'melting_detected': melting_ser,
+                'energy_conservation': energy_cons,
+                'region_data': region_data,
+                'summary': {
+                    'n_layers': t_n_layers,
+                    'max_temp': max_temp_ser,
+                    'mean_temp': mean_temp_ser,
+                    'n_safe': n_safe_ser,
+                    'n_warning': n_warning_ser,
+                    'n_critical': n_critical_ser,
+                    'melting_detected': len(melting_ser) > 0,
+                },
+                'params_used': {
+                    'mode': 'thermal',
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                    'layer_grouping': layer_grouping,
+                    'build_direction': build_direction,
+                    'effective_layer_thickness': layer_thickness * layer_grouping,
+                    'material': mat_name,
+                    'laser_power': process_params.laser_power,
+                    'scan_velocity': process_params.scan_velocity,
+                    'hatch_spacing': process_params.hatch_spacing,
+                    'preheat_temp': thermal_params.preheat_temp,
+                },
+                'computation_time_seconds': computation_time,
+            }
+
+            progress_with_cancel(98, f"[INFO] Thermal analysis complete in {computation_time:.1f}s")
+
+            if not session.is_cancelled():
+                session.set_complete(results, computation_time)
+            return  # Don't fall through to energy mode
+
         need_reslice = True
         masks = None
         slice_info = None
@@ -746,98 +961,252 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         n_layers = len(masks)
         progress_with_cancel(22, f"[INFO] {n_layers} layers ready")
 
-        G_layers = None
-        if use_geometry_multiplier:
-            progress_with_cancel(25, "[STAGE] Computing geometry multiplier G...")
+        mode = params.get('mode', 'energy')
 
-            slice_result_for_G = {
-                'masks': masks,
-                'n_layers': n_layers,
-                'grid_shape': slice_info.get('grid_shape', masks[1].shape),
-                'voxel_size': voxel_size,
-                'layer_thickness': layer_thickness,
-            }
+        if mode == 'thermal':
+            # ----------------------------------------------------------------
+            # THERMAL SIMULATION PIPELINE
+            # ----------------------------------------------------------------
+            import importlib.util as _ilu, os as _os
+            _cfg_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'config.py')
+            _cfg_spec = _ilu.spec_from_file_location('_root_config', _cfg_path)
+            _cfg_mod = _ilu.module_from_spec(_cfg_spec)
+            _cfg_spec.loader.exec_module(_cfg_mod)
 
-            G_layers_2d = calculate_geometry_multiplier_per_layer(
-                slice_result_for_G,
-                sigma_mm=sigma_mm,
-                G_max=G_max,
-                progress_callback=lambda p, s: progress_with_cancel(25 + p * 0.15, s)
+            from src.compute.region_detect import detect_all_layer_regions, compute_cross_layer_connectivity
+            from src.compute.thermal_model import run_thermal_analysis
+
+            effective_layer_thickness = layer_thickness * layer_grouping
+
+            progress_with_cancel(25, "[STAGE] Detecting layer regions for thermal model...")
+            regions_per_layer = detect_all_layer_regions(
+                masks=masks,
+                voxel_size=voxel_size,
+                layer_thickness=effective_layer_thickness,
             )
 
-            G_layers = G_layers_2d  # Pass per-voxel 2D arrays (not pre-averaged scalars)
-            progress_with_cancel(42, "[INFO] Geometry G computed")
+            progress_with_cancel(35, "[STAGE] Computing cross-layer connectivity...")
+            _, conn_below_lookup, conn_above_lookup = compute_cross_layer_connectivity(
+                regions_per_layer=regions_per_layer,
+                voxel_size=voxel_size,
+            )
+
+            # Build material properties (from preset + optional per-field overrides)
+            material_key = params.get('material_key', 'SS316L')
+            mat = _cfg_mod.MATERIAL_DATABASE.get(material_key, _cfg_mod.MATERIAL_DATABASE['SS316L'])
+
+            material_props = _cfg_mod.MaterialProperties(
+                name=mat.name,
+                thermal_conductivity=float(params.get('thermal_k', mat.thermal_conductivity)),
+                specific_heat=float(params.get('thermal_cp', mat.specific_heat)),
+                density=float(params.get('thermal_rho', mat.density)),
+                melting_point=float(params.get('thermal_Tm', mat.melting_point)),
+                absorptivity=float(params.get('thermal_absorptivity', mat.absorptivity)),
+            )
+
+            process_params = _cfg_mod.ProcessDefaults(
+                laser_power=float(params.get('thermal_laser_power', laser_power)),
+                scan_velocity=float(params.get('thermal_scan_velocity', 960.0)),
+                hatch_spacing=float(params.get('thermal_hatch_spacing', hatch_distance)),
+                recoat_time=float(params.get('thermal_recoat_time', 8.0)),
+                scan_efficiency=float(params.get('thermal_scan_efficiency', 0.1)),
+            )
+
+            thermal_params = _cfg_mod.ThermalSimDefaults(
+                convection_coefficient=float(params.get('thermal_h_conv', 10.0)),
+                substrate_influence=float(params.get('thermal_substrate_inf', 0.3)),
+                warning_fraction=float(params.get('thermal_warning_frac', 0.8)),
+                critical_fraction=float(params.get('thermal_critical_frac', 1.0)),
+                preheat_temp=float(params.get('thermal_preheat', 80.0)),
+            )
+
+            progress_with_cancel(40, "[STAGE] Running thermal simulation...")
+            thermal_results = run_thermal_analysis(
+                masks=masks,
+                regions_per_layer=regions_per_layer,
+                conn_below_lookup=conn_below_lookup,
+                conn_above_lookup=conn_above_lookup,
+                material_props=material_props,
+                process_params=process_params,
+                thermal_params=thermal_params,
+                layer_grouping=layer_grouping,
+                voxel_size=voxel_size,
+                layer_thickness=layer_thickness,
+                progress_callback=lambda p, s='': progress_with_cancel(40 + p * 0.50, s),
+            )
+
+            progress_with_cancel(92, "[STAGE] Preparing thermal results...")
+
+            # Convert to JSON-serializable format
+            temp_per_layer = {
+                int(layer): {int(rid): float(t) for rid, t in region_temps.items()}
+                for layer, region_temps in thermal_results['temperature_per_layer'].items()
+            }
+            risk_per_layer = {
+                int(layer): risk
+                for layer, risk in thermal_results['risk_per_layer'].items()
+            }
+
+            # Convert regions_per_layer to region_data format (with 'labeled' key)
+            region_data = {}
+            for layer_idx, ldata in regions_per_layer.items():
+                region_data[layer_idx] = {
+                    'n_regions': ldata['n_regions'],
+                    'labeled': ldata['label_map'],
+                    'region_areas': {
+                        rid: rinfo['pixel_count']
+                        for rid, rinfo in ldata['regions'].items()
+                    },
+                }
+
+            computation_time = time.time() - start_time
+
+            # Summary stats
+            all_temps = [
+                t for layer_temps in temp_per_layer.values()
+                for t in layer_temps.values()
+            ]
+            max_temp = float(max(all_temps)) if all_temps else 0.0
+            mean_temp = float(sum(all_temps) / len(all_temps)) if all_temps else 0.0
+            n_safe = sum(1 for v in risk_per_layer.values() if v == 'SAFE')
+            n_warning = sum(1 for v in risk_per_layer.values() if v == 'WARNING')
+            n_critical = sum(1 for v in risk_per_layer.values() if v == 'CRITICAL')
+
+            results = {
+                'n_layers': n_layers,
+                'mode': 'thermal',
+                'temperature_per_layer': temp_per_layer,
+                'risk_per_layer': risk_per_layer,
+                'melting_detected': len(thermal_results['melting_detected']) > 0,
+                'params_used': {
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                    'layer_grouping': layer_grouping,
+                    'build_direction': build_direction,
+                    'effective_layer_thickness': effective_layer_thickness,
+                    'mode': 'thermal',
+                    'material': material_props.name,
+                    'laser_power': process_params.laser_power,
+                    'scan_velocity': process_params.scan_velocity,
+                    'hatch_spacing': process_params.hatch_spacing,
+                    'preheat_temp': thermal_params.preheat_temp,
+                },
+                'summary': {
+                    'n_layers': n_layers,
+                    'max_temp': max_temp,
+                    'mean_temp': mean_temp,
+                    'n_safe': n_safe,
+                    'n_warning': n_warning,
+                    'n_critical': n_critical,
+                    'melting_detected': len(thermal_results['melting_detected']) > 0,
+                },
+                'computation_time_seconds': computation_time,
+                'masks': masks,
+                'region_data': region_data,
+            }
+
+            progress_with_cancel(98, f"[INFO] Thermal analysis complete in {computation_time:.1f}s")
+
+            if not session.is_cancelled():
+                session.set_complete(results, computation_time)
+
         else:
-            progress_with_cancel(42, "[INFO] Using Area-Only mode (no geometry G)")
+            # ----------------------------------------------------------------
+            # ENERGY BALANCE PIPELINE (existing, unchanged)
+            # ----------------------------------------------------------------
 
-        progress_with_cancel(45, "[STAGE] Running energy accumulation analysis...")
+            G_layers = None
+            if use_geometry_multiplier:
+                progress_with_cancel(25, "[STAGE] Computing geometry multiplier G...")
 
-        # Effective layer thickness with grouping
-        effective_layer_thickness = layer_thickness * layer_grouping
+                slice_result_for_G = {
+                    'masks': masks,
+                    'n_layers': n_layers,
+                    'grid_shape': slice_info.get('grid_shape', masks[1].shape),
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                }
 
-        energy_results = run_energy_analysis(
-            masks=masks,
-            G_layers=G_layers,
-            dissipation_factor=dissipation_factor,
-            convection_factor=convection_factor,
-            use_geometry_multiplier=use_geometry_multiplier,
-            area_ratio_power=area_ratio_power,
-            area_ratio_method=area_ratio_method,
-            gaussian_ratio_power=gaussian_ratio_power,
-            threshold_medium=threshold_medium,
-            threshold_high=threshold_high,
-            voxel_size=voxel_size,
-            layer_thickness=effective_layer_thickness,
-            laser_power=laser_power,
-            scan_speed=scan_speed,
-            hatch_distance=hatch_distance,
-            progress_callback=lambda p, s: progress_with_cancel(45 + p * 0.45, s)
-        )
+                G_layers_2d = calculate_geometry_multiplier_per_layer(
+                    slice_result_for_G,
+                    sigma_mm=sigma_mm,
+                    G_max=G_max,
+                    progress_callback=lambda p, s: progress_with_cancel(25 + p * 0.15, s)
+                )
 
-        progress_with_cancel(92, "[STAGE] Preparing results...")
+                G_layers = G_layers_2d  # Pass per-voxel 2D arrays (not pre-averaged scalars)
+                progress_with_cancel(42, "[INFO] Geometry G computed")
+            else:
+                progress_with_cancel(42, "[INFO] Using Area-Only mode (no geometry G)")
 
-        computation_time = time.time() - start_time
+            progress_with_cancel(45, "[STAGE] Running energy accumulation analysis...")
 
-        results = {
-            'n_layers': n_layers,
-            'risk_scores': energy_results['risk_scores'],
-            'raw_energy_scores': energy_results['raw_energy_scores'],
-            'energy_density_scores': energy_results['energy_density_scores'],
-            'risk_levels': energy_results['risk_levels'],
-            'layer_areas': energy_results['layer_areas'],
-            'contact_areas': energy_results['contact_areas'],
-            'summary': energy_results['summary'],
-            'params_used': {
-                'voxel_size': voxel_size,
-                'layer_thickness': layer_thickness,
-                'layer_grouping': layer_grouping,
-                'build_direction': build_direction,
-                'effective_layer_thickness': effective_layer_thickness,
-                'dissipation_factor': dissipation_factor,
-                'convection_factor': convection_factor,
-                'use_geometry_multiplier': use_geometry_multiplier,
-                'sigma_mm': sigma_mm if use_geometry_multiplier else None,
-                'G_max': G_max if use_geometry_multiplier else None,
-                'area_ratio_power': area_ratio_power,
-                'area_ratio_method': area_ratio_method,
-                'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
-                'threshold_medium': threshold_medium,
-                'threshold_high': threshold_high,
-                'mode': energy_results['params']['mode'],
-                'laser_power': laser_power,
-                'scan_speed': scan_speed,
-                'hatch_distance': hatch_distance,
-            },
-            'computation_time_seconds': computation_time,
-            'masks': masks,
-            'G_layers': G_layers if use_geometry_multiplier else None,
-            'region_data': energy_results.get('region_data', {}),
-        }
+            # Effective layer thickness with grouping
+            effective_layer_thickness = layer_thickness * layer_grouping
 
-        progress_with_cancel(98, f"[INFO] Analysis complete in {computation_time:.1f}s")
+            energy_results = run_energy_analysis(
+                masks=masks,
+                G_layers=G_layers,
+                dissipation_factor=dissipation_factor,
+                convection_factor=convection_factor,
+                use_geometry_multiplier=use_geometry_multiplier,
+                area_ratio_power=area_ratio_power,
+                area_ratio_method=area_ratio_method,
+                gaussian_ratio_power=gaussian_ratio_power,
+                threshold_medium=threshold_medium,
+                threshold_high=threshold_high,
+                voxel_size=voxel_size,
+                layer_thickness=effective_layer_thickness,
+                laser_power=laser_power,
+                scan_speed=scan_speed,
+                hatch_distance=hatch_distance,
+                progress_callback=lambda p, s: progress_with_cancel(45 + p * 0.45, s)
+            )
 
-        if not session.is_cancelled():
-            session.set_complete(results, computation_time)
+            progress_with_cancel(92, "[STAGE] Preparing results...")
+
+            computation_time = time.time() - start_time
+
+            results = {
+                'n_layers': n_layers,
+                'risk_scores': energy_results['risk_scores'],
+                'raw_energy_scores': energy_results['raw_energy_scores'],
+                'energy_density_scores': energy_results['energy_density_scores'],
+                'risk_levels': energy_results['risk_levels'],
+                'layer_areas': energy_results['layer_areas'],
+                'contact_areas': energy_results['contact_areas'],
+                'summary': energy_results['summary'],
+                'params_used': {
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                    'layer_grouping': layer_grouping,
+                    'build_direction': build_direction,
+                    'effective_layer_thickness': effective_layer_thickness,
+                    'dissipation_factor': dissipation_factor,
+                    'convection_factor': convection_factor,
+                    'use_geometry_multiplier': use_geometry_multiplier,
+                    'sigma_mm': sigma_mm if use_geometry_multiplier else None,
+                    'G_max': G_max if use_geometry_multiplier else None,
+                    'area_ratio_power': area_ratio_power,
+                    'area_ratio_method': area_ratio_method,
+                    'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
+                    'threshold_medium': threshold_medium,
+                    'threshold_high': threshold_high,
+                    'mode': energy_results['params']['mode'],
+                    'laser_power': laser_power,
+                    'scan_speed': scan_speed,
+                    'hatch_distance': hatch_distance,
+                },
+                'computation_time_seconds': computation_time,
+                'masks': masks,
+                'G_layers': G_layers if use_geometry_multiplier else None,
+                'region_data': energy_results.get('region_data', {}),
+            }
+
+            progress_with_cancel(98, f"[INFO] Analysis complete in {computation_time:.1f}s")
+
+            if not session.is_cancelled():
+                session.set_complete(results, computation_time)
 
     except CancelledException:
         logger.info(f"Analysis cancelled for session {session.session_id}")
@@ -1482,6 +1851,94 @@ def get_layer_surfaces(session_id, data_type):
             'voxel_size': voxel_size,
             'is_categorical': True
         })
+    elif data_type == 'temperature':
+        # Per-region peak temperature visualization (thermal mode)
+        from scipy import ndimage as _ndimage_temp
+
+        temperature_per_layer = results.get('temperature_per_layer', {})
+        region_data_all_t = results.get('region_data', {})
+
+        if not temperature_per_layer:
+            return jsonify({'status': 'error', 'message': 'No temperature data (run thermal analysis first)'}), 400
+
+        all_temps = [
+            t for layer_temps in temperature_per_layer.values()
+            for t in layer_temps.values()
+        ]
+        min_val = float(min(all_temps)) if all_temps else 0.0
+        max_val = float(max(all_temps)) if all_temps else 1.0
+
+        layers_data = []
+        sorted_layers = sorted(masks.keys())
+
+        for layer in sorted_layers:
+            mask = masks.get(layer)
+            if mask is None:
+                continue
+            mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+            if mask_arr.sum() == 0:
+                continue
+
+            z = layer * layer_thickness
+            rd = region_data_all_t.get(layer)
+            if rd and rd.get('n_regions', 0) > 0:
+                labeled = rd['labeled']
+                n_regions = rd['n_regions']
+            else:
+                labeled, n_regions = _ndimage_temp.label(mask_arr > 0)
+
+            if n_regions == 0:
+                continue
+
+            layer_temps = temperature_per_layer.get(layer, {})
+
+            for rid in range(1, n_regions + 1):
+                region_mask = (labeled == rid).astype(np.uint8)
+                if region_mask.sum() == 0:
+                    continue
+
+                temp_value = layer_temps.get(rid, min_val)
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z, skip_garbage_filter=True)
+                if vertices and faces:
+                    layers_data.append({
+                        'layer': int(layer),
+                        'z': float(z),
+                        'value': float(temp_value),
+                        'region_id': int(rid),
+                        'n_regions': int(n_regions),
+                        'vertices': vertices,
+                        'faces': faces,
+                    })
+
+        return jsonify({
+            'status': 'success',
+            'layers': layers_data,
+            'n_layers': len(sorted_layers),
+            'n_valid_layers': len(layers_data),
+            'min_val': min_val,
+            'max_val': max_val,
+            'value_label': 'Peak Temperature (°C)',
+            'layer_thickness': layer_thickness,
+            'voxel_size': voxel_size,
+            'per_region': True,
+        })
+    elif data_type == 'thermal_risk':
+        # Thermal risk per layer: SAFE=0, WARNING=1, CRITICAL=2
+        risk_per_layer = results.get('risk_per_layer', {})
+        if not risk_per_layer:
+            return jsonify({'status': 'error', 'message': 'No thermal risk data (run thermal analysis first)'}), 400
+
+        layer_values = {}
+        for k, level in risk_per_layer.items():
+            if level == 'WARNING':
+                layer_values[int(k)] = 1
+            elif level == 'CRITICAL':
+                layer_values[int(k)] = 2
+            else:  # SAFE
+                layer_values[int(k)] = 0
+        value_label = 'Thermal Risk'
+        min_val = 0
+        max_val = 2
     else:
         return jsonify({'status': 'error', 'message': f'Unknown data type: {data_type}'}), 400
 
@@ -2644,6 +3101,39 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             color: var(--text-secondary);
             font-size: 0.9rem;
         }}
+        /* Mode selector (analysis method toggle) */
+        .mode-selector {{
+            margin-bottom: 10px;
+            padding: 10px;
+            background: rgba(0, 127, 163, 0.15);
+            border-radius: 6px;
+            border: 1px solid rgba(0, 127, 163, 0.3);
+        }}
+        .mode-selector-label {{
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }}
+        .mode-btn {{
+            flex: 1;
+            padding: 6px 8px;
+            border: 1px solid rgba(0, 127, 163, 0.4);
+            border-radius: 4px;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .mode-btn.active {{
+            background: rgba(0, 127, 163, 0.5);
+            color: #fff;
+            border-color: var(--accent);
+        }}
+        .mode-btn:hover:not(.active) {{
+            background: rgba(0, 127, 163, 0.2);
+            color: #ccc;
+        }}
     </style>
 </head>
 <body>
@@ -2656,6 +3146,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         <!-- Left Sidebar -->
         <aside class="sidebar">
             <div class="panel-title">Parameters</div>
+
+            <!-- Mode Selector -->
+            <div class="mode-selector">
+                <div class="mode-selector-label">Analysis Method</div>
+                <div style="display: flex; gap: 4px;">
+                    <button id="mode-energy" class="mode-btn active" onclick="setMode('energy')">&#9889; Energy Balance</button>
+                    <button id="mode-thermal" class="mode-btn" onclick="setMode('thermal')">&#127777; Thermal Sim</button>
+                </div>
+            </div>
 
             <!-- STL Input Section -->
             <div class="sidebar-section expanded">
@@ -2728,7 +3227,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             </div>
 
             <!-- Energy Model Section -->
-            <div class="sidebar-section">
+            <div class="sidebar-section energy-only">
                 <div class="section-header" onclick="toggleSection(this)">
                     <span>Energy Model</span>
                     <span class="arrow">&#9660;</span>
@@ -2811,7 +3310,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             </div>
 
             <!-- Risk Thresholds Section -->
-            <div class="sidebar-section">
+            <div class="sidebar-section energy-only">
                 <div class="section-header collapsed" onclick="toggleSection(this)">
                     <span>Risk Thresholds</span>
                     <span class="arrow">&#9660;</span>
@@ -2835,6 +3334,115 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
+            <!-- Material Properties Section (Thermal Only) -->
+            <div class="sidebar-section thermal-only" style="display: none;">
+                <div class="section-header collapsed" onclick="toggleSection(this)">
+                    <span>Material</span>
+                    <span class="arrow">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <div class="param-row" style="margin-bottom: 6px;">
+                        <span class="param-label">Preset</span>
+                        <select class="param-input" id="materialSelect" style="flex: 1;" onchange="onMaterialSelect(this.value)">
+                            <option value="SS316L">SS316L (Stainless)</option>
+                            <option value="Ti64">Ti-6Al-4V</option>
+                            <option value="IN718">Inconel 718</option>
+                            <option value="AlSi10Mg">AlSi10Mg</option>
+                        </select>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Conductivity</span>
+                        <input type="number" class="param-input" id="thermalK" value="16.2" step="0.1">
+                        <span class="param-unit">W/mK</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Sp. Heat</span>
+                        <input type="number" class="param-input" id="thermalCp" value="500" step="10">
+                        <span class="param-unit">J/kgK</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Density</span>
+                        <input type="number" class="param-input" id="thermalRho" value="7990" step="10">
+                        <span class="param-unit">kg/m³</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Melt Point</span>
+                        <input type="number" class="param-input" id="thermalTm" value="1400" step="10">
+                        <span class="param-unit">°C</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Absorptivity</span>
+                        <input type="number" class="param-input" id="thermalAbsorptivity" value="0.35" step="0.01" min="0.05" max="0.95">
+                        <span class="param-unit"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Process Parameters Section (Thermal Only) -->
+            <div class="sidebar-section thermal-only" style="display: none;">
+                <div class="section-header collapsed" onclick="toggleSection(this)">
+                    <span>Process (Thermal)</span>
+                    <span class="arrow">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <div class="param-row">
+                        <span class="param-label">Laser Power</span>
+                        <input type="number" class="param-input" id="thermalLaserPower" value="280" step="10" min="50" max="1000">
+                        <span class="param-unit">W</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Scan Speed</span>
+                        <input type="number" class="param-input" id="thermalScanVelocity" value="960" step="50" min="100" max="5000">
+                        <span class="param-unit">mm/s</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Hatch Spacing</span>
+                        <input type="number" class="param-input" id="thermalHatchSpacing" value="0.1" step="0.01" min="0.01" max="1.0">
+                        <span class="param-unit">mm</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Recoat Time</span>
+                        <input type="number" class="param-input" id="thermalRecoatTime" value="8" step="1" min="1" max="60">
+                        <span class="param-unit">s</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Scan Efficiency</span>
+                        <input type="number" class="param-input" id="thermalScanEfficiency" value="0.1" step="0.01" min="0.01" max="1.0">
+                        <span class="param-unit"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Thermal Settings Section (Thermal Only) -->
+            <div class="sidebar-section thermal-only" style="display: none;">
+                <div class="section-header collapsed" onclick="toggleSection(this)">
+                    <span>Thermal Settings</span>
+                    <span class="arrow">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <div class="param-row">
+                        <span class="param-label">Preheat Temp</span>
+                        <input type="number" class="param-input" id="thermalPreheat" value="80" step="10" min="20" max="500">
+                        <span class="param-unit">°C</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Convection h</span>
+                        <input type="number" class="param-input" id="thermalHConv" value="10" step="1" min="0" max="200">
+                        <span class="param-unit">W/m²K</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Substrate Inf.</span>
+                        <input type="number" class="param-input" id="thermalSubstrateInf" value="0.3" step="0.05" min="0" max="1">
+                        <span class="param-unit"></span>
+                    </div>
+                    <div style="font-size: 0.7rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">
+                        <strong style="color: var(--success);">SAFE:</strong> T &lt; 80% T_melt<br>
+                        <strong style="color: var(--warning);">WARNING:</strong> 80–100% T_melt<br>
+                        <strong style="color: var(--danger);">CRITICAL:</strong> T ≥ T_melt
+                    </div>
+                </div>
+            </div>
+
         </aside>
 
         <!-- Main Content -->
@@ -2843,10 +3451,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
                 <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
                 <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
-                <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
-                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
-                <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
-                <button class="tab-btn" onclick="switchTab('density', event)">Energy Density</button>
+                <button class="tab-btn energy-only-tab" onclick="switchTab('area_ratio', event)">Area Ratio</button>
+                <button class="tab-btn energy-only-tab" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
+                <button class="tab-btn energy-only-tab" onclick="switchTab('energy', event)">Energy Accumulation</button>
+                <button class="tab-btn energy-only-tab" onclick="switchTab('density', event)">Energy Density</button>
+                <button class="tab-btn thermal-only-tab" style="display:none;" onclick="switchTab('temperature', event)">&#127777; Temperature</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
@@ -2954,6 +3563,19 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- Temperature Tab (Thermal Mode Only) -->
+                <div class="tab-panel" id="tab-temperature">
+                    <div class="viz-container" id="temperaturePlot">
+                        <div class="loading-overlay hidden" id="temperatureLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Loading temperature map...</div>
+                        </div>
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run thermal analysis to see per-region peak temperature
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Risk Map Tab -->
                 <div class="tab-panel" id="tab-risk">
                     <div class="viz-container" id="riskPlot">
@@ -2962,9 +3584,18 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <div class="loading-text">Updating visualization...</div>
                         </div>
                         <div class="risk-legend" style="display: none;" id="riskLegend">
-                            <div class="risk-item"><div class="risk-color low"></div> LOW (safe)</div>
-                            <div class="risk-item"><div class="risk-color medium"></div> MEDIUM (caution)</div>
-                            <div class="risk-item"><div class="risk-color high"></div> HIGH (risk)</div>
+                            <!-- Energy mode legend -->
+                            <div id="riskLegendEnergy">
+                                <div class="risk-item"><div class="risk-color low"></div> LOW (safe)</div>
+                                <div class="risk-item"><div class="risk-color medium"></div> MEDIUM (caution)</div>
+                                <div class="risk-item"><div class="risk-color high"></div> HIGH (risk)</div>
+                            </div>
+                            <!-- Thermal mode legend -->
+                            <div id="riskLegendThermal" style="display:none;">
+                                <div class="risk-item"><div class="risk-color low"></div> SAFE</div>
+                                <div class="risk-item"><div class="risk-color medium"></div> WARNING</div>
+                                <div class="risk-item"><div class="risk-color high"></div> CRITICAL</div>
+                            </div>
                         </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see risk classification
@@ -3055,6 +3686,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         let stlLoaded = false;
         let currentEventSource = null;  // Track EventSource for cleanup
         let currentRegionsView = 'per_layer';  // 'per_layer' or 'branches_3d'
+        let currentMode = localStorage.getItem('analysisMode') || 'energy';  // 'energy' or 'thermal'
+
+        // Material database (mirrors Python MATERIAL_DATABASE in config.py)
+        const MATERIAL_DB = {{
+            'SS316L': {{ name: 'Stainless Steel 316L', k: 16.2, cp: 500, rho: 7990, Tm: 1400, absorptivity: 0.35 }},
+            'Ti64':   {{ name: 'Ti-6Al-4V',            k: 6.7,  cp: 526, rho: 4430, Tm: 1660, absorptivity: 0.40 }},
+            'IN718':  {{ name: 'Inconel 718',           k: 11.4, cp: 435, rho: 8190, Tm: 1336, absorptivity: 0.38 }},
+            'AlSi10Mg': {{ name: 'AlSi10Mg',           k: 147,  cp: 963, rho: 2670, Tm: 660,  absorptivity: 0.30 }}
+        }};
 
         // Color scale state (null = use adaptive from data)
         let manualColorMin = null;
@@ -3068,6 +3708,74 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Per-tab cache for full layer data (avoids re-fetching on color scale change)
         const layerDataCache = {{}};
+
+        // Switch analysis mode (energy / thermal)
+        function setMode(mode) {{
+            currentMode = mode;
+            localStorage.setItem('analysisMode', mode);
+
+            // Update button active state
+            document.getElementById('mode-energy').classList.toggle('active', mode === 'energy');
+            document.getElementById('mode-thermal').classList.toggle('active', mode === 'thermal');
+
+            // Show/hide energy-only sidebar sections
+            document.querySelectorAll('.energy-only').forEach(el => {{
+                el.style.display = mode === 'energy' ? '' : 'none';
+            }});
+
+            // Show/hide thermal-only sidebar sections
+            document.querySelectorAll('.thermal-only').forEach(el => {{
+                el.style.display = mode === 'thermal' ? '' : 'none';
+            }});
+
+            // Show/hide tab buttons
+            document.querySelectorAll('.energy-only-tab').forEach(el => {{
+                el.style.display = mode === 'energy' ? '' : 'none';
+            }});
+            document.querySelectorAll('.thermal-only-tab').forEach(el => {{
+                el.style.display = mode === 'thermal' ? '' : 'none';
+            }});
+
+            // Switch away from hidden tabs
+            const activePanel = document.querySelector('.tab-panel.active');
+            if (activePanel) {{
+                const tabName = activePanel.id.replace('tab-', '');
+                const energyOnlyTabs = ['area_ratio', 'gaussian', 'energy', 'density'];
+                const thermalOnlyTabs = ['temperature'];
+                if (mode === 'thermal' && energyOnlyTabs.includes(tabName)) {{
+                    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+                    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                    document.getElementById('tab-preview').classList.add('active');
+                    const firstVisibleBtn = document.querySelector('.tab-btn:not([style*="display: none"])');
+                    if (firstVisibleBtn) firstVisibleBtn.classList.add('active');
+                }} else if (mode === 'energy' && thermalOnlyTabs.includes(tabName)) {{
+                    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+                    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                    document.getElementById('tab-preview').classList.add('active');
+                    const firstVisibleBtn = document.querySelector('.tab-btn:not([style*="display: none"])');
+                    if (firstVisibleBtn) firstVisibleBtn.classList.add('active');
+                }}
+            }}
+
+            // Update risk legend labels
+            const legendEnergy = document.getElementById('riskLegendEnergy');
+            const legendThermal = document.getElementById('riskLegendThermal');
+            if (legendEnergy) legendEnergy.style.display = mode === 'energy' ? '' : 'none';
+            if (legendThermal) legendThermal.style.display = mode === 'thermal' ? '' : 'none';
+
+            logConsole('Mode: ' + (mode === 'energy' ? '⚡ Energy Balance' : '🌡️ Thermal Simulation'), 'info');
+        }}
+
+        // Auto-fill material properties from MATERIAL_DB
+        function onMaterialSelect(key) {{
+            const mat = MATERIAL_DB[key];
+            if (!mat) return;
+            document.getElementById('thermalK').value = mat.k;
+            document.getElementById('thermalCp').value = mat.cp;
+            document.getElementById('thermalRho').value = mat.rho;
+            document.getElementById('thermalTm').value = mat.Tm;
+            document.getElementById('thermalAbsorptivity').value = mat.absorptivity;
+        }}
 
         // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
@@ -3103,7 +3811,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'density': 'densityPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'density': 'densityPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot', 'temperature': 'temperaturePlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -3155,7 +3863,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
             // Show/hide color scale controls (for tabs with continuous color scales)
             const colorScaleBlock = document.getElementById('colorScaleBlock');
-            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
+            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian', 'temperature'];
             if (colorScaleBlock) {{
                 colorScaleBlock.style.display = colorScaleTabs.includes(tabName) ? 'block' : 'none';
             }}
@@ -3181,7 +3889,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Resize all visible Plotly plots
         function resizeAllPlots() {{
-            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot'].forEach(plotId => {{
+            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot', 'temperaturePlot'].forEach(plotId => {{
                 const plotEl = document.getElementById(plotId);
                 if (plotEl && plotEl.data) {{
                     Plotly.Plots.resize(plotEl);
@@ -3542,8 +4250,27 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15,
                 laser_power: parseFloat(document.getElementById('laserPower').value) || 200,
                 scan_speed: parseFloat(document.getElementById('scanSpeed').value) || 800,
-                hatch_distance: parseFloat(document.getElementById('hatchDistance').value) || 0.1
+                hatch_distance: parseFloat(document.getElementById('hatchDistance').value) || 0.1,
+                mode: currentMode
             }};
+
+            // Add thermal parameters when in thermal mode
+            if (currentMode === 'thermal') {{
+                params.material_key = document.getElementById('materialSelect').value;
+                params.thermal_k = parseFloat(document.getElementById('thermalK').value);
+                params.thermal_cp = parseFloat(document.getElementById('thermalCp').value);
+                params.thermal_rho = parseFloat(document.getElementById('thermalRho').value);
+                params.thermal_Tm = parseFloat(document.getElementById('thermalTm').value);
+                params.thermal_absorptivity = parseFloat(document.getElementById('thermalAbsorptivity').value);
+                params.thermal_laser_power = parseFloat(document.getElementById('thermalLaserPower').value);
+                params.thermal_scan_velocity = parseFloat(document.getElementById('thermalScanVelocity').value);
+                params.thermal_hatch_spacing = parseFloat(document.getElementById('thermalHatchSpacing').value);
+                params.thermal_recoat_time = parseFloat(document.getElementById('thermalRecoatTime').value);
+                params.thermal_scan_efficiency = parseFloat(document.getElementById('thermalScanEfficiency').value);
+                params.thermal_h_conv = parseFloat(document.getElementById('thermalHConv').value);
+                params.thermal_substrate_inf = parseFloat(document.getElementById('thermalSubstrateInf').value);
+                params.thermal_preheat = parseFloat(document.getElementById('thermalPreheat').value);
+            }}
 
             const runBtn = document.getElementById('runBtn');
             // Don't disable - allow rerun
@@ -3664,18 +4391,31 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
             const isModeB = analysisResults.params_used && analysisResults.params_used.mode === 'geometry_multiplier';
-            const vizSteps = [
-                {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
-                {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
-                {{ label: 'Density', fn: () => renderLayerSurfaces('density') }},
-                {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
-                {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
-                ...(isModeB ? [
-                    {{ label: 'Gaussian Multiplier', fn: () => renderLayerSurfaces('gaussian_factor') }},
-                ] : []),
-                {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
-                {{ label: 'Summary', fn: () => updateSummary() }}
-            ];
+            const isThermal = analysisResults.mode === 'thermal';
+
+            let vizSteps;
+            if (isThermal) {{
+                vizSteps = [
+                    {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
+                    {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
+                    {{ label: 'Temperature', fn: () => renderLayerSurfaces('temperature') }},
+                    {{ label: 'Thermal Risk', fn: () => renderLayerSurfaces('thermal_risk') }},
+                    {{ label: 'Summary', fn: () => updateSummary() }}
+                ];
+            }} else {{
+                vizSteps = [
+                    {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
+                    {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
+                    {{ label: 'Density', fn: () => renderLayerSurfaces('density') }},
+                    {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
+                    {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
+                    ...(isModeB ? [
+                        {{ label: 'Gaussian Multiplier', fn: () => renderLayerSurfaces('gaussian_factor') }},
+                    ] : []),
+                    {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
+                    {{ label: 'Summary', fn: () => updateSummary() }}
+                ];
+            }}
 
             for (let i = 0; i < vizSteps.length; i++) {{
                 const step = vizSteps[i];
@@ -3713,7 +4453,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
                 'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_below / A_region)', loadingId: 'areaRatioLoading', placeholderId: null }},
                 'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }},
-                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)', loadingId: 'regionsLoading', placeholderId: 'regionsPlaceholder' }}
+                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)', loadingId: 'regionsLoading', placeholderId: 'regionsPlaceholder' }},
+                'temperature': {{ plotId: 'temperaturePlot', title: 'Peak Temperature (°C)', loadingId: 'temperatureLoading', placeholderId: null }},
+                'thermal_risk': {{ plotId: 'riskPlot', title: 'Thermal Risk Classification', loadingId: 'riskLoading', placeholderId: null }}
             }};
 
             const config = plotConfig[dataType];
@@ -3835,11 +4577,28 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     if (dataType === 'regions') {{
                         // Regions: use categorical color from backend
                         color = layerData.color || '#888';
-                    }} else if (dataType === 'risk') {{
-                        // Risk uses categorical colors: LOW=green, MEDIUM=yellow, HIGH=red
-                        if (value >= 2) color = '#f87171';  // HIGH - red
-                        else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
-                        else color = '#4ade80';  // LOW - green
+                    }} else if (dataType === 'risk' || dataType === 'thermal_risk') {{
+                        // Risk uses categorical colors: SAFE/LOW=green, WARNING/MEDIUM=yellow, CRITICAL/HIGH=red
+                        if (value >= 2) color = '#f87171';  // HIGH/CRITICAL - red
+                        else if (value >= 1) color = '#fbbf24';  // MEDIUM/WARNING - yellow
+                        else color = '#4ade80';  // LOW/SAFE - green
+                    }} else if (dataType === 'temperature') {{
+                        // Temperature: hot colormap (dark blue → blue → cyan → yellow → red → magenta)
+                        let r, g, b;
+                        if (normalizedValue < 0.25) {{
+                            const t = normalizedValue / 0.25;
+                            r = 0; g = 0; b = Math.round(128 + t * 127);
+                        }} else if (normalizedValue < 0.5) {{
+                            const t = (normalizedValue - 0.25) / 0.25;
+                            r = 0; g = Math.round(t * 255); b = 255;
+                        }} else if (normalizedValue < 0.75) {{
+                            const t = (normalizedValue - 0.5) / 0.25;
+                            r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
+                        }} else {{
+                            const t = (normalizedValue - 0.75) / 0.25;
+                            r = 255; g = Math.round(255 * (1 - t)); b = 0;
+                        }}
+                        color = `rgb(${{r}}, ${{g}}, ${{b}})`;
                     }} else if (dataType === 'area_ratio') {{
                         // Area ratio: Inverted Jet (red=low, blue=high)
                         const iv = 1.0 - normalizedValue;  // Invert so red=min, blue=max
@@ -3902,6 +4661,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     }} else if (dataType === 'energy') {{
                         // Energy: show Joules with 2 decimal places
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Energy: ' + (typeof value === 'number' ? value.toFixed(2) : value) + ' J<extra></extra>';
+                    }} else if (dataType === 'temperature') {{
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>T_peak: ' + (typeof value === 'number' ? value.toFixed(1) : value) + ' °C<extra></extra>';
+                    }} else if (dataType === 'thermal_risk') {{
+                        const riskLabel = value >= 2 ? 'CRITICAL' : value >= 1 ? 'WARNING' : 'SAFE';
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Risk: ' + riskLabel + '<extra></extra>';
                     }} else {{
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>';
                     }}
@@ -3931,8 +4695,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 // Add colorbar via invisible scatter3d trace (skip for categorical regions)
                 if (dataType !== 'regions') {{
                     let colorscale;
-                    if (dataType === 'risk') {{
+                    if (dataType === 'risk' || dataType === 'thermal_risk') {{
                         colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
+                    }} else if (dataType === 'temperature') {{
+                        colorscale = [
+                            [0.0, '#00007F'],
+                            [0.25, '#0000FF'],
+                            [0.5, '#00FFFF'],
+                            [0.75, '#FFFF00'],
+                            [1.0, '#FF0000']
+                        ];
                     }} else if (dataType === 'area_ratio') {{
                         // Inverted Jet: red at min (bad), blue at max (good)
                         colorscale = [
@@ -4397,8 +5169,42 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         // Update summary tab
         function updateSummary() {{
             const r = analysisResults;
+            if (!r) return;
             const s = r.summary;
             const p = r.params_used;
+
+            // Thermal mode summary
+            if (r.mode === 'thermal') {{
+                document.getElementById('summaryContent').innerHTML = `
+                    <div class="summary-card">
+                        <h4>Thermal Analysis Results</h4>
+                        <div class="summary-stat"><span class="label">Total Layers</span><span class="value">${{s.n_layers}}</span></div>
+                        <div class="summary-stat"><span class="label">Max Peak Temp</span><span class="value">${{s.max_temp.toFixed(1)}} °C</span></div>
+                        <div class="summary-stat"><span class="label">Mean Peak Temp</span><span class="value">${{s.mean_temp.toFixed(1)}} °C</span></div>
+                        <div class="summary-stat"><span class="label">Melting Detected</span><span class="value" style="color: ${{s.melting_detected ? 'var(--danger)' : 'var(--success)'}}">${{s.melting_detected ? 'YES ⚠️' : 'NO ✓'}}</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Thermal Risk Distribution</h4>
+                        <div class="summary-stat"><span class="label" style="color: var(--success)">SAFE</span><span class="value">${{s.n_safe}} layers</span></div>
+                        <div class="summary-stat"><span class="label" style="color: var(--warning)">WARNING</span><span class="value">${{s.n_warning}} layers</span></div>
+                        <div class="summary-stat"><span class="label" style="color: var(--danger)">CRITICAL</span><span class="value">${{s.n_critical}} layers</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Parameters Used</h4>
+                        <div class="summary-stat"><span class="label">Material</span><span class="value">${{p.material}}</span></div>
+                        <div class="summary-stat"><span class="label">Build Direction</span><span class="value">${{p.build_direction || 'Z'}}-up</span></div>
+                        <div class="summary-stat"><span class="label">Voxel Size</span><span class="value">${{p.voxel_size}} mm</span></div>
+                        <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
+                        <div class="summary-stat"><span class="label">Laser Power</span><span class="value">${{p.laser_power}} W</span></div>
+                        <div class="summary-stat"><span class="label">Preheat Temp</span><span class="value">${{p.preheat_temp}} °C</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Timing</h4>
+                        <div class="summary-stat"><span class="label">Computation Time</span><span class="value">${{r.computation_time_seconds.toFixed(1)}} s</span></div>
+                    </div>
+                `;
+                return;
+            }}
 
             // Calculate max energy density for display
             const densityScores = r.energy_density_scores || {{}};
@@ -4525,10 +5331,17 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 normalizedValue = Math.max(0, Math.min(1, normalizedValue));
             }}
 
-            if (dataType === 'risk') {{
+            if (dataType === 'risk' || dataType === 'thermal_risk') {{
                 if (value >= 2) return '#f87171';
                 else if (value >= 1) return '#fbbf24';
                 else return '#4ade80';
+            }} else if (dataType === 'temperature') {{
+                let r, g, b;
+                if (normalizedValue < 0.25) {{ const t = normalizedValue / 0.25; r = 0; g = 0; b = Math.round(128 + t * 127); }}
+                else if (normalizedValue < 0.5) {{ const t = (normalizedValue - 0.25) / 0.25; r = 0; g = Math.round(t * 255); b = 255; }}
+                else if (normalizedValue < 0.75) {{ const t = (normalizedValue - 0.5) / 0.25; r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t)); }}
+                else {{ const t = (normalizedValue - 0.75) / 0.25; r = 255; g = Math.round(255 * (1 - t)); b = 0; }}
+                return `rgb(${{r}}, ${{g}}, ${{b}})`;
             }} else if (dataType === 'area_ratio') {{
                 // Inverted Jet: red=low, blue=high
                 const iv = 1.0 - normalizedValue;
@@ -4572,7 +5385,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             if (!activePanel) return;
 
             const tabId = activePanel.id.replace('tab-', '');
-            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
+            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian', 'temperature'];
             if (!colorScaleTabs.includes(tabId)) return;
 
             const dataType = tabId === 'gaussian' ? 'gaussian_factor' : tabId;
@@ -4590,7 +5403,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 'density': 'densityPlot',
                 'risk': 'riskPlot',
                 'area_ratio': 'areaRatioPlot',
-                'gaussian_factor': 'gaussianPlot'
+                'gaussian_factor': 'gaussianPlot',
+                'temperature': 'temperaturePlot'
             }};
             const plotId = plotIdMap[dataType];
             const plotEl = document.getElementById(plotId);
@@ -4603,7 +5417,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
                     'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
                     'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_below / A_region)', loadingId: 'areaRatioLoading', placeholderId: null }},
-                    'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }}
+                    'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }},
+                    'temperature': {{ plotId: 'temperaturePlot', title: 'Peak Temperature (°C)', loadingId: 'temperatureLoading', placeholderId: null }}
                 }};
                 renderFromData(dataType, cachedData, plotConfigMap[dataType]);
                 return;
@@ -4631,6 +5446,9 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         document.addEventListener('DOMContentLoaded', function() {{
             logConsole('Auto-loading Test STL 4...', 'info');
             updateModelVisibility();
+            // Restore saved analysis mode (default: energy)
+            const savedMode = localStorage.getItem('analysisMode') || 'energy';
+            setMode(savedMode);
             // Auto-load Test STL 4 by default
             loadTestSTL(4);
         }});
