@@ -190,10 +190,6 @@ PARAMETER_RULES = {
     'threshold_medium': {'min': 0.0, 'max': 1.0},
     'threshold_high': {'min': 0.0, 'max': 1.0},
     'area_ratio_power': {'min': 0.1},
-    # Laser parameters for Joule calculation (literature-based ranges)
-    'laser_power': {'min': 50, 'max': 500, 'unit': 'W'},
-    'scan_speed': {'min': 100, 'max': 2000, 'unit': 'mm/s'},
-    'hatch_distance': {'min': 0.05, 'max': 0.15, 'unit': 'mm'},
 }
 
 def safe_float(value, default=0.0):
@@ -241,55 +237,8 @@ current_state = {
     'cached_masks': None,
     'cached_slice_params': None,
     'cached_slice_info': None,
-    'cached_region_data': None,  # Region detection results from slicing
     'lock': threading.RLock()
 }
-
-
-# =============================================================================
-# SHARED GEOMETRY UTILITIES
-# =============================================================================
-def apply_build_direction_rotation(mesh, build_direction: str):
-    """Apply rotation to mesh based on build direction.
-
-    This is a shared function used by both slice_worker and run_analysis_worker
-    to ensure consistent rotation behavior.
-
-    Args:
-        mesh: trimesh mesh object
-        build_direction: 'Z' (default), 'Y', 'Y-', or 'X'
-
-    Returns:
-        Rotated mesh (copy of original)
-    """
-    import trimesh
-
-    if build_direction == 'Z':
-        return mesh  # No rotation needed
-
-    rotated_mesh = mesh.copy()
-
-    if build_direction == 'Y':
-        # Y-down: rotate so Y becomes Z, then flip Z
-        rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
-        rotated_mesh.apply_transform(rotation)
-        flip = trimesh.transformations.reflection_matrix([0, 0, 0], [0, 0, 1])
-        rotated_mesh.apply_transform(flip)
-        logger.debug(f"Applied Y→Z rotation + Z flip (Y-down)")
-    elif build_direction == 'Y-':
-        # Y-up: rotate so Y becomes Z (no flip)
-        rotation = trimesh.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
-        rotated_mesh.apply_transform(rotation)
-        logger.debug(f"Applied Y→Z rotation (Y-up)")
-    elif build_direction == 'X':
-        # X-up: rotate so X becomes Z
-        rotation = trimesh.transformations.rotation_matrix(-np.pi/2, [0, 1, 0])
-        rotated_mesh.apply_transform(rotation)
-        logger.debug(f"Applied X→Z rotation")
-    else:
-        logger.warning(f"Unknown build_direction '{build_direction}', no rotation applied")
-
-    return rotated_mesh
 
 
 @app.after_request
@@ -382,10 +331,6 @@ def load_test_stl():
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SmartFusion_Calibration_Square.stl"),
         '2': os.getenv('TEST_STL_PATH_2',
             r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\SF_3_overhanges_less_triangles.stl"),
-        '3': os.getenv('TEST_STL_PATH_3',
-            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Korper1173.stl"),
-        '4': os.getenv('TEST_STL_PATH_4',
-            r"C:\Users\huayu\Local\Desktop\Overheating_Classifier\CAD\Test_Geo_Group_20260210.STL"),
     }
 
     default_path = test_stl_paths.get(stl_index, test_stl_paths['1'])
@@ -440,22 +385,16 @@ def load_test_stl():
 
 @app.route('/api/slice', methods=['POST'])
 def api_slice():
-    """Slice-only endpoint: slices STL and detects regions without running energy analysis."""
-    params = request.json or {}
-
     try:
-        voxel_size = float(params.get('voxel_size', 0.1))
-        layer_thickness = float(params.get('layer_thickness', 0.04))
-        layer_grouping = int(params.get('layer_grouping', 25))
-        build_direction = params.get('build_direction', 'Z')
+        voxel_size = float(request.form.get('voxel_size', 0.1))
+        layer_thickness = float(request.form.get('layer_thickness', 0.04))
     except (ValueError, TypeError) as e:
         logger.warning(f"Invalid parameter format: {e}")
         return jsonify({'status': 'error', 'message': 'Invalid parameter format'}), 400
 
     is_valid, errors = validate_parameters({
         'voxel_size': voxel_size,
-        'layer_thickness': layer_thickness,
-        'layer_grouping': layer_grouping
+        'layer_thickness': layer_thickness
     })
     if not is_valid:
         return jsonify({'status': 'error', 'message': str(errors)}), 400
@@ -471,7 +410,7 @@ def api_slice():
 
     thread = threading.Thread(
         target=slice_worker,
-        args=(session, stl_path, voxel_size, layer_thickness, layer_grouping, build_direction)
+        args=(session, stl_path, voxel_size, layer_thickness)
     )
     thread.daemon = True
     thread.start()
@@ -482,17 +421,10 @@ def api_slice():
     })
 
 
-def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, layer_thickness: float,
-                  layer_grouping: int = 25, build_direction: str = 'Z'):
-    """Slice STL and detect connected regions (islands) per layer.
-
-    This worker handles the slicing pipeline that is shared between the Slice button
-    and the Run Analysis button. Results are cached for reuse.
-    """
+def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, layer_thickness: float):
     try:
         start_time = time.time()
         from src.data.stl_loader import load_stl, slice_stl
-        from scipy import ndimage
 
         def progress_with_cancel(progress, step):
             if session.is_cancelled():
@@ -504,44 +436,13 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
         # Load mesh first (slice_stl expects mesh_info dict, not path)
         mesh_info = load_stl(stl_path)
 
-        # Apply build direction transformation using shared function
-        if build_direction != 'Z':
-            session.update_progress(6, f"[STAGE] Rotating mesh ({build_direction}→Z)...")
-            mesh = mesh_info['mesh']
-            rotated_mesh = apply_build_direction_rotation(mesh, build_direction)
-            # Update mesh_info with transformed mesh
-            mesh_info['mesh'] = rotated_mesh
-            mesh_info['bounds'] = rotated_mesh.bounds
-            mesh_info['dimensions'] = rotated_mesh.bounds[1] - rotated_mesh.bounds[0]
-            session.update_progress(8, f"[INFO] Rotated dimensions: {mesh_info['dimensions'][0]:.1f} x {mesh_info['dimensions'][1]:.1f} x {mesh_info['dimensions'][2]:.1f} mm")
-
-        session.update_progress(10, "[STAGE] Slicing geometry into layers...")
         slice_result = slice_stl(
             mesh_info=mesh_info,
             voxel_size=voxel_size,
             layer_thickness=layer_thickness,
-            layer_grouping=layer_grouping,
-            progress_callback=lambda p, s: progress_with_cancel(10 + p * 0.80, s)
+            layer_grouping=25,  # Default grouping for preview slicing
+            progress_callback=progress_with_cancel
         )
-
-        # Detect regions (connected components) per layer
-        session.update_progress(92, "[STAGE] Detecting regions per layer...")
-        masks = slice_result['masks']
-        region_data = {}
-        for layer_num, mask in masks.items():
-            labeled, n_regions = ndimage.label(mask > 0)
-            region_areas = {}
-            for rid in range(1, n_regions + 1):
-                region_areas[rid] = int(np.sum(labeled == rid))
-            region_data[layer_num] = {
-                'n_regions': n_regions,
-                'labeled': labeled,
-                'region_areas': region_areas,
-            }
-
-        slice_result['region_data'] = region_data
-        n_layers = len(masks)
-        session.update_progress(95, f"[INFO] {n_layers} layers sliced, regions detected")
 
         if not session.is_cancelled():
             with current_state['lock']:
@@ -549,15 +450,12 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 current_state['cached_slice_params'] = {
                     'voxel_size': voxel_size,
                     'layer_thickness': layer_thickness,
-                    'layer_grouping': layer_grouping,
-                    'build_direction': build_direction,  # Now cached!
+                    'layer_grouping': 25  # Default for preview slicing
                 }
                 current_state['cached_slice_info'] = {
                     'n_layers': slice_result['n_layers'],
                     'grid_shape': slice_result['grid_shape'],
                 }
-                current_state['cached_region_data'] = region_data  # Cache region data!
-                logger.info(f"Cached slice results: {n_layers} layers, build_direction={build_direction}")
 
             session.slice_data = slice_result
             computation_time = time.time() - start_time
@@ -566,8 +464,6 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
                 'grid_shape': slice_result['grid_shape'],
                 'voxel_size': voxel_size,
                 'layer_thickness': layer_thickness,
-                'layer_grouping': layer_grouping,
-                'build_direction': build_direction,
             }, computation_time)
 
     except CancelledException:
@@ -575,42 +471,6 @@ def slice_worker(session: AnalysisSession, stl_path: str, voxel_size: float, lay
     except Exception as e:
         logger.error(f"Slicing error: {e}", exc_info=True)
         session.set_error(str(e))
-
-
-@app.route('/api/slice_results/<session_id>', methods=['GET'])
-def get_slice_results(session_id: str):
-    """Get slice results including region data for visualization."""
-    session = session_registry.get_session(session_id)
-    if not session:
-        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
-
-    if session.status != 'complete':
-        return jsonify({'status': 'error', 'message': f'Session status: {session.status}'}), 400
-
-    if not session.slice_data:
-        return jsonify({'status': 'error', 'message': 'No slice data available'}), 400
-
-    slice_data = session.slice_data
-
-    # Prepare region summary for each layer (without sending full labeled arrays)
-    region_summary = {}
-    region_data = slice_data.get('region_data', {})
-    for layer_num, rd in region_data.items():
-        region_summary[layer_num] = {
-            'n_regions': rd['n_regions'],
-            'region_areas': rd['region_areas'],
-        }
-
-    return jsonify({
-        'status': 'success',
-        'results': {
-            'n_layers': slice_data['n_layers'],
-            'grid_shape': slice_data['grid_shape'],
-            'voxel_size': slice_data['voxel_size'],
-            'layer_thickness': slice_data['layer_thickness'],
-            'region_summary': region_summary,
-        }
-    })
 
 
 @app.route('/api/run', methods=['POST'])
@@ -633,7 +493,6 @@ def run_analysis():
         cached_masks = current_state.get('cached_masks')
         cached_slice_params = current_state.get('cached_slice_params')
         cached_slice_info = current_state.get('cached_slice_info')
-        cached_region_data = current_state.get('cached_region_data')
 
     session_registry.cleanup_all_except(None)
     session = session_registry.create_session()
@@ -643,8 +502,7 @@ def run_analysis():
         slice_cache = {
             'masks': cached_masks,
             'params': cached_slice_params,
-            'info': cached_slice_info,
-            'region_data': cached_region_data,  # Include cached region data
+            'info': cached_slice_info
         }
 
     thread = threading.Thread(
@@ -688,13 +546,8 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
         G_max = params.get('G_max', 99.0)
         threshold_medium = params.get('threshold_medium', 0.3)
         threshold_high = params.get('threshold_high', 0.6)
-        area_ratio_power = params.get('area_ratio_power', 1.0)
-        area_ratio_method = params.get('area_ratio_method', 'layer_scan')
+        area_ratio_power = params.get('area_ratio_power', 3.0)
         gaussian_ratio_power = params.get('gaussian_ratio_power', 0.15)
-        # Laser parameters for Joule calculation
-        laser_power = params.get('laser_power', 200.0)
-        scan_speed = params.get('scan_speed', 800.0)
-        hatch_distance = params.get('hatch_distance', 0.1)
 
         need_reslice = True
         masks = None
@@ -712,127 +565,300 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                 progress_with_cancel(20, "[INFO] Using cached slice data")
 
         if need_reslice:
+            import trimesh
+
             progress_with_cancel(5, "[STAGE] Loading STL mesh...")
             mesh_info = load_stl(stl_path)
 
-            # Apply rotation using shared function (same as slice_worker)
+            # Apply rotation if build direction is not Z
             if build_direction != 'Z':
                 progress_with_cancel(6, f"[STAGE] Rotating mesh ({build_direction}→Z)...")
+
                 mesh = mesh_info['mesh']
-                rotated_mesh = apply_build_direction_rotation(mesh, build_direction)
-                # Update mesh_info with transformed mesh
-                mesh_info['mesh'] = rotated_mesh
-                mesh_info['bounds'] = rotated_mesh.bounds
-                mesh_info['dimensions'] = rotated_mesh.bounds[1] - rotated_mesh.bounds[0]
+
+                if build_direction == 'Y':
+                    rotation_matrix = trimesh.transformations.rotation_matrix(
+                        np.radians(-90), [1, 0, 0]
+                    )
+                    progress_with_cancel(7, "[INFO] Applying Y→Z rotation (-90 deg around X)")
+                elif build_direction == 'Y-':
+                    # Y-down: rotate Y→Z then flip Z
+                    rotation_matrix = trimesh.transformations.rotation_matrix(
+                        np.radians(-90), [1, 0, 0]
+                    )
+                    flip_matrix = np.array([
+                        [1, 0, 0, 0],
+                        [0, 1, 0, 0],
+                        [0, 0, -1, 0],
+                        [0, 0, 0, 1]
+                    ])
+                    rotation_matrix = flip_matrix @ rotation_matrix
+                    progress_with_cancel(7, "[INFO] Applying Y→Z rotation + Z flip (Y-down)")
+                elif build_direction == 'X':
+                    rotation_matrix = trimesh.transformations.rotation_matrix(
+                        np.radians(90), [0, 1, 0]
+                    )
+                    progress_with_cancel(7, "[INFO] Applying X→Z rotation (90 deg around Y)")
+                else:
+                    rotation_matrix = np.eye(4)
+
+                rotated_mesh = mesh.copy()
+                rotated_mesh.apply_transform(rotation_matrix)
+
+                bounds = rotated_mesh.bounds
+                mesh_info = {
+                    'vertices': np.array(rotated_mesh.vertices),
+                    'faces': np.array(rotated_mesh.faces),
+                    'bounds': bounds,
+                    'dimensions': bounds[1] - bounds[0],
+                    'n_triangles': len(rotated_mesh.faces),
+                    'n_vertices': len(rotated_mesh.vertices),
+                    'is_watertight': rotated_mesh.is_watertight,
+                    'volume': rotated_mesh.volume if rotated_mesh.is_watertight else None,
+                    'mesh': rotated_mesh,
+                }
                 progress_with_cancel(8, f"[INFO] Rotated dimensions: {mesh_info['dimensions'][0]:.1f} x {mesh_info['dimensions'][1]:.1f} x {mesh_info['dimensions'][2]:.1f} mm")
 
-            progress_with_cancel(10, "[STAGE] Slicing geometry into layers...")
+            progress_with_cancel(8, "[STAGE] Slicing geometry into layers...")
             slice_result = slice_stl(
                 mesh_info=mesh_info,
                 voxel_size=voxel_size,
                 layer_thickness=layer_thickness,
                 layer_grouping=layer_grouping,
-                progress_callback=lambda p, s: progress_with_cancel(10 + p * 0.10, s)
+                progress_callback=lambda p, s: progress_with_cancel(8 + p * 0.12, s)
             )
             masks = slice_result['masks']
             slice_info = {
                 'n_layers': slice_result['n_layers'],
                 'grid_shape': slice_result['grid_shape'],
             }
-            logger.info(f"run_analysis_worker: Re-sliced geometry ({len(masks)} layers)")
-        else:
-            logger.info(f"run_analysis_worker: Using cached slice data ({len(masks)} layers)")
 
         n_layers = len(masks)
-        progress_with_cancel(22, f"[INFO] {n_layers} layers ready")
+        progress_with_cancel(22, f"[INFO] {n_layers} layers sliced")
 
-        G_layers = None
-        if use_geometry_multiplier:
-            progress_with_cancel(25, "[STAGE] Computing geometry multiplier G...")
+        # Detect analysis mode
+        mode = params.get('mode', 'energy')
 
-            slice_result_for_G = {
-                'masks': masks,
-                'n_layers': n_layers,
-                'grid_shape': slice_info.get('grid_shape', masks[1].shape),
-                'voxel_size': voxel_size,
-                'layer_thickness': layer_thickness,
-            }
+        if mode == 'thermal':
+            # ----------------------------------------------------------------
+            # THERMAL SIMULATION PATH
+            # ----------------------------------------------------------------
+            # Deferred imports to avoid circular import via src/config/__init__.py
+            from src.compute.thermal_model import run_thermal_analysis
+            from src.compute.region_detect import detect_all_layer_regions, compute_cross_layer_connectivity
+            # Import config directly from project root (not from src/config package)
+            import importlib.util as _ilu, os as _os
+            _cfg_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'config.py')
+            _cfg_spec = _ilu.spec_from_file_location('_root_config', _cfg_path)
+            _cfg_mod = _ilu.module_from_spec(_cfg_spec)
+            _cfg_spec.loader.exec_module(_cfg_mod)
+            MaterialProperties = _cfg_mod.MaterialProperties
+            MATERIAL_DATABASE = _cfg_mod.MATERIAL_DATABASE
+            ProcessDefaults = _cfg_mod.ProcessDefaults
+            ThermalSimDefaults = _cfg_mod.ThermalSimDefaults
 
-            G_layers_2d = calculate_geometry_multiplier_per_layer(
-                slice_result_for_G,
-                sigma_mm=sigma_mm,
-                G_max=G_max,
-                progress_callback=lambda p, s: progress_with_cancel(25 + p * 0.15, s)
+            # Build material properties
+            material_key = params.get('material', 'SS316L')
+            if material_key in MATERIAL_DATABASE and material_key != 'Custom':
+                mat = MATERIAL_DATABASE[material_key]
+            else:
+                mat = MaterialProperties(
+                    name='Custom',
+                    thermal_conductivity=float(params.get('thermal_conductivity', 16.2)),
+                    specific_heat=float(params.get('specific_heat', 500)),
+                    density=float(params.get('density', 7990)),
+                    melting_point=float(params.get('melting_point', 1400)),
+                    absorptivity=float(params.get('absorptivity', 0.35)),
+                )
+
+            process_params = ProcessDefaults(
+                laser_power=float(params.get('laser_power', 280.0)),
+                scan_velocity=float(params.get('scan_velocity', 960.0)),
+                hatch_spacing=float(params.get('hatch_spacing', 0.1)),
+                recoat_time=float(params.get('recoat_time', 8.0)),
+                scan_efficiency=float(params.get('scan_efficiency', 0.1)),
             )
 
-            G_layers = G_layers_2d  # Pass per-voxel 2D arrays (not pre-averaged scalars)
-            progress_with_cancel(42, "[INFO] Geometry G computed")
+            thermal_params = ThermalSimDefaults(
+                convection_coefficient=float(params.get('convection_coeff', 10.0)),
+                substrate_influence=float(params.get('substrate_influence', 0.3)),
+                warning_fraction=float(params.get('warning_fraction', 0.8)),
+                critical_fraction=float(params.get('critical_fraction', 1.0)),
+                preheat_temp=float(params.get('preheat_temp', 80.0)),
+            )
+
+            progress_with_cancel(25, "[STAGE] Detecting layer regions...")
+            regions_per_layer = detect_all_layer_regions(
+                masks=masks,
+                voxel_size=voxel_size,
+                layer_thickness=layer_thickness * layer_grouping,
+            )
+
+            progress_with_cancel(40, "[STAGE] Computing cross-layer connectivity...")
+            _, conn_below_lookup, conn_above_lookup = compute_cross_layer_connectivity(
+                regions_per_layer=regions_per_layer,
+                voxel_size=voxel_size,
+            )
+
+            progress_with_cancel(50, "[STAGE] Running thermal simulation...")
+            thermal_results = run_thermal_analysis(
+                masks=masks,
+                regions_per_layer=regions_per_layer,
+                conn_below_lookup=conn_below_lookup,
+                conn_above_lookup=conn_above_lookup,
+                material_props=mat,
+                process_params=process_params,
+                thermal_params=thermal_params,
+                layer_grouping=layer_grouping,
+                voxel_size=voxel_size,
+                layer_thickness=layer_thickness,
+                progress_callback=lambda p, s='': progress_with_cancel(50 + p * 40, s),
+            )
+
+            progress_with_cancel(92, "[STAGE] Preparing thermal results...")
+            computation_time = time.time() - start_time
+
+            temperature_per_layer = thermal_results['temperature_per_layer']
+            risk_per_layer = thermal_results['risk_per_layer']
+
+            # Build summary stats
+            n_safe = sum(1 for v in risk_per_layer.values() if v == 'SAFE')
+            n_warning = sum(1 for v in risk_per_layer.values() if v == 'WARNING')
+            n_critical = sum(1 for v in risk_per_layer.values() if v == 'CRITICAL')
+
+            max_temp = thermal_params.preheat_temp
+            max_temp_layer = 1
+            for lyr, rtemps in temperature_per_layer.items():
+                if rtemps:
+                    lt = max(rtemps.values())
+                    if lt > max_temp:
+                        max_temp = lt
+                        max_temp_layer = lyr
+
+            melting_detected = thermal_results.get('melting_detected', [])
+            energy_conservation = thermal_results.get('energy_conservation', {})
+
+            results = {
+                'mode': 'thermal',
+                'n_layers': n_layers,
+                'temperature_per_layer': temperature_per_layer,
+                'risk_per_layer': risk_per_layer,
+                'melting_point': mat.melting_point,
+                'preheat_temp': thermal_params.preheat_temp,
+                'masks': masks,
+                'summary': {
+                    'n_layers': n_layers,
+                    'n_safe': n_safe,
+                    'n_warning': n_warning,
+                    'n_critical': n_critical,
+                    'max_temperature': max_temp,
+                    'max_temp_layer': max_temp_layer,
+                    'material': mat.name,
+                    'melting_point': mat.melting_point,
+                    'n_melting_events': len(melting_detected),
+                    'total_E_in_J': energy_conservation.get('total_E_in', 0.0),
+                },
+                'params_used': {
+                    'mode': 'thermal',
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                    'layer_grouping': layer_grouping,
+                    'build_direction': build_direction,
+                    'effective_layer_thickness': layer_thickness * layer_grouping,
+                    'material': material_key,
+                    'material_name': mat.name,
+                    'laser_power': process_params.laser_power,
+                    'scan_velocity': process_params.scan_velocity,
+                    'hatch_spacing': process_params.hatch_spacing,
+                    'recoat_time': process_params.recoat_time,
+                    'scan_efficiency': process_params.scan_efficiency,
+                    'preheat_temp': thermal_params.preheat_temp,
+                    'convection_coeff': thermal_params.convection_coefficient,
+                    'substrate_influence': thermal_params.substrate_influence,
+                    'warning_fraction': thermal_params.warning_fraction,
+                    'critical_fraction': thermal_params.critical_fraction,
+                },
+                'computation_time_seconds': computation_time,
+            }
+
         else:
-            progress_with_cancel(42, "[INFO] Using Area-Only mode (no geometry G)")
+            # ----------------------------------------------------------------
+            # ENERGY BALANCE PATH (existing, unchanged)
+            # ----------------------------------------------------------------
+            G_layers = None
+            if use_geometry_multiplier:
+                progress_with_cancel(25, "[STAGE] Computing geometry multiplier G...")
 
-        progress_with_cancel(45, "[STAGE] Running energy accumulation analysis...")
+                slice_result_for_G = {
+                    'masks': masks,
+                    'n_layers': n_layers,
+                    'grid_shape': slice_info.get('grid_shape', masks[1].shape),
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                }
 
-        # Effective layer thickness with grouping
-        effective_layer_thickness = layer_thickness * layer_grouping
+                G_layers_2d = calculate_geometry_multiplier_per_layer(
+                    slice_result_for_G,
+                    sigma_mm=sigma_mm,
+                    G_max=G_max,
+                    progress_callback=lambda p, s: progress_with_cancel(25 + p * 0.15, s)
+                )
 
-        energy_results = run_energy_analysis(
-            masks=masks,
-            G_layers=G_layers,
-            dissipation_factor=dissipation_factor,
-            convection_factor=convection_factor,
-            use_geometry_multiplier=use_geometry_multiplier,
-            area_ratio_power=area_ratio_power,
-            area_ratio_method=area_ratio_method,
-            gaussian_ratio_power=gaussian_ratio_power,
-            threshold_medium=threshold_medium,
-            threshold_high=threshold_high,
-            voxel_size=voxel_size,
-            layer_thickness=effective_layer_thickness,
-            laser_power=laser_power,
-            scan_speed=scan_speed,
-            hatch_distance=hatch_distance,
-            progress_callback=lambda p, s: progress_with_cancel(45 + p * 0.45, s)
-        )
+                G_layers = G_layers_2d  # Pass per-voxel 2D arrays (not pre-averaged scalars)
+                progress_with_cancel(42, "[INFO] Geometry G computed")
+            else:
+                progress_with_cancel(42, "[INFO] Using Area-Only mode (no geometry G)")
 
-        progress_with_cancel(92, "[STAGE] Preparing results...")
+            progress_with_cancel(45, "[STAGE] Running energy accumulation analysis...")
 
-        computation_time = time.time() - start_time
+            energy_results = run_energy_analysis(
+                masks=masks,
+                G_layers=G_layers,
+                dissipation_factor=dissipation_factor,
+                convection_factor=convection_factor,
+                use_geometry_multiplier=use_geometry_multiplier,
+                area_ratio_power=area_ratio_power,
+                gaussian_ratio_power=gaussian_ratio_power,
+                threshold_medium=threshold_medium,
+                threshold_high=threshold_high,
+                voxel_size=voxel_size,
+                progress_callback=lambda p, s: progress_with_cancel(45 + p * 0.45, s)
+            )
 
-        results = {
-            'n_layers': n_layers,
-            'risk_scores': energy_results['risk_scores'],
-            'raw_energy_scores': energy_results['raw_energy_scores'],
-            'energy_density_scores': energy_results['energy_density_scores'],
-            'risk_levels': energy_results['risk_levels'],
-            'layer_areas': energy_results['layer_areas'],
-            'contact_areas': energy_results['contact_areas'],
-            'summary': energy_results['summary'],
-            'params_used': {
-                'voxel_size': voxel_size,
-                'layer_thickness': layer_thickness,
-                'layer_grouping': layer_grouping,
-                'build_direction': build_direction,
-                'effective_layer_thickness': effective_layer_thickness,
-                'dissipation_factor': dissipation_factor,
-                'convection_factor': convection_factor,
-                'use_geometry_multiplier': use_geometry_multiplier,
-                'sigma_mm': sigma_mm if use_geometry_multiplier else None,
-                'G_max': G_max if use_geometry_multiplier else None,
-                'area_ratio_power': area_ratio_power,
-                'area_ratio_method': area_ratio_method,
-                'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
-                'threshold_medium': threshold_medium,
-                'threshold_high': threshold_high,
-                'mode': energy_results['params']['mode'],
-                'laser_power': laser_power,
-                'scan_speed': scan_speed,
-                'hatch_distance': hatch_distance,
-            },
-            'computation_time_seconds': computation_time,
-            'masks': masks,
-            'G_layers': G_layers if use_geometry_multiplier else None,
-            'region_data': energy_results.get('region_data', {}),
-        }
+            progress_with_cancel(92, "[STAGE] Preparing results...")
+
+            computation_time = time.time() - start_time
+
+            results = {
+                'mode': 'energy',
+                'n_layers': n_layers,
+                'risk_scores': energy_results['risk_scores'],
+                'risk_levels': energy_results['risk_levels'],
+                'layer_areas': energy_results['layer_areas'],
+                'contact_areas': energy_results['contact_areas'],
+                'summary': energy_results['summary'],
+                'params_used': {
+                    'voxel_size': voxel_size,
+                    'layer_thickness': layer_thickness,
+                    'layer_grouping': layer_grouping,
+                    'build_direction': build_direction,
+                    'effective_layer_thickness': layer_thickness * layer_grouping,
+                    'dissipation_factor': dissipation_factor,
+                    'convection_factor': convection_factor,
+                    'use_geometry_multiplier': use_geometry_multiplier,
+                    'sigma_mm': sigma_mm if use_geometry_multiplier else None,
+                    'G_max': G_max if use_geometry_multiplier else None,
+                    'area_ratio_power': area_ratio_power,
+                    'gaussian_ratio_power': gaussian_ratio_power if use_geometry_multiplier else None,
+                    'threshold_medium': threshold_medium,
+                    'threshold_high': threshold_high,
+                    'mode': energy_results['params']['mode'],
+                },
+                'computation_time_seconds': computation_time,
+                'masks': masks,
+                'G_layers': G_layers if use_geometry_multiplier else None,
+                'region_data': energy_results.get('region_data', {}),
+            }
 
         progress_with_cancel(98, f"[INFO] Analysis complete in {computation_time:.1f}s")
 
@@ -1004,38 +1030,17 @@ def export_results(session_id):
 def get_layer_surfaces(session_id, data_type):
     """Get 3D layer surfaces with per-layer values for different data types.
 
-    Supports: energy (risk scores), risk (risk levels), slices, regions
+    Supports: energy (risk scores), risk (risk levels)
 
     Each layer is rendered as a surface with color based on its value.
-    Also supports slice-only mode where only masks and regions are available.
     """
     session = session_registry.get_session(session_id)
-    if not session:
-        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
-
-    # Support both full analysis results and slice-only data
-    # Check slice_data first since set_complete may set session.results to metadata without masks
-    results = session.results
-    slice_data = session.slice_data
-
-    # Prefer slice_data if it has masks (slice-only mode or slice from full analysis)
-    if slice_data and slice_data.get('masks'):
-        # Slice-only mode: use slice_data for slices/regions visualization
-        masks = slice_data.get('masks', {})
-        params = {
-            'voxel_size': slice_data.get('voxel_size', 0.1),
-            'layer_thickness': slice_data.get('layer_thickness', 0.04),
-        }
-        # For slice-only mode, only slices and regions are available
-        if data_type not in ['slices', 'regions']:
-            return jsonify({'status': 'error',
-                           'message': f'{data_type} requires full analysis (Run Analysis), not just slicing'}), 400
-    elif results and results.get('masks'):
-        # Full analysis mode with masks in results
-        masks = results.get('masks', {})
-        params = results.get('params_used', {})
-    else:
+    if not session or not session.results:
         return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    masks = results.get('masks', {})
+    params = results.get('params_used', {})
 
     if not masks:
         return jsonify({'status': 'error', 'message': 'No mask data available'}), 404
@@ -1045,114 +1050,10 @@ def get_layer_surfaces(session_id, data_type):
 
     # Get layer values based on data type
     if data_type == 'energy':
-        # Use raw energy in Joules (not normalized risk scores)
-        layer_values = {int(k): float(v) for k, v in results.get('raw_energy_scores', {}).items()}
-        value_label = 'Energy (J)'
-        # Use dynamic min/max for actual Joule values
-        if layer_values:
-            min_val = min(layer_values.values())
-            max_val = max(layer_values.values())
-        else:
-            min_val = 0.0
-            max_val = 1.0
-    elif data_type == 'density':
-        # Per-region energy density visualization in J/mm²
-        # Each region displays its OWN density, not aggregated per layer
-        from scipy import ndimage
-
-        region_data_all = results.get('region_data', {})
-        voxel_size_sq = voxel_size ** 2  # For area conversion
-
-        if not region_data_all:
-            return jsonify({'status': 'error', 'message': 'No region data available for density visualization'}), 400
-
-        # Collect all region densities to find global min/max
-        # Calculate density on-the-fly: energy / (area_voxels * voxel_size²)
-        all_densities = []
-        for layer_idx, rd in region_data_all.items():
-            region_energies = rd.get('region_energies', {})
-            region_areas = rd.get('region_areas', {})
-            for rid, energy in region_energies.items():
-                area_voxels = region_areas.get(rid, 0)
-                if area_voxels > 0:
-                    density = energy / (area_voxels * voxel_size_sq)
-                    all_densities.append(density)
-
-        if all_densities:
-            min_val = min(all_densities)
-            max_val = max(all_densities)
-        else:
-            min_val = 0.0
-            max_val = 1.0
-
-        # Generate per-region surfaces with density-based coloring
-        layers_data = []
-        sorted_layers = sorted(masks.keys())
-
-        for layer in sorted_layers:
-            mask = masks.get(layer)
-            if mask is None:
-                continue
-            mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
-            if mask_arr.sum() == 0:
-                continue
-
-            z = layer * layer_thickness
-
-            # Get region data for this layer
-            rd = region_data_all.get(layer)
-            if rd and rd.get('n_regions', 0) > 0:
-                labeled = rd['labeled']
-                n_regions = rd['n_regions']
-                region_energies = rd.get('region_energies', {})
-                region_areas = rd.get('region_areas', {})
-            else:
-                labeled, n_regions = ndimage.label(mask_arr > 0)
-                region_energies = {}
-                region_areas = {}
-
-            if n_regions == 0:
-                continue
-
-            # Generate one surface per region with density-based color
-            for rid in range(1, n_regions + 1):
-                region_mask = (labeled == rid).astype(np.uint8)
-                if region_mask.sum() == 0:
-                    continue
-
-                # Calculate density on-the-fly
-                energy = region_energies.get(rid, 0.0)
-                area_voxels = region_areas.get(rid, 0)
-                if area_voxels > 0:
-                    density_value = energy / (area_voxels * voxel_size_sq)
-                else:
-                    density_value = 0.0
-
-                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
-                                                          skip_garbage_filter=True)
-                if vertices and faces:
-                    layers_data.append({
-                        'layer': int(layer),
-                        'z': float(z),
-                        'value': float(density_value),
-                        'region_id': int(rid),
-                        'n_regions': int(n_regions),
-                        'vertices': vertices,
-                        'faces': faces
-                    })
-
-        return jsonify({
-            'status': 'success',
-            'layers': layers_data,
-            'n_layers': len(sorted_layers),
-            'n_valid_layers': len(layers_data),
-            'min_val': float(min_val),
-            'max_val': float(max_val),
-            'value_label': 'Energy Density (J/mm²)',
-            'layer_thickness': layer_thickness,
-            'voxel_size': voxel_size,
-            'per_region': True  # Flag indicating per-region visualization
-        })
+        layer_values = {int(k): float(v) for k, v in results.get('risk_scores', {}).items()}
+        value_label = 'Risk Score'
+        min_val = 0.0
+        max_val = 1.0
     elif data_type == 'risk':
         # Map risk levels to numeric values: LOW=0, MEDIUM=1, HIGH=2
         risk_levels = results.get('risk_levels', {})
@@ -1168,80 +1069,20 @@ def get_layer_surfaces(session_id, data_type):
         min_val = 0
         max_val = 2
     elif data_type == 'area_ratio':
-        # Per-region area ratio visualization
-        from scipy import ndimage as scipy_ndimage
-
+        layer_areas = results.get('layer_areas', {})
+        contact_areas = results.get('contact_areas', {})
         area_ratio_power = results.get('params_used', {}).get('area_ratio_power',
-                           results.get('params', {}).get('area_ratio_power', 1.0))
+                           results.get('params', {}).get('area_ratio_power', 3.0))
+        layer_values = {}
+        for k in layer_areas:
+            a_layer = float(layer_areas[k])
+            a_contact = float(contact_areas.get(k, 0))
+            ratio = min(1.0, a_contact / a_layer) if a_layer > 0 else 0.0
+            layer_values[int(k)] = ratio ** area_ratio_power
         power_label = f'^{area_ratio_power}' if area_ratio_power != 1.0 else ''
-        value_label = f'Area Ratio (A_below / A_region){power_label}'
+        value_label = f'Area Ratio (A_contact / A_layer){power_label}'
         min_val = 0.0
-        max_val = 2.0  # Ratio can exceed 1.0 for narrowing features
-
-        # Get region data from results
-        region_data_all = results.get('region_data', {})
-
-        layers_data = []
-        sorted_layers = sorted(masks.keys())
-
-        for layer in sorted_layers:
-            mask = masks.get(layer)
-            if mask is None:
-                continue
-            mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
-            if mask_arr.sum() == 0:
-                continue
-
-            z = layer * layer_thickness
-
-            # Use region_data if available, otherwise label on the fly
-            rd = region_data_all.get(layer)
-            if rd and rd.get('n_regions', 0) > 0:
-                labeled = rd['labeled']
-                n_regions = rd['n_regions']
-                region_area_ratios = rd.get('region_area_ratios', {})
-            else:
-                labeled, n_regions = scipy_ndimage.label(mask_arr > 0)
-                region_area_ratios = {}
-
-            if n_regions == 0:
-                continue
-
-            # Generate one surface per region with per-region area ratio
-            for rid in range(1, n_regions + 1):
-                region_mask = (labeled == rid).astype(np.uint8)
-                if region_mask.sum() == 0:
-                    continue
-
-                # Use precomputed area ratio from energy model
-                ratio = region_area_ratios.get(rid, region_area_ratios.get(str(rid), 1.0))
-                area_ratio_value = ratio ** area_ratio_power
-
-                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
-                                                          skip_garbage_filter=True)
-                if vertices and faces:
-                    layers_data.append({
-                        'layer': int(layer),
-                        'z': float(z),
-                        'value': float(area_ratio_value),
-                        'region_id': int(rid),
-                        'n_regions': int(n_regions),
-                        'vertices': vertices,
-                        'faces': faces
-                    })
-
-        return jsonify({
-            'status': 'success',
-            'layers': layers_data,
-            'n_layers': len(sorted_layers),
-            'n_valid_layers': len(layers_data),
-            'min_val': float(min_val),
-            'max_val': float(max_val),
-            'value_label': value_label,
-            'layer_thickness': layer_thickness,
-            'voxel_size': voxel_size,
-            'per_region': True  # Flag indicating per-region visualization
-        })
+        max_val = 1.0
     elif data_type == 'gaussian_factor':
         G_layers = results.get('G_layers')
         if G_layers is None:
@@ -1264,106 +1105,60 @@ def get_layer_surfaces(session_id, data_type):
         value_label = f'Gaussian Multiplier (1/(1+G)){power_label}'
         min_val = 0.0
         max_val = 1.0
+    elif data_type == 'temperature':
+        # Thermal mode: peak temperature per layer
+        temperature_per_layer = results.get('temperature_per_layer', {})
+        if not temperature_per_layer:
+            return jsonify({'status': 'error', 'message': 'No thermal temperature data available. Run in Thermal Simulation mode first.'}), 400
+        preheat_temp = float(results.get('preheat_temp', 80.0))
+        melting_point = float(results.get('melting_point', 1400.0))
+        layer_values = {}
+        for k, rtemps in temperature_per_layer.items():
+            if isinstance(rtemps, dict) and rtemps:
+                layer_values[int(k)] = max(float(v) for v in rtemps.values())
+            else:
+                layer_values[int(k)] = preheat_temp
+        value_label = 'Peak Temperature (°C)'
+        min_val = preheat_temp
+        max_val = melting_point
+    elif data_type == 'thermal_risk':
+        # Thermal mode: SAFE/WARNING/CRITICAL risk per layer
+        risk_per_layer = results.get('risk_per_layer', {})
+        if not risk_per_layer:
+            return jsonify({'status': 'error', 'message': 'No thermal risk data available. Run in Thermal Simulation mode first.'}), 400
+        layer_values = {}
+        for k, level in risk_per_layer.items():
+            if level == 'SAFE':
+                layer_values[int(k)] = 0
+            elif level == 'WARNING':
+                layer_values[int(k)] = 1
+            else:  # CRITICAL
+                layer_values[int(k)] = 2
+        value_label = 'Thermal Risk'
+        min_val = 0
+        max_val = 2
     elif data_type == 'regions':
-        # Regions visualization - supports two view modes
+        # Region/island detection - each region gets a distinct color
         from scipy import ndimage
-        view_mode = request.args.get('view_mode', 'branches_3d')  # 'per_layer' or 'branches_3d'
-        # Get region_data from either full results or slice-only data
-        if results:
-            region_data_all = results.get('region_data', {})
-        elif slice_data:
-            region_data_all = slice_data.get('region_data', {})
-        else:
-            region_data_all = {}
-
-        # Color palette for per-layer view (distinct colors)
-        REGION_COLORS = [
-            '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
-            '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5',
-            '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854', '#ffd92f'
-        ]
-
-        if view_mode == 'per_layer':
-            # Per-layer view: use 3D branch tracking to ensure consistent coloring
-            # across layers (same physical object = same color, even if scipy
-            # assigns different region IDs on different layers)
-            branch_info = _build_3d_branches(masks, region_data_all)
-            layer_regions = branch_info['layer_regions']
-
-            layers_data = []
-            sorted_layers = sorted(masks.keys())
-            max_branches = len(branch_info['branches'])
-
-            for layer in sorted_layers:
-                mask = masks.get(layer)
-                if mask is None:
-                    continue
-                mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
-                if mask_arr.sum() == 0:
-                    continue
-
-                z = layer * layer_thickness
-
-                # Use region_data if available, otherwise label on the fly
-                rd = region_data_all.get(layer)
-                if rd and rd.get('n_regions', 0) > 0:
-                    labeled = rd['labeled']
-                    n_regions = rd['n_regions']
-                else:
-                    labeled, n_regions = ndimage.label(mask_arr > 0)
-
-                if n_regions == 0:
-                    continue
-
-                # Generate one surface per region with color based on BRANCH ID
-                # (tracked across layers for consistency)
-                for rid in range(1, n_regions + 1):
-                    region_mask = (labeled == rid).astype(np.uint8)
-                    if region_mask.sum() == 0:
-                        continue
-
-                    # Get branch color from layer_regions (consistent tracking)
-                    region_info = layer_regions.get(layer, {}).get(rid, {})
-                    branch_id = region_info.get('branch_id', rid)
-                    # Use REGION_COLORS palette but indexed by branch_id
-                    color = REGION_COLORS[(branch_id - 1) % len(REGION_COLORS)]
-
-                    vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
-                                                              skip_garbage_filter=True)
-                    if vertices and faces:
-                        layers_data.append({
-                            'layer': int(layer),
-                            'z': float(z),
-                            'value': int(branch_id),
-                            'region_id': int(rid),
-                            'branch_id': int(branch_id),
-                            'n_regions': int(n_regions),
-                            'color': color,
-                            'vertices': vertices,
-                            'faces': faces
-                        })
-
-            return jsonify({
-                'status': 'success',
-                'layers': layers_data,
-                'n_layers': len(sorted_layers),
-                'n_valid_layers': len(layers_data),
-                'min_val': 1,
-                'max_val': max_branches,
-                'value_label': 'Region ID (tracked)',
-                'layer_thickness': layer_thickness,
-                'voxel_size': voxel_size,
-                'is_categorical': True
-            })
-
-        # Default: 3D Branch visualization - connected regions across layers colored consistently
-        # Build 3D branch tracking
-        branch_info = _build_3d_branches(masks, region_data_all)
-        layer_regions = branch_info['layer_regions']
+        region_data_all = results.get('region_data', {})
 
         layers_data = []
         sorted_layers = sorted(masks.keys())
-        max_branches = len(branch_info['branches'])
+        max_regions_seen = 1
+
+        # 10 distinct high-contrast categorical colors
+        REGION_COLORS = [
+            '#3b82f6',  # blue
+            '#f97316',  # orange
+            '#22c55e',  # green
+            '#ef4444',  # red
+            '#a855f7',  # purple
+            '#eab308',  # yellow
+            '#06b6d4',  # cyan
+            '#ec4899',  # pink
+            '#84cc16',  # lime
+            '#f59e0b',  # amber
+        ]
 
         for layer in sorted_layers:
             mask = masks.get(layer)
@@ -1383,89 +1178,24 @@ def get_layer_surfaces(session_id, data_type):
             else:
                 labeled, n_regions = ndimage.label(mask_arr > 0)
 
-            if n_regions == 0:
-                continue
+            if n_regions > max_regions_seen:
+                max_regions_seen = n_regions
 
-            # Calculate region sizes for filtering out garbage (small fragments from messy STL)
-            region_sizes = ndimage.sum(mask_arr > 0, labeled, range(1, n_regions + 1))
-            max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
-
-            # Overlap-based garbage detection:
-            # - Small regions whose BOUNDING BOX OVERLAPS with larger regions = garbage
-            # - Small regions that are standalone (no bbox overlap) = legitimate features
-            # Threshold for "small": regions < 20% of largest region
-            SMALL_REGION_THRESHOLD = 0.20
-            small_region_size_limit = max_region_size * SMALL_REGION_THRESHOLD
-
-            # Pre-compute bounding boxes for all regions
-            region_bboxes = {}
+            # Generate one surface per region with its own color
             for rid in range(1, n_regions + 1):
-                rows, cols = np.where(labeled == rid)
-                if len(rows) > 0:
-                    region_bboxes[rid] = (rows.min(), rows.max(), cols.min(), cols.max())
-
-            # Helper function to check if two bounding boxes overlap
-            def bboxes_overlap(bbox1, bbox2):
-                r1_min, r1_max, c1_min, c1_max = bbox1
-                r2_min, r2_max, c2_min, c2_max = bbox2
-                # Check if boxes overlap (share any space)
-                return (r1_min <= r2_max and r1_max >= r2_min and
-                        c1_min <= c2_max and c1_max >= c2_min)
-
-            # Pre-compute which regions are "garbage" (small AND bbox overlaps with larger)
-            garbage_regions = set()
-            for rid in range(1, n_regions + 1):
-                region_size = region_sizes[rid - 1]
-                if region_size >= small_region_size_limit:
-                    continue  # Not small, definitely not garbage
-
-                if rid not in region_bboxes:
-                    continue
-
-                small_bbox = region_bboxes[rid]
-
-                # Check if this small region's bbox overlaps with any larger region's bbox
-                for other_rid in range(1, n_regions + 1):
-                    if other_rid == rid:
-                        continue
-                    other_size = region_sizes[other_rid - 1]
-                    if other_size <= region_size:
-                        continue  # Only check against larger regions
-
-                    if other_rid not in region_bboxes:
-                        continue
-
-                    if bboxes_overlap(small_bbox, region_bboxes[other_rid]):
-                        garbage_regions.add(rid)
-                        break
-
-            # Generate one surface per region with its 3D branch color (skip garbage)
-            for rid in range(1, n_regions + 1):
-                # Skip garbage regions (small AND near larger regions)
-                if rid in garbage_regions:
-                    continue
-
                 region_mask = (labeled == rid).astype(np.uint8)
                 if region_mask.sum() == 0:
                     continue
 
-                # Get 3D branch color for this region
-                region_info = layer_regions.get(layer, {}).get(rid, {})
-                branch_id = region_info.get('branch_id', rid)
-                color = region_info.get('color', '#888888')
-
-                # Skip garbage filter since we already filtered at region level
-                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z,
-                                                          skip_garbage_filter=True)
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z)
                 if vertices and faces:
                     layers_data.append({
                         'layer': int(layer),
                         'z': float(z),
-                        'value': int(branch_id),
+                        'value': int(rid),
                         'region_id': int(rid),
-                        'branch_id': int(branch_id),
                         'n_regions': int(n_regions),
-                        'color': color,
+                        'color': REGION_COLORS[(rid - 1) % len(REGION_COLORS)],
                         'vertices': vertices,
                         'faces': faces
                     })
@@ -1476,8 +1206,8 @@ def get_layer_surfaces(session_id, data_type):
             'n_layers': len(sorted_layers),
             'n_valid_layers': len(layers_data),
             'min_val': 1,
-            'max_val': max_branches,
-            'value_label': '3D Branch ID',
+            'max_val': max_regions_seen,
+            'value_label': 'Region ID',
             'layer_thickness': layer_thickness,
             'voxel_size': voxel_size,
             'is_categorical': True
@@ -1536,401 +1266,22 @@ def get_layer_surfaces(session_id, data_type):
     })
 
 
-def _mix_colors(hex_colors: list) -> str:
-    """
-    Mix multiple hex colors by averaging their RGB values.
-
-    Parameters
-    ----------
-    hex_colors : list of str
-        List of hex color strings (e.g., ['#3b82f6', '#f97316'])
-
-    Returns
-    -------
-    str
-        Mixed color as hex string
-    """
-    if not hex_colors:
-        return '#888888'  # Default gray
-    if len(hex_colors) == 1:
-        return hex_colors[0]
-
-    # Convert hex to RGB
-    rgb_values = []
-    for hex_color in hex_colors:
-        hex_color = hex_color.lstrip('#')
-        r = int(hex_color[0:2], 16)
-        g = int(hex_color[2:4], 16)
-        b = int(hex_color[4:6], 16)
-        rgb_values.append((r, g, b))
-
-    # Average RGB values
-    avg_r = int(sum(rgb[0] for rgb in rgb_values) / len(rgb_values))
-    avg_g = int(sum(rgb[1] for rgb in rgb_values) / len(rgb_values))
-    avg_b = int(sum(rgb[2] for rgb in rgb_values) / len(rgb_values))
-
-    # Convert back to hex
-    return f'#{avg_r:02x}{avg_g:02x}{avg_b:02x}'
-
-
-def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> Dict:
-    """
-    Build 3D connected component (branch) tracking across layers.
-
-    Each 2D region on a layer is assigned to a 3D branch ID based on overlap
-    with parent regions. Branches are colored consistently, with color variations
-    when branches split (Y-branching) or merge (multiple branches joining).
-
-    Parameters
-    ----------
-    masks : dict
-        Layer masks {layer_idx: 2D numpy array}
-    region_data_all : dict
-        Region data from energy calculation {layer_idx: {'labeled': array, 'n_regions': int}}
-
-    Returns
-    -------
-    dict with keys:
-        - branches: {branch_id: {'base_color': str, 'child_colors': [str], 'layers': [int]}}
-        - layer_regions: {layer_idx: {region_id: {'branch_id': int, 'color': str}}}
-    """
-    from scipy import ndimage
-
-    # Base color palette (10 distinct colors)
-    BASE_COLORS = [
-        '#3b82f6',  # blue
-        '#f97316',  # orange
-        '#22c55e',  # green
-        '#ef4444',  # red
-        '#a855f7',  # purple
-        '#eab308',  # yellow
-        '#06b6d4',  # cyan
-        '#ec4899',  # pink
-        '#84cc16',  # lime
-        '#f59e0b',  # amber
-    ]
-
-    branches = {}  # branch_id -> {color, layers}
-    layer_regions = {}  # layer_idx -> {region_id: {branch_id, color}}
-
-    next_branch_id = 1
-    prev_labeled = None
-    prev_layer_branches = {}  # region_id -> branch_id from previous layer
-    prev_layer_idx = None  # Track previous layer index for debugging
-
-    sorted_layers = sorted(masks.keys())
-
-    # Debug: Track branch assignments for debugging first/last layer issues
-    branch_debug_info = {}  # branch_id -> {'first_layer': int, 'last_layer': int, 'layers': []}
-
-    for layer_idx in sorted_layers:
-        mask = masks[layer_idx]
-        if mask is None or np.sum(mask > 0) == 0:
-            layer_regions[layer_idx] = {}
-            continue
-
-        # Get labeled regions
-        rd = region_data_all.get(layer_idx)
-        if rd and rd.get('n_regions', 0) > 0:
-            labeled = rd['labeled']
-            n_regions = rd['n_regions']
-        else:
-            labeled, n_regions = ndimage.label(mask > 0)
-
-        # Filter out garbage regions BEFORE branch tracking
-        # Garbage = small regions (< 20% of largest) whose BOUNDING BOX OVERLAPS with larger regions
-        garbage_regions = set()
-        if n_regions > 1:
-            region_sizes = ndimage.sum(np.array(mask) > 0, labeled, range(1, n_regions + 1))
-            max_region_size = np.max(region_sizes) if len(region_sizes) > 0 else 0
-            SMALL_REGION_THRESHOLD = 0.20
-
-            # Pre-compute bounding boxes
-            region_bboxes = {}
-            for rid in range(1, n_regions + 1):
-                rows, cols = np.where(labeled == rid)
-                if len(rows) > 0:
-                    region_bboxes[rid] = (rows.min(), rows.max(), cols.min(), cols.max())
-
-            def bboxes_overlap(bbox1, bbox2):
-                r1_min, r1_max, c1_min, c1_max = bbox1
-                r2_min, r2_max, c2_min, c2_max = bbox2
-                return (r1_min <= r2_max and r1_max >= r2_min and
-                        c1_min <= c2_max and c1_max >= c2_min)
-
-            for rid in range(1, n_regions + 1):
-                region_size = region_sizes[rid - 1]
-                if region_size >= max_region_size * SMALL_REGION_THRESHOLD:
-                    continue  # Not small
-
-                if rid not in region_bboxes:
-                    continue
-
-                small_bbox = region_bboxes[rid]
-
-                for other_rid in range(1, n_regions + 1):
-                    if other_rid == rid:
-                        continue
-                    other_size = region_sizes[other_rid - 1]
-                    if other_size <= region_size:
-                        continue
-                    if other_rid not in region_bboxes:
-                        continue
-                    if bboxes_overlap(small_bbox, region_bboxes[other_rid]):
-                        garbage_regions.add(rid)
-                        break
-
-        curr_layer_branches = {}
-        layer_regions[layer_idx] = {}
-
-        # FIRST: Build parent-to-children mapping to detect splits
-        parent_to_children = {}  # parent_branch_id -> [list of child region ids]
-        region_parent_branches = {}  # region_id -> {parent_branch_id: overlap_count}
-
-        for rid in range(1, n_regions + 1):
-            # Skip garbage regions during branch tracking
-            if rid in garbage_regions:
-                continue
-
-            region_mask = (labeled == rid)
-
-            # Find overlapping parent regions
-            parent_branches = {}
-            if prev_labeled is not None:
-                # First check for direct overlap
-                overlap = region_mask & (prev_labeled > 0)
-                if np.any(overlap):
-                    parent_rids = np.unique(prev_labeled[overlap])
-                    parent_rids = parent_rids[parent_rids > 0]
-
-                    for parent_rid in parent_rids:
-                        overlap_count = np.sum((labeled == rid) & (prev_labeled == parent_rid))
-                        if overlap_count > 0:
-                            parent_branch_id = prev_layer_branches.get(int(parent_rid))
-                            if parent_branch_id:
-                                parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + overlap_count
-
-                # If no overlap found, check for proximity using dilation (for thin bridges/overhangs)
-                if not parent_branches:
-                    from scipy.ndimage import binary_dilation
-
-                    # Dilate current region by 5 voxels to check for nearby parent regions
-                    # This handles thin structures that shift position between layers
-                    dilation_iterations = 5
-                    dilated_region = binary_dilation(region_mask, iterations=dilation_iterations)
-
-                    # Check which parent regions overlap with dilated current region
-                    overlap_with_dilated = dilated_region & (prev_labeled > 0)
-                    if np.any(overlap_with_dilated):
-                        parent_rids = np.unique(prev_labeled[overlap_with_dilated])
-                        parent_rids = parent_rids[parent_rids > 0]
-
-                        for parent_rid in parent_rids:
-                            # Calculate overlap between dilated current region and parent
-                            proximity_overlap = np.sum(dilated_region & (prev_labeled == parent_rid))
-                            if proximity_overlap > 0:
-                                parent_branch_id = prev_layer_branches.get(int(parent_rid))
-                                if parent_branch_id:
-                                    # Score based on overlap area after dilation
-                                    parent_branches[parent_branch_id] = parent_branches.get(parent_branch_id, 0) + proximity_overlap
-
-            region_parent_branches[rid] = parent_branches
-
-            # Build parent -> children mapping
-            if parent_branches:
-                # Child belongs to largest parent
-                parent_branch_id = max(parent_branches, key=parent_branches.get)
-                if parent_branch_id not in parent_to_children:
-                    parent_to_children[parent_branch_id] = []
-                parent_to_children[parent_branch_id].append(rid)
-
-        # SECOND: Assign branch IDs with split and merge detection
-        for rid in range(1, n_regions + 1):
-            # Skip garbage regions
-            if rid in garbage_regions:
-                continue
-
-            parent_branches = region_parent_branches.get(rid, {})
-
-            if not parent_branches:
-                # No parent - create new branch
-                branch_id = next_branch_id
-                next_branch_id += 1
-                color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
-                branches[branch_id] = {
-                    'color': color,
-                    'layers': [layer_idx]
-                }
-            elif len(parent_branches) > 1:
-                # MERGE DETECTED - multiple branches merging into one
-                # Create new branch with mixed color from all parent branches
-                branch_id = next_branch_id
-                next_branch_id += 1
-
-                # Mix colors from all parent branches
-                parent_colors = [branches[pb_id]['color'] for pb_id in parent_branches.keys()]
-                color = _mix_colors(parent_colors)
-
-                branches[branch_id] = {
-                    'color': color,
-                    'layers': [layer_idx],
-                    'is_merge': True,
-                    'parent_branches': list(parent_branches.keys())
-                }
-            else:
-                # Single parent
-                parent_branch_id = max(parent_branches, key=parent_branches.get)
-                children_of_parent = parent_to_children.get(parent_branch_id, [])
-
-                if len(children_of_parent) == 1:
-                    # No split - inherit parent branch ID
-                    branch_id = parent_branch_id
-                    if layer_idx not in branches[branch_id]['layers']:
-                        branches[branch_id]['layers'].append(layer_idx)
-                    color = branches[branch_id]['color']
-                else:
-                    # Split detected - create NEW branch for this child
-                    branch_id = next_branch_id
-                    next_branch_id += 1
-                    color = BASE_COLORS[(branch_id - 1) % len(BASE_COLORS)]
-                    branches[branch_id] = {
-                        'color': color,
-                        'layers': [layer_idx]
-                    }
-
-            curr_layer_branches[rid] = branch_id
-            layer_regions[layer_idx][rid] = {
-                'branch_id': branch_id,
-                'color': color
-            }
-
-            # Track branch first/last layer info
-            if branch_id not in branch_debug_info:
-                # Calculate centroid for this region
-                rows, cols = np.where(labeled == rid)
-                centroid_r, centroid_c = np.mean(rows), np.mean(cols)
-                branch_debug_info[branch_id] = {
-                    'first_layer': layer_idx,
-                    'first_layer_centroid': (centroid_r, centroid_c),
-                    'last_layer': layer_idx,
-                    'layers': [layer_idx]
-                }
-            else:
-                branch_debug_info[branch_id]['last_layer'] = layer_idx
-                branch_debug_info[branch_id]['layers'].append(layer_idx)
-
-        prev_labeled = labeled
-        prev_layer_branches = curr_layer_branches
-        prev_layer_idx = layer_idx
-
-    # Log branch debug info
-    logger.debug(f"Branch tracking complete: {len(branches)} branches")
-    for bid in sorted(branch_debug_info.keys())[:10]:  # Log first 10 branches
-        info = branch_debug_info[bid]
-        logger.debug(f"  Branch {bid}: layers {info['first_layer']}-{info['last_layer']} "
-                    f"(centroid at first: {info.get('first_layer_centroid', 'N/A')})")
-
-    return {
-        'branches': branches,
-        'layer_regions': layer_regions,
-        'branch_debug_info': branch_debug_info
-    }
-
-
-def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
-                            min_area_fraction: float = 0.01,
-                            min_area_voxels: int = 25,
-                            skip_garbage_filter: bool = False) -> tuple:
-    """Generate triangulated surface from a 2D mask with overlap-based garbage filtering.
+def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float) -> tuple:
+    """Generate triangulated surface from a 2D mask.
 
     Uses marching squares-like approach to find contours and triangulate them.
     Returns (vertices, faces) for mesh3d rendering.
-
-    Garbage filtering logic:
-    - Small regions (< 20% of largest) whose BOUNDING BOX OVERLAPS with larger regions are filtered
-    - Small regions that are standalone (no bbox overlap) are KEPT (legitimate features)
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        2D binary mask of the layer
-    voxel_size : float
-        Physical size of each voxel in mm
-    z : float
-        Z height of this layer in mm
-    min_area_fraction : float
-        (Deprecated) Not used with overlap-based filtering
-    min_area_voxels : int
-        (Deprecated) Not used with overlap-based filtering
-    skip_garbage_filter : bool
-        If True, skip garbage filtering (for pre-filtered single-region masks)
     """
     from scipy import ndimage
 
     # Find connected regions and their boundaries
     labeled, n_features = ndimage.label(mask)
 
-    if n_features == 0:
-        return [], []
-
-    # Calculate area of each region
-    region_sizes = ndimage.sum(mask > 0, labeled, range(1, n_features + 1))
-    if len(region_sizes) == 0:
-        return [], []
-
-    # Overlap-based garbage detection (unless filtering is skipped)
-    garbage_regions = set()
-    if not skip_garbage_filter and n_features > 1:
-        max_region_size = np.max(region_sizes)
-        SMALL_REGION_THRESHOLD = 0.20  # 20% of largest
-        small_region_size_limit = max_region_size * SMALL_REGION_THRESHOLD
-
-        # Pre-compute bounding boxes
-        region_bboxes = {}
-        for region_id in range(1, n_features + 1):
-            rows, cols = np.where(labeled == region_id)
-            if len(rows) > 0:
-                region_bboxes[region_id] = (rows.min(), rows.max(), cols.min(), cols.max())
-
-        def bboxes_overlap(bbox1, bbox2):
-            r1_min, r1_max, c1_min, c1_max = bbox1
-            r2_min, r2_max, c2_min, c2_max = bbox2
-            return (r1_min <= r2_max and r1_max >= r2_min and
-                    c1_min <= c2_max and c1_max >= c2_min)
-
-        for region_id in range(1, n_features + 1):
-            region_size = region_sizes[region_id - 1]
-            if region_size >= small_region_size_limit:
-                continue  # Not small, not garbage
-
-            if region_id not in region_bboxes:
-                continue
-
-            small_bbox = region_bboxes[region_id]
-
-            for other_id in range(1, n_features + 1):
-                if other_id == region_id:
-                    continue
-                other_size = region_sizes[other_id - 1]
-                if other_size <= region_size:
-                    continue  # Only check against larger regions
-
-                if other_id not in region_bboxes:
-                    continue
-
-                if bboxes_overlap(small_bbox, region_bboxes[other_id]):
-                    garbage_regions.add(region_id)
-                    break
-
     all_vertices = []
     all_faces = []
     vertex_offset = 0
 
     for region_id in range(1, n_features + 1):
-        # Skip garbage regions (small AND near larger regions)
-        if region_id in garbage_regions:
-            continue
-
         region_mask = (labeled == region_id)
 
         # Find boundary pixels using erosion
@@ -2012,32 +1363,14 @@ def get_slice_visualization(session_id):
 
     Returns layer surfaces and edge points where kernels can be placed.
     The frontend handles kernel rendering, updating when sigma changes.
-    Also supports slice-only mode (from Slice button).
     """
     session = session_registry.get_session(session_id)
-    if not session:
-        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
-
-    # Support both full analysis results and slice-only data
-    # Check slice_data first (for slice-only mode) since set_complete may set
-    # session.results to metadata without masks
-    results = session.results
-    slice_data = session.slice_data
-
-    # Prefer slice_data if it has masks, otherwise use results
-    if slice_data and slice_data.get('masks'):
-        # Slice-only mode (or slice_data available from full analysis)
-        masks = slice_data.get('masks', {})
-        params = {
-            'voxel_size': slice_data.get('voxel_size', 0.1),
-            'layer_thickness': slice_data.get('layer_thickness', 0.04),
-        }
-    elif results and results.get('masks'):
-        # Full analysis mode with masks in results
-        masks = results.get('masks', {})
-        params = results.get('params_used', {})
-    else:
+    if not session or not session.results:
         return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    masks = results.get('masks', {})
+    params = results.get('params_used', {})
 
     if not masks:
         return jsonify({'status': 'error', 'message': 'No mask data available'}), 404
@@ -2611,39 +1944,71 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         .summary-stat {{ display: flex; justify-content: space-between; padding: 6px 0; font-size: 0.85rem; }}
         .summary-stat .label {{ color: var(--text-secondary); }}
         .summary-stat .value {{ color: var(--text-primary); font-weight: 500; }}
-        /* Loading overlay for visualization tabs */
-        .loading-overlay {{
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(10, 15, 25, 0.85);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            z-index: 100;
+
+        /* ============================================================
+           MODE SELECTOR
+           ============================================================ */
+        .mode-selector {{
+            margin-bottom: 10px;
+            padding: 10px 12px;
+            background: var(--bg-card);
+            border-radius: 6px;
+            border: 1px solid rgba(30,101,55,0.3);
         }}
-        .loading-overlay.hidden {{
-            display: none;
-        }}
-        .loading-spinner {{
-            width: 40px;
-            height: 40px;
-            border: 3px solid var(--border-color);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }}
-        @keyframes spin {{
-            to {{ transform: rotate(360deg); }}
-        }}
-        .loading-text {{
-            margin-top: 12px;
+        .mode-selector-label {{
+            font-size: 0.7rem;
             color: var(--text-secondary);
-            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 6px;
         }}
+        .mode-buttons {{
+            display: flex;
+            gap: 6px;
+        }}
+        .mode-btn {{
+            flex: 1;
+            padding: 8px 6px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            border-radius: 5px;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+            white-space: nowrap;
+        }}
+        .mode-btn:hover {{
+            background: rgba(30,101,55,0.2);
+            color: var(--text-primary);
+            border-color: var(--accent);
+        }}
+        .mode-btn.active {{
+            background: linear-gradient(135deg, var(--primary), var(--primary-light));
+            color: #fff;
+            border-color: var(--accent);
+            box-shadow: 0 2px 8px rgba(30,101,55,0.4);
+        }}
+
+        /* Thermal mode input elements */
+        .param-select {{
+            width: 100%;
+            padding: 6px 10px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            margin-bottom: 8px;
+        }}
+        .param-select:focus {{ outline: none; border-color: var(--accent); }}
+
+        /* Thermal risk legend items */
+        .risk-color.safe {{ background: #4ade80; }}
+        .risk-color.warning {{ background: #fbbf24; }}
+        .risk-color.critical {{ background: #f87171; }}
     </style>
 </head>
 <body>
@@ -2656,6 +2021,15 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
         <!-- Left Sidebar -->
         <aside class="sidebar">
             <div class="panel-title">Parameters</div>
+
+            <!-- Analysis Mode Selector -->
+            <div class="mode-selector">
+                <div class="mode-selector-label">Analysis Method</div>
+                <div class="mode-buttons">
+                    <button id="mode-energy" class="mode-btn active" onclick="setMode('energy')">⚡ Energy Balance</button>
+                    <button id="mode-thermal" class="mode-btn" onclick="setMode('thermal')">🌡️ Thermal Sim</button>
+                </div>
+            </div>
 
             <!-- STL Input Section -->
             <div class="sidebar-section expanded">
@@ -2672,8 +2046,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <div style="display: flex; gap: 4px; margin-top: 4px;">
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(1)">Test STL 1</button>
                         <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(2)">Test STL 2</button>
-                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(3)">Test STL 3</button>
-                        <button class="btn btn-secondary" style="flex: 1; padding: 4px 8px; font-size: 0.75rem;" onclick="loadTestSTL(4)">Test STL 4</button>
                     </div>
 
                     <!-- STL Info (shown when loaded) -->
@@ -2711,24 +2083,17 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             <span class="param-label">Build Direction</span>
                             <select class="param-input" id="buildDirection" style="flex: 1;" onchange="onBuildDirectionChange()">
                                 <option value="Z">Z-up (default)</option>
-                                <option value="Y-">Y-up (rotate Y→Z)</option>
-                                <option value="Y">Y-down (rotate Y→Z, flip)</option>
+                                <option value="Y">Y-up (rotate Y→Z)</option>
+                                <option value="Y-">Y-down (rotate Y→Z, flip)</option>
                                 <option value="X">X-up (rotate X→Z)</option>
                             </select>
-                        </div>
-
-                        <!-- Slice Button -->
-                        <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color);">
-                            <button class="btn btn-primary" id="sliceBtn" style="width: 100%; padding: 6px 12px; font-size: 0.8rem;" onclick="runSliceOnly()" disabled>
-                                Slice
-                            </button>
                         </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Energy Model Section -->
-            <div class="sidebar-section">
+            <!-- Energy Model Section (energy mode only) -->
+            <div class="sidebar-section energy-only">
                 <div class="section-header" onclick="toggleSection(this)">
                     <span>Energy Model</span>
                     <span class="arrow">&#9660;</span>
@@ -2736,44 +2101,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <div class="section-content">
                     <div style="margin-bottom: 6px;">
                         <label class="radio-option">
-                            <input type="radio" name="energyModel" value="area_only" checked onchange="updateModelVisibility()">
+                            <input type="radio" name="energyModel" value="area_only" onchange="updateModelVisibility()">
                             <span>Area-Only Mode (faster)</span>
                         </label>
                         <label class="radio-option">
-                            <input type="radio" name="energyModel" value="geometry_multiplier" onchange="updateModelVisibility()">
+                            <input type="radio" name="energyModel" value="geometry_multiplier" checked onchange="updateModelVisibility()">
                             <span>Geometry Multiplier Mode</span>
                         </label>
-                    </div>
-                    <!-- Area Ratio Method (only visible in Area-Only mode) -->
-                    <div id="areaRatioMethodGroup" style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border-color);">
-                        <div style="font-size: 0.7rem; color: var(--text-secondary); margin-bottom: 4px;">Area Ratio Method</div>
-                        <label class="radio-option">
-                            <input type="radio" name="areaRatioMethod" value="layer_scan" checked>
-                            <span>Layer Scan Area (default)</span>
-                        </label>
-                        <label class="radio-option">
-                            <input type="radio" name="areaRatioMethod" value="contact">
-                            <span>Contact Area (legacy)</span>
-                        </label>
-                    </div>
-                    <!-- Laser Parameters for Energy Calculation -->
-                    <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border-color);">
-                        <div style="font-size: 0.7rem; color: var(--text-secondary); margin-bottom: 4px;">Laser Parameters</div>
-                        <div class="param-row">
-                            <span class="param-label">Power</span>
-                            <input type="number" class="param-input" id="laserPower" value="200" step="10" min="50" max="500">
-                            <span class="param-unit">W</span>
-                        </div>
-                        <div class="param-row">
-                            <span class="param-label">Scan Speed</span>
-                            <input type="number" class="param-input" id="scanSpeed" value="800" step="50" min="100" max="2000">
-                            <span class="param-unit">mm/s</span>
-                        </div>
-                        <div class="param-row">
-                            <span class="param-label">Hatch Distance</span>
-                            <input type="number" class="param-input" id="hatchDistance" value="0.1" step="0.01" min="0.05" max="0.15">
-                            <span class="param-unit">mm</span>
-                        </div>
                     </div>
                     <div class="param-row">
                         <span class="param-label">Dissipation Factor</span>
@@ -2787,7 +2121,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                     <div class="param-row" id="powerParamGroup">
                         <span class="param-label">Area Ratio Power</span>
-                        <input type="number" class="param-input" id="areaRatioPower" value="1.0" step="0.1" min="0.1">
+                        <input type="number" class="param-input" id="areaRatioPower" value="3.0" step="0.1" min="0.1">
                         <span class="param-unit"></span>
                     </div>
                     <div id="geometryParams" style="display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-color);">
@@ -2810,8 +2144,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- Risk Thresholds Section -->
-            <div class="sidebar-section">
+            <!-- Risk Thresholds Section (energy mode only) -->
+            <div class="sidebar-section energy-only">
                 <div class="section-header collapsed" onclick="toggleSection(this)">
                     <span>Risk Thresholds</span>
                     <span class="arrow">&#9660;</span>
@@ -2835,6 +2169,126 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
+            <!-- Material Section (thermal mode only) -->
+            <div class="sidebar-section thermal-only" style="display:none;">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <span>🧪 Material</span>
+                    <span class="arrow">&#9660;</span>
+                </div>
+                <div class="section-content">
+                    <select class="param-select" id="material-select" onchange="onMaterialSelect()">
+                        <option value="SS316L">SS316L — Stainless Steel 316L</option>
+                        <option value="Ti64">Ti-6Al-4V</option>
+                        <option value="IN718">Inconel 718</option>
+                        <option value="AlSi10Mg">AlSi10Mg</option>
+                        <option value="Custom">Custom</option>
+                    </select>
+                    <div class="param-row">
+                        <span class="param-label">Thermal Conductivity</span>
+                        <input type="number" class="param-input" id="thermal-k" value="16.2" step="0.1" min="0.1">
+                        <span class="param-unit">W/mK</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Specific Heat</span>
+                        <input type="number" class="param-input" id="specific-heat" value="500" step="1" min="50">
+                        <span class="param-unit">J/kgK</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Density</span>
+                        <input type="number" class="param-input" id="density" value="7990" step="10" min="500">
+                        <span class="param-unit">kg/m³</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Melting Point</span>
+                        <input type="number" class="param-input" id="melting-point" value="1400" step="10" min="100">
+                        <span class="param-unit">°C</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Absorptivity</span>
+                        <input type="number" class="param-input" id="absorptivity" value="0.35" step="0.01" min="0.05" max="0.95">
+                        <span class="param-unit"></span>
+                    </div>
+                    <div style="font-size: 0.65rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">
+                        Absorptivity is an effective/calibrated parameter. Calibrate against experimental data for your specific machine.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Process Parameters (thermal mode only) -->
+            <div class="sidebar-section thermal-only" style="display:none;">
+                <div class="section-header collapsed" onclick="toggleSection(this)">
+                    <span>⚙️ Process Parameters</span>
+                    <span class="arrow">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <div class="param-row">
+                        <span class="param-label">Laser Power</span>
+                        <input type="number" class="param-input" id="laser-power" value="280" step="10" min="50" max="1000">
+                        <span class="param-unit">W</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Scan Velocity</span>
+                        <input type="number" class="param-input" id="scan-velocity" value="960" step="10" min="100" max="5000">
+                        <span class="param-unit">mm/s</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Hatch Spacing</span>
+                        <input type="number" class="param-input" id="hatch-spacing" value="0.1" step="0.01" min="0.01" max="1.0">
+                        <span class="param-unit">mm</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Recoat Time</span>
+                        <input type="number" class="param-input" id="recoat-time" value="8" step="1" min="1" max="60">
+                        <span class="param-unit">s</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Scan Efficiency</span>
+                        <input type="number" class="param-input" id="scan-efficiency" value="0.1" step="0.01" min="0.01" max="1.0">
+                        <span class="param-unit"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Thermal Settings (thermal mode only) -->
+            <div class="sidebar-section thermal-only" style="display:none;">
+                <div class="section-header collapsed" onclick="toggleSection(this)">
+                    <span>🌡️ Thermal Settings</span>
+                    <span class="arrow">&#9660;</span>
+                </div>
+                <div class="section-content collapsed">
+                    <div class="param-row">
+                        <span class="param-label">Preheat Temperature</span>
+                        <input type="number" class="param-input" id="preheat-temp" value="80" step="5" min="20" max="500">
+                        <span class="param-unit">°C</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Convection Coeff.</span>
+                        <input type="number" class="param-input" id="convection-coeff" value="10" step="1" min="0" max="200">
+                        <span class="param-unit">W/m²K</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Substrate Influence</span>
+                        <input type="number" class="param-input" id="substrate-influence" value="0.3" step="0.05" min="0" max="1">
+                        <span class="param-unit"></span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Warning Threshold</span>
+                        <input type="number" class="param-input" id="warning-fraction" value="0.8" step="0.05" min="0.1" max="1.0">
+                        <span class="param-unit">× T_melt</span>
+                    </div>
+                    <div class="param-row">
+                        <span class="param-label">Critical Threshold</span>
+                        <input type="number" class="param-input" id="critical-fraction" value="1.0" step="0.05" min="0.1" max="2.0">
+                        <span class="param-unit">× T_melt</span>
+                    </div>
+                    <div style="font-size: 0.65rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.3;">
+                        <strong style="color: var(--success);">SAFE:</strong> T &lt; warning × T_melt<br>
+                        <strong style="color: var(--warning);">WARNING:</strong> warning × T_melt ≤ T &lt; critical × T_melt<br>
+                        <strong style="color: var(--danger);">CRITICAL:</strong> T ≥ critical × T_melt
+                    </div>
+                </div>
+            </div>
+
         </aside>
 
         <!-- Main Content -->
@@ -2842,11 +2296,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             <nav class="tab-nav">
                 <button class="tab-btn active" onclick="switchTab('preview', event)">STL Preview</button>
                 <button class="tab-btn" onclick="switchTab('slices', event)">Sliced Layers</button>
+                <button class="tab-btn energy-tab" id="tab-btn-area_ratio" onclick="switchTab('area_ratio', event)">Area Ratio</button>
+                <button class="tab-btn energy-tab" id="tab-btn-gaussian" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
                 <button class="tab-btn" onclick="switchTab('regions', event)">Regions</button>
-                <button class="tab-btn" onclick="switchTab('area_ratio', event)">Area Ratio</button>
-                <button class="tab-btn" onclick="switchTab('gaussian', event)">Gaussian Multiplier</button>
-                <button class="tab-btn" onclick="switchTab('energy', event)">Energy Accumulation</button>
-                <button class="tab-btn" onclick="switchTab('density', event)">Energy Density</button>
+                <button class="tab-btn" id="tab-btn-results" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
@@ -2879,25 +2332,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Sliced Layers Tab -->
                 <div class="tab-panel" id="tab-slices">
                     <div class="viz-container" id="slicesPlot">
-                        <div class="loading-overlay hidden" id="slicesLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Loading sliced layers...</div>
-                        </div>
-                        <div id="slicesPlaceholder" style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Click "Slice" or "Run Analysis" to see sliced layers
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Regions Tab (moved after Sliced Layers) -->
-                <div class="tab-panel" id="tab-regions">
-                    <div class="viz-container" id="regionsPlot">
-                        <div class="loading-overlay hidden" id="regionsLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Loading regions...</div>
-                        </div>
-                        <div id="regionsPlaceholder" style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Click "Slice" or "Run Analysis" to see connected regions (islands)
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see sliced layers
                         </div>
                     </div>
                 </div>
@@ -2905,12 +2341,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Area Ratio Tab -->
                 <div class="tab-panel" id="tab-area_ratio">
                     <div class="viz-container" id="areaRatioPlot">
-                        <div class="loading-overlay hidden" id="areaRatioLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Updating visualization...</div>
-                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see area ratio (A_below / A_region)
+                            Run analysis to see area ratio (A_contact / A_layer)
                         </div>
                     </div>
                 </div>
@@ -2918,12 +2350,17 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Gaussian Multiplier Tab -->
                 <div class="tab-panel" id="tab-gaussian">
                     <div class="viz-container" id="gaussianPlot">
-                        <div class="loading-overlay hidden" id="gaussianLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Updating visualization...</div>
-                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis (Mode B) to see Gaussian multiplier 1/(1+G)
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Regions Tab -->
+                <div class="tab-panel" id="tab-regions">
+                    <div class="viz-container" id="regionsPlot">
+                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            Run analysis to see connected regions (islands)
                         </div>
                     </div>
                 </div>
@@ -2931,25 +2368,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Energy Accumulation Tab -->
                 <div class="tab-panel" id="tab-energy">
                     <div class="viz-container" id="energyPlot">
-                        <div class="loading-overlay hidden" id="energyLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Updating visualization...</div>
-                        </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see energy accumulation
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Energy Density Tab -->
-                <div class="tab-panel" id="tab-density">
-                    <div class="viz-container" id="densityPlot">
-                        <div class="loading-overlay hidden" id="densityLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Updating visualization...</div>
-                        </div>
-                        <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
-                            Run analysis to see energy density (J/mm²)
                         </div>
                     </div>
                 </div>
@@ -2957,14 +2377,19 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <!-- Risk Map Tab -->
                 <div class="tab-panel" id="tab-risk">
                     <div class="viz-container" id="riskPlot">
-                        <div class="loading-overlay hidden" id="riskLoading">
-                            <div class="loading-spinner"></div>
-                            <div class="loading-text">Updating visualization...</div>
-                        </div>
                         <div class="risk-legend" style="display: none;" id="riskLegend">
-                            <div class="risk-item"><div class="risk-color low"></div> LOW (safe)</div>
-                            <div class="risk-item"><div class="risk-color medium"></div> MEDIUM (caution)</div>
-                            <div class="risk-item"><div class="risk-color high"></div> HIGH (risk)</div>
+                            <!-- Energy mode legend -->
+                            <div id="energyRiskLegend">
+                                <div class="risk-item"><div class="risk-color low"></div> LOW (safe)</div>
+                                <div class="risk-item"><div class="risk-color medium"></div> MEDIUM (caution)</div>
+                                <div class="risk-item"><div class="risk-color high"></div> HIGH (risk)</div>
+                            </div>
+                            <!-- Thermal mode legend (hidden by default) -->
+                            <div id="thermalRiskLegend" style="display:none;">
+                                <div class="risk-item"><div class="risk-color safe"></div> SAFE</div>
+                                <div class="risk-item"><div class="risk-color warning"></div> WARNING</div>
+                                <div class="risk-item"><div class="risk-color critical"></div> CRITICAL</div>
+                            </div>
                         </div>
                         <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
                             Run analysis to see risk classification
@@ -3003,35 +2428,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 </div>
             </div>
 
-            <div class="viz-block" id="colorScaleBlock" style="display: none;">
-                <div class="block-title">Color Scale</div>
-                <div class="control-group">
-                    <label>Min Value</label>
-                    <input type="number" id="colorScaleMin" step="any" style="width: 100%; padding: 4px 8px; background: {BG_CARD}; border: 1px solid #444; border-radius: 4px; color: #e0e0e0;" onchange="updateColorScaleMin(this.value)">
-                </div>
-                <div class="control-group">
-                    <label>Max Value</label>
-                    <input type="number" id="colorScaleMax" step="any" style="width: 100%; padding: 4px 8px; background: {BG_CARD}; border: 1px solid #444; border-radius: 4px; color: #e0e0e0;" onchange="updateColorScaleMax(this.value)">
-                </div>
-                <button id="colorScaleResetBtn" style="display: none; width: 100%; padding: 6px 12px; margin-top: 8px; background: #4a5568; border: none; border-radius: 4px; color: #e0e0e0; cursor: pointer; font-size: 12px;" onclick="resetColorScale()">
-                    Reset to Adaptive
-                </button>
-            </div>
-
-            <div class="viz-block" id="regionsViewBlock" style="display: none;">
-                <div class="block-title">View Mode</div>
-                <div class="control-group" style="margin-bottom: 0;">
-                    <label class="radio-option" style="margin-bottom: 6px;">
-                        <input type="radio" name="regionsView" value="per_layer" checked onchange="updateRegionsView()">
-                        <span>Per-Layer Colors</span>
-                    </label>
-                    <label class="radio-option">
-                        <input type="radio" name="regionsView" value="branches_3d" onchange="updateRegionsView()">
-                        <span>3D Branch Tracking</span>
-                    </label>
-                </div>
-            </div>
-
             <div class="viz-block" id="kernelVizBlock" style="display: none;">
                 <div class="block-title">Kernel Visualization</div>
                 <div class="control-group">
@@ -3049,25 +2445,71 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
     <script>
         // Global state
         let currentSessionId = null;
-        let sliceSessionId = null;  // Session ID for slice-only operations
         let analysisResults = null;
-        let sliceResults = null;  // Stores slice-only results (masks, regions)
         let stlLoaded = false;
         let currentEventSource = null;  // Track EventSource for cleanup
-        let currentRegionsView = 'per_layer';  // 'per_layer' or 'branches_3d'
+        let currentMode = 'energy';     // 'energy' or 'thermal'
 
-        // Color scale state (null = use adaptive from data)
-        let manualColorMin = null;
-        let manualColorMax = null;
-        let lastAdaptiveMin = null;  // Store adaptive values for reset (current tab)
-        let lastAdaptiveMax = null;
-        let currentColorDataType = null;  // Track which data type color scale applies to
+        // Built-in material database (mirrors config.py MATERIAL_DATABASE)
+        const MATERIAL_DB = {{
+            'SS316L':   {{ k: 16.2,  cp: 500,  rho: 7990,  Tm: 1400, eta: 0.35 }},
+            'Ti64':     {{ k: 6.7,   cp: 526,  rho: 4430,  Tm: 1660, eta: 0.40 }},
+            'IN718':    {{ k: 11.4,  cp: 435,  rho: 8190,  Tm: 1336, eta: 0.38 }},
+            'AlSi10Mg': {{ k: 147,   cp: 963,  rho: 2670,  Tm: 660,  eta: 0.30 }},
+        }};
 
-        // Per-tab cache for adaptive min/max values (for instant switching)
-        const tabAdaptiveRanges = {{}};
+        // ============================================================
+        // MODE SWITCHING
+        // ============================================================
+        function setMode(mode) {{
+            currentMode = mode;
+            localStorage.setItem('oc_mode', mode);
 
-        // Per-tab cache for full layer data (avoids re-fetching on color scale change)
-        const layerDataCache = {{}};
+            // Update mode buttons
+            document.getElementById('mode-energy').classList.toggle('active', mode === 'energy');
+            document.getElementById('mode-thermal').classList.toggle('active', mode === 'thermal');
+
+            // Show/hide energy-only sections
+            document.querySelectorAll('.energy-only').forEach(el => {{
+                el.style.display = (mode === 'energy') ? '' : 'none';
+            }});
+
+            // Show/hide thermal-only sections
+            document.querySelectorAll('.thermal-only').forEach(el => {{
+                el.style.display = (mode === 'thermal') ? '' : 'none';
+            }});
+
+            // Show/hide energy-specific tabs
+            document.querySelectorAll('.energy-tab').forEach(el => {{
+                el.style.display = (mode === 'energy') ? '' : 'none';
+            }});
+
+            // Update results tab label
+            const resultsBtn = document.getElementById('tab-btn-results');
+            if (resultsBtn) {{
+                resultsBtn.textContent = (mode === 'thermal') ? '🌡️ Temperature' : 'Energy Accumulation';
+            }}
+
+            // Update risk legend
+            const energyLegend = document.getElementById('energyRiskLegend');
+            const thermalLegend = document.getElementById('thermalRiskLegend');
+            if (energyLegend) energyLegend.style.display = (mode === 'energy') ? '' : 'none';
+            if (thermalLegend) thermalLegend.style.display = (mode === 'thermal') ? '' : 'none';
+
+            logConsole('Switched to ' + (mode === 'energy' ? 'Energy Balance' : 'Thermal Simulation') + ' mode', 'info');
+        }}
+
+        // Auto-fill material properties from dropdown selection
+        function onMaterialSelect() {{
+            const key = document.getElementById('material-select').value;
+            const mat = MATERIAL_DB[key];
+            if (!mat) return;  // Custom – let user fill manually
+            document.getElementById('thermal-k').value = mat.k;
+            document.getElementById('specific-heat').value = mat.cp;
+            document.getElementById('density').value = mat.rho;
+            document.getElementById('melting-point').value = mat.Tm;
+            document.getElementById('absorptivity').value = mat.eta;
+        }}
 
         // Toggle section expand/collapse (accordion behavior - only one open at a time)
         function toggleSection(header) {{
@@ -3098,12 +2540,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const isGeometry = document.querySelector('input[name="energyModel"]:checked').value === 'geometry_multiplier';
             document.getElementById('geometryParams').style.display = isGeometry ? 'block' : 'none';
             document.getElementById('powerParamGroup').style.display = isGeometry ? 'none' : '';
-            document.getElementById('areaRatioMethodGroup').style.display = isGeometry ? 'none' : 'block';
         }}
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'density': 'densityPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -3145,37 +2586,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const kernelBlock = document.getElementById('kernelVizBlock');
             if (kernelBlock) {{
                 kernelBlock.style.display = (tabName === 'gaussian') ? 'block' : 'none';
-            }}
-
-            // Show/hide regions view mode controls
-            const regionsViewBlock = document.getElementById('regionsViewBlock');
-            if (regionsViewBlock) {{
-                regionsViewBlock.style.display = (tabName === 'regions') ? 'block' : 'none';
-            }}
-
-            // Show/hide color scale controls (for tabs with continuous color scales)
-            const colorScaleBlock = document.getElementById('colorScaleBlock');
-            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
-            if (colorScaleBlock) {{
-                colorScaleBlock.style.display = colorScaleTabs.includes(tabName) ? 'block' : 'none';
-            }}
-
-            // Reset color scale when switching to a different visualization type
-            if (colorScaleTabs.includes(tabName) && currentColorDataType !== tabName) {{
-                currentColorDataType = tabName;
-                // Reset to adaptive when switching tabs
-                manualColorMin = null;
-                manualColorMax = null;
-                updateColorScaleResetButton();
-
-                // Immediately restore cached adaptive values for this tab (responsive switching)
-                const cacheKey = tabName === 'gaussian' ? 'gaussian_factor' : tabName;
-                if (tabAdaptiveRanges[cacheKey]) {{
-                    const cached = tabAdaptiveRanges[cacheKey];
-                    lastAdaptiveMin = cached.min;
-                    lastAdaptiveMax = cached.max;
-                    updateColorScaleInputs(cached.min, cached.max);
-                }}
             }}
         }}
 
@@ -3280,7 +2690,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     stlLoaded = true;
                     stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
-                    document.getElementById('sliceBtn').disabled = false;
                     document.getElementById('fileUpload').classList.add('loaded');
                     document.getElementById('fileUploadText').textContent = data.filename || 'Test STL';
 
@@ -3290,20 +2699,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     document.getElementById('infoDimensions').textContent = dims[0].toFixed(1) + ' × ' + dims[1].toFixed(1) + ' × ' + dims[2].toFixed(1) + ' mm';
 
                     updateLayerGroupingDisplay();
-
-                    // Auto-select build direction based on test STL
-                    // STL 1, 3 → Z-up; STL 2, 4 → Y-up
-                    const buildDirSelect = document.getElementById('buildDirection');
-                    if (stlIndex === 1 || stlIndex === 3) {{
-                        buildDirSelect.value = 'Z';
-                        logConsole('Build direction auto-set to: Z-up', 'info');
-                    }} else if (stlIndex === 2 || stlIndex === 4) {{
-                        buildDirSelect.value = 'Y-';
-                        logConsole('Build direction auto-set to: Y-up', 'info');
-                    }}
-                    // Trigger change event to update preview
-                    buildDirSelect.dispatchEvent(new Event('change'));
-
                     logConsole('Test STL loaded: ' + data.info.n_triangles + ' triangles', 'success');
 
                     // Render 3D STL preview
@@ -3342,7 +2737,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     stlLoaded = true;
                     stlDimensions = data.info.dimensions;
                     document.getElementById('runBtn').disabled = false;
-                    document.getElementById('sliceBtn').disabled = false;
                     document.getElementById('fileUpload').classList.add('loaded');
                     document.getElementById('fileUploadText').textContent = file.name;
 
@@ -3368,142 +2762,6 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             }}
         }}
 
-        // Run slice-only (no energy analysis, just slicing and region detection)
-        async function runSliceOnly() {{
-            if (!stlLoaded) {{
-                logConsole('Please upload an STL file first', 'warning');
-                return;
-            }}
-
-            const params = {{
-                voxel_size: parseFloat(document.getElementById('voxelSize').value),
-                layer_thickness: parseFloat(document.getElementById('layerThickness').value),
-                layer_grouping: parseInt(document.getElementById('layerGroupingValue').value) || 1,
-                build_direction: document.getElementById('buildDirection').value
-            }};
-
-            const sliceBtn = document.getElementById('sliceBtn');
-            sliceBtn.disabled = true;
-            sliceBtn.textContent = 'Slicing...';
-
-            try {{
-                logConsole('Starting slice operation (layer grouping: ' + params.layer_grouping + 'x)...', 'info');
-
-                const response = await fetch('/api/slice', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify(params)
-                }});
-
-                const data = await response.json();
-
-                if (data.status === 'started') {{
-                    monitorSliceProgress(data.session_id);
-                }} else {{
-                    logConsole('Error: ' + data.message, 'error');
-                    sliceBtn.disabled = false;
-                    sliceBtn.textContent = 'Slice';
-                }}
-            }} catch (err) {{
-                logConsole('Slice failed: ' + err.message, 'error');
-                sliceBtn.disabled = false;
-                sliceBtn.textContent = 'Slice';
-            }}
-        }}
-
-        // Monitor slice progress via SSE
-        function monitorSliceProgress(sessionId) {{
-            const evtSource = new EventSource('/api/progress/' + sessionId);
-
-            evtSource.onmessage = function(event) {{
-                const data = JSON.parse(event.data);
-                const sliceBtn = document.getElementById('sliceBtn');
-
-                if (data.heartbeat) return;
-
-                if (data.progress !== undefined) {{
-                    logConsole('[' + data.progress + '%] ' + (data.message || ''), 'info');
-                }}
-
-                if (data.status === 'complete') {{
-                    evtSource.close();
-                    sliceBtn.disabled = false;
-                    sliceBtn.textContent = 'Slice';
-                    logConsole('Slice completed! Fetching results...', 'success');
-                    // Store session ID for visualization
-                    sliceSessionId = sessionId;
-                    fetchSliceResults(sessionId);
-                }}
-
-                if (data.status === 'error' || data.status === 'cancelled') {{
-                    evtSource.close();
-                    sliceBtn.disabled = false;
-                    sliceBtn.textContent = 'Slice';
-                    logConsole('Slice failed: ' + (data.message || 'Unknown error'), 'error');
-                }}
-            }};
-
-            evtSource.onerror = function() {{
-                evtSource.close();
-                document.getElementById('sliceBtn').disabled = false;
-                document.getElementById('sliceBtn').textContent = 'Slice';
-            }};
-        }}
-
-        // Fetch slice results after completion
-        async function fetchSliceResults(sessionId) {{
-            try {{
-                const response = await fetch('/api/slice_results/' + sessionId);
-                const data = await response.json();
-
-                if (data.status === 'success') {{
-                    sliceResults = data.results;
-                    logConsole('Slice data ready: ' + sliceResults.n_layers + ' layers', 'success');
-
-                    // Update layer slider
-                    const slider = document.getElementById('layerSlider');
-                    slider.max = sliceResults.n_layers;
-                    slider.value = 1;
-                    document.getElementById('layerVal').textContent = '1 / ' + sliceResults.n_layers;
-
-                    // Render sliced layers and regions
-                    updateSlicesVisualization();
-                    updateRegionsVisualization();
-
-                    // Switch to Regions tab
-                    switchTab('regions');
-                }} else {{
-                    logConsole('Error fetching slice results: ' + data.message, 'error');
-                }}
-            }} catch (err) {{
-                logConsole('Error fetching slice results: ' + err.message, 'error');
-            }}
-        }}
-
-        // Update regions view toggle
-        function updateRegionsView() {{
-            currentRegionsView = document.querySelector('input[name="regionsView"]:checked').value;
-            updateRegionsVisualization();
-        }}
-
-        // Render slices visualization (used by both Slice and Run Analysis)
-        function updateSlicesVisualization() {{
-            const results = analysisResults || sliceResults;
-            if (!results) return;
-
-            // Re-render the slices tab
-            fetchAndRenderVisualization('slices', document.getElementById('layerSlider').value);
-        }}
-
-        // Render regions visualization based on current view mode
-        function updateRegionsVisualization() {{
-            const results = analysisResults || sliceResults;
-            if (!results) return;
-
-            const layer = parseInt(document.getElementById('layerSlider').value);
-            fetchAndRenderVisualization('regions', layer, currentRegionsView);
-        }}
-
         // Run analysis (can be called during existing run to restart with new params)
         async function runAnalysis() {{
             if (!stlLoaded) {{
@@ -3525,25 +2783,45 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 }}
             }}
 
+            // Build params object based on current mode
             const params = {{
+                mode: currentMode,
                 voxel_size: parseFloat(document.getElementById('voxelSize').value),
                 layer_thickness: parseFloat(document.getElementById('layerThickness').value),
                 layer_grouping: parseInt(document.getElementById('layerGroupingValue').value) || 1,
                 build_direction: document.getElementById('buildDirection').value,
-                dissipation_factor: parseFloat(document.getElementById('dissipationFactor').value),
-                convection_factor: parseFloat(document.getElementById('convectionFactor').value),
-                use_geometry_multiplier: document.querySelector('input[name="energyModel"]:checked').value === 'geometry_multiplier',
-                sigma_mm: parseFloat(document.getElementById('sigmaMM').value),
-                G_max: parseFloat(document.getElementById('gMax').value),
-                threshold_medium: parseFloat(document.getElementById('thresholdMedium').value),
-                threshold_high: parseFloat(document.getElementById('thresholdHigh').value),
-                area_ratio_power: parseFloat(document.getElementById('areaRatioPower').value) || 1.0,
-                area_ratio_method: document.querySelector('input[name="areaRatioMethod"]:checked').value,
-                gaussian_ratio_power: parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15,
-                laser_power: parseFloat(document.getElementById('laserPower').value) || 200,
-                scan_speed: parseFloat(document.getElementById('scanSpeed').value) || 800,
-                hatch_distance: parseFloat(document.getElementById('hatchDistance').value) || 0.1
             }};
+
+            if (currentMode === 'thermal') {{
+                // Thermal simulation params
+                params.material = document.getElementById('material-select').value;
+                params.thermal_conductivity = parseFloat(document.getElementById('thermal-k').value);
+                params.specific_heat = parseFloat(document.getElementById('specific-heat').value);
+                params.density = parseFloat(document.getElementById('density').value);
+                params.melting_point = parseFloat(document.getElementById('melting-point').value);
+                params.absorptivity = parseFloat(document.getElementById('absorptivity').value);
+                params.laser_power = parseFloat(document.getElementById('laser-power').value);
+                params.scan_velocity = parseFloat(document.getElementById('scan-velocity').value);
+                params.hatch_spacing = parseFloat(document.getElementById('hatch-spacing').value);
+                params.recoat_time = parseFloat(document.getElementById('recoat-time').value);
+                params.scan_efficiency = parseFloat(document.getElementById('scan-efficiency').value);
+                params.preheat_temp = parseFloat(document.getElementById('preheat-temp').value);
+                params.convection_coeff = parseFloat(document.getElementById('convection-coeff').value);
+                params.substrate_influence = parseFloat(document.getElementById('substrate-influence').value);
+                params.warning_fraction = parseFloat(document.getElementById('warning-fraction').value);
+                params.critical_fraction = parseFloat(document.getElementById('critical-fraction').value);
+            }} else {{
+                // Energy balance params
+                params.dissipation_factor = parseFloat(document.getElementById('dissipationFactor').value);
+                params.convection_factor = parseFloat(document.getElementById('convectionFactor').value);
+                params.use_geometry_multiplier = document.querySelector('input[name="energyModel"]:checked').value === 'geometry_multiplier';
+                params.sigma_mm = parseFloat(document.getElementById('sigmaMM').value);
+                params.G_max = parseFloat(document.getElementById('gMax').value);
+                params.threshold_medium = parseFloat(document.getElementById('thresholdMedium').value);
+                params.threshold_high = parseFloat(document.getElementById('thresholdHigh').value);
+                params.area_ratio_power = parseFloat(document.getElementById('areaRatioPower').value) || 3.0;
+                params.gaussian_ratio_power = parseFloat(document.getElementById('gaussianRatioPower').value) || 0.15;
+            }}
 
             const runBtn = document.getElementById('runBtn');
             // Don't disable - allow rerun
@@ -3663,19 +2941,31 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('layerSlider').max = nLayers;
             document.getElementById('layerVal').textContent = '1 / ' + nLayers;
 
-            const isModeB = analysisResults.params_used && analysisResults.params_used.mode === 'geometry_multiplier';
-            const vizSteps = [
-                {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
-                {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
-                {{ label: 'Density', fn: () => renderLayerSurfaces('density') }},
-                {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
-                {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
-                ...(isModeB ? [
-                    {{ label: 'Gaussian Multiplier', fn: () => renderLayerSurfaces('gaussian_factor') }},
-                ] : []),
-                {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
-                {{ label: 'Summary', fn: () => updateSummary() }}
-            ];
+            const resultMode = analysisResults.mode || 'energy';
+            let vizSteps;
+
+            if (resultMode === 'thermal') {{
+                vizSteps = [
+                    {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
+                    {{ label: 'Temperature', fn: () => renderLayerSurfaces('temperature') }},
+                    {{ label: 'Thermal Risk', fn: () => renderLayerSurfaces('thermal_risk') }},
+                    {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
+                    {{ label: 'Summary', fn: () => updateSummary() }}
+                ];
+            }} else {{
+                const isModeB = analysisResults.params_used && analysisResults.params_used.mode === 'geometry_multiplier';
+                vizSteps = [
+                    {{ label: 'Sliced Layers', fn: () => renderSlicesPlot() }},
+                    {{ label: 'Energy', fn: () => renderLayerSurfaces('energy') }},
+                    {{ label: 'Risk', fn: () => renderLayerSurfaces('risk') }},
+                    {{ label: 'Area Ratio', fn: () => renderLayerSurfaces('area_ratio') }},
+                    ...(isModeB ? [
+                        {{ label: 'Gaussian Multiplier', fn: () => renderLayerSurfaces('gaussian_factor') }},
+                    ] : []),
+                    {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
+                    {{ label: 'Summary', fn: () => updateSummary() }}
+                ];
+            }}
 
             for (let i = 0; i < vizSteps.length; i++) {{
                 const step = vizSteps[i];
@@ -3691,29 +2981,18 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             logConsole('All visualizations loaded', 'success');
         }}
 
-        // Helper to fetch and render visualization with optional view mode
-        async function fetchAndRenderVisualization(dataType, layer, viewMode) {{
-            if (dataType === 'slices') {{
-                renderSlicesPlot();
-            }} else if (dataType === 'regions') {{
-                renderLayerSurfaces('regions', viewMode || currentRegionsView);
-            }} else {{
-                renderLayerSurfaces(dataType);
-            }}
-        }}
-
         // Unified layer surface rendering for 3D visualization
-        async function renderLayerSurfaces(dataType, viewMode) {{
-            const sessionId = currentSessionId || sliceSessionId;
-            if (!sessionId) return;
+        async function renderLayerSurfaces(dataType) {{
+            if (!currentSessionId) return;
 
             const plotConfig = {{
-                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: 'energyLoading', placeholderId: null }},
-                'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
-                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
-                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_below / A_region)', loadingId: 'areaRatioLoading', placeholderId: null }},
-                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }},
-                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)', loadingId: 'regionsLoading', placeholderId: 'regionsPlaceholder' }}
+                'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)' }},
+                'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)' }},
+                'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_contact / A_layer)' }},
+                'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)' }},
+                'regions': {{ plotId: 'regionsPlot', title: 'Connected Regions (Islands)' }},
+                'temperature': {{ plotId: 'energyPlot', title: 'Peak Temperature (3D)' }},
+                'thermal_risk': {{ plotId: 'riskPlot', title: 'Thermal Risk Classification (3D)' }},
             }};
 
             const config = plotConfig[dataType];
@@ -3722,25 +3001,10 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 return;
             }}
 
-            // Show loading overlay if available
-            if (config.loadingId) {{
-                const loadingEl = document.getElementById(config.loadingId);
-                if (loadingEl) loadingEl.classList.remove('hidden');
-            }}
-            // Hide placeholder
-            if (config.placeholderId) {{
-                const placeholderEl = document.getElementById(config.placeholderId);
-                if (placeholderEl) placeholderEl.style.display = 'none';
-            }}
-
             logConsole('Loading ' + config.title + ' surfaces...', 'info');
 
             try {{
-                let url = '/api/layer_surfaces/' + sessionId + '/' + dataType;
-                if (viewMode) {{
-                    url += '?view_mode=' + viewMode;
-                }}
-                const response = await fetch(url);
+                const response = await fetch('/api/layer_surfaces/' + currentSessionId + '/' + dataType);
                 if (!response.ok) {{
                     logConsole('Failed to load ' + config.title + ': HTTP ' + response.status, 'error');
                     return;
@@ -3757,44 +3021,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     return;
                 }}
 
-                // Cache the fetched data for instant recoloring
-                layerDataCache[dataType] = data;
-
-                // Store adaptive values and update color scale inputs (with dataType for caching)
-                updateColorScaleInputs(data.min_val, data.max_val, dataType);
-
-                // Render from cached data
-                renderFromData(dataType, data, config);
-
-                // Hide loading overlay
-                if (config.loadingId) {{
-                    const loadingEl = document.getElementById(config.loadingId);
-                    if (loadingEl) loadingEl.classList.add('hidden');
-                }}
-
-                logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
-
-            }} catch (e) {{
-                console.error(e);
-                logConsole('Error loading ' + config.title + ': ' + e.message, 'error');
-                // Hide loading overlay on error too
-                if (config.loadingId) {{
-                    const loadingEl = document.getElementById(config.loadingId);
-                    if (loadingEl) loadingEl.classList.add('hidden');
-                }}
-            }}
-        }}
-
-        // Render visualization from data object (no network request)
-        // Used both by renderLayerSurfaces (after fetch) and recolorFromCache (instant)
-        function renderFromData(dataType, data, config) {{
-                // Use manual values if set, otherwise use adaptive from data
-                const minVal = manualColorMin !== null ? manualColorMin : data.min_val;
-                const maxVal = manualColorMax !== null ? manualColorMax : data.max_val;
-                const valueRange = maxVal - minVal || 1;
-
+                // Create mesh3d traces for each layer
                 const traces = [];
                 const allX = [], allY = [], allZ = [];
+                const minVal = data.min_val;
+                const maxVal = data.max_val;
+                const valueRange = maxVal - minVal || 1;
+
                 const layerValues = [];
 
                 data.layers.forEach((layerData) => {{
@@ -3820,15 +3053,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     const j = faces.map(f => f[1]);
                     const k = faces.map(f => f[2]);
 
-                    // Guard against division by zero when all values are identical
-                    let normalizedValue;
-                    if (valueRange === 0) {{
-                        normalizedValue = 0.5;  // Middle of scale when all values equal
-                    }} else {{
-                        normalizedValue = (value - minVal) / valueRange;
-                        // Clamp to [0, 1] when using manual color scale
-                        normalizedValue = Math.max(0, Math.min(1, normalizedValue));
-                    }}
+                    const normalizedValue = (value - minVal) / valueRange;
 
                     // Get color based on data type
                     let color;
@@ -3836,34 +3061,37 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         // Regions: use categorical color from backend
                         color = layerData.color || '#888';
                     }} else if (dataType === 'risk') {{
-                        // Risk uses categorical colors: LOW=green, MEDIUM=yellow, HIGH=red
+                        // Energy risk: LOW=green, MEDIUM=yellow, HIGH=red
                         if (value >= 2) color = '#f87171';  // HIGH - red
                         else if (value >= 1) color = '#fbbf24';  // MEDIUM - yellow
                         else color = '#4ade80';  // LOW - green
-                    }} else if (dataType === 'area_ratio') {{
-                        // Area ratio: Inverted Jet (red=low, blue=high)
-                        const iv = 1.0 - normalizedValue;  // Invert so red=min, blue=max
-                        let r, g, b;
-                        if (iv < 0.125) {{
-                            const t = iv / 0.125;
-                            r = 0; g = 0; b = Math.round(128 + t * 127);
-                        }} else if (iv < 0.375) {{
-                            const t = (iv - 0.125) / 0.25;
-                            r = 0; g = Math.round(t * 255); b = 255;
-                        }} else if (iv < 0.625) {{
-                            const t = (iv - 0.375) / 0.25;
-                            r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
-                        }} else if (iv < 0.875) {{
-                            const t = (iv - 0.625) / 0.25;
-                            r = 255; g = Math.round(255 * (1 - t)); b = 0;
+                    }} else if (dataType === 'thermal_risk') {{
+                        // Thermal risk: SAFE=green, WARNING=yellow, CRITICAL=red
+                        if (value >= 2) color = '#f87171';  // CRITICAL - red
+                        else if (value >= 1) color = '#fbbf24';  // WARNING - yellow
+                        else color = '#4ade80';  // SAFE - green
+                    }} else if (dataType === 'temperature') {{
+                        // Temperature: blue (cold/preheat) → cyan → yellow → orange → red (melting)
+                        if (normalizedValue < 0.25) {{
+                            // Blue → Cyan
+                            const t = normalizedValue / 0.25;
+                            color = `rgb(0, ${{Math.round(100 + t * 155)}}, ${{Math.round(200 - t * 50)}})`;
+                        }} else if (normalizedValue < 0.5) {{
+                            // Cyan → Yellow
+                            const t = (normalizedValue - 0.25) / 0.25;
+                            color = `rgb(${{Math.round(t * 251)}}, ${{Math.round(255 - t * 51)}}, ${{Math.round(150 - t * 150)}})`;
+                        }} else if (normalizedValue < 0.75) {{
+                            // Yellow → Orange
+                            const t = (normalizedValue - 0.5) / 0.25;
+                            color = `rgb(251, ${{Math.round(204 - t * 100)}}, 0)`;
                         }} else {{
-                            const t = (iv - 0.875) / 0.125;
-                            r = Math.round(255 - t * 127); g = 0; b = 0;
+                            // Orange → Red
+                            const t = (normalizedValue - 0.75) / 0.25;
+                            color = `rgb(${{Math.round(251 - t * 10)}}, ${{Math.round(104 - t * 104)}}, 0)`;
                         }}
-                        color = `rgb(${{r}}, ${{g}}, ${{b}})`;
-                    }} else if (dataType === 'gaussian_factor') {{
-                        // Gaussian: keep old green-red scale
-                        const rv = 1.0 - normalizedValue;
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
+                        // Geometry factors: REVERSED - high=green (good), low=red (bad)
+                        const rv = 1.0 - normalizedValue;  // Reverse: 0→1, 1→0
                         if (rv < 0.3) {{
                             const t = rv / 0.3;
                             color = `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
@@ -3875,33 +3103,27 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                             color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
                         }}
                     }} else {{
-                        // Energy: Jet colormap (blue → cyan → green → yellow → red)
-                        let r, g, b;
-                        if (normalizedValue < 0.125) {{
-                            const t = normalizedValue / 0.125;
-                            r = 0; g = 0; b = Math.round(128 + t * 127);
-                        }} else if (normalizedValue < 0.375) {{
-                            const t = (normalizedValue - 0.125) / 0.25;
-                            r = 0; g = Math.round(t * 255); b = 255;
-                        }} else if (normalizedValue < 0.625) {{
-                            const t = (normalizedValue - 0.375) / 0.25;
-                            r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
-                        }} else if (normalizedValue < 0.875) {{
-                            const t = (normalizedValue - 0.625) / 0.25;
-                            r = 255; g = Math.round(255 * (1 - t)); b = 0;
+                        // Energy: green=low, red=high
+                        if (normalizedValue < 0.3) {{
+                            // Green range
+                            const t = normalizedValue / 0.3;
+                            color = `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`;
+                        }} else if (normalizedValue < 0.6) {{
+                            // Yellow range
+                            const t = (normalizedValue - 0.3) / 0.3;
+                            color = `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189 - t * 0)}}, ${{Math.round(36 - t * 0)}})`;
                         }} else {{
-                            const t = (normalizedValue - 0.875) / 0.125;
-                            r = Math.round(255 - t * 127); g = 0; b = 0;
+                            // Red range
+                            const t = (normalizedValue - 0.6) / 0.4;
+                            color = `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`;
                         }}
-                        color = `rgb(${{r}}, ${{g}}, ${{b}})`;
                     }}
 
                     let hoverText;
                     if (dataType === 'regions') {{
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Region: ' + value + ' / ' + (layerData.n_regions || '?') + '<extra></extra>';
-                    }} else if (dataType === 'energy') {{
-                        // Energy: show Joules with 2 decimal places
-                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>Energy: ' + (typeof value === 'number' ? value.toFixed(2) : value) + ' J<extra></extra>';
+                    }} else if (dataType === 'temperature') {{
+                        hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>T_peak: ' + (typeof value === 'number' ? value.toFixed(1) : value) + ' °C<extra></extra>';
                     }} else {{
                         hoverText = 'Layer ' + layer + '<br>Z: ' + z.toFixed(2) + ' mm<br>' + data.value_label + ': ' + (typeof value === 'number' ? value.toFixed(3) : value) + '<extra></extra>';
                     }}
@@ -3925,39 +3147,23 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 }});
 
                 if (traces.length === 0) {{
+                    logConsole('No valid layer geometry to display', 'warning');
                     return;
                 }}
 
                 // Add colorbar via invisible scatter3d trace (skip for categorical regions)
                 if (dataType !== 'regions') {{
                     let colorscale;
-                    if (dataType === 'risk') {{
+                    if (dataType === 'risk' || dataType === 'thermal_risk') {{
                         colorscale = [[0, '#4ade80'], [0.5, '#fbbf24'], [1.0, '#f87171']];
-                    }} else if (dataType === 'area_ratio') {{
-                        // Inverted Jet: red at min (bad), blue at max (good)
-                        colorscale = [
-                            [0.0, '#7F0000'],    // Dark red
-                            [0.125, '#FF0000'],  // Red
-                            [0.375, '#FFFF00'],  // Yellow
-                            [0.5, '#00FF00'],    // Green
-                            [0.625, '#00FFFF'],  // Cyan
-                            [0.875, '#0000FF'],  // Blue
-                            [1.0, '#00007F']     // Dark blue
-                        ];
-                    }} else if (dataType === 'gaussian_factor') {{
-                        // Gaussian: keep old green-red scale
+                    }} else if (dataType === 'temperature') {{
+                        // Thermal colorscale: blue (cold) → cyan → yellow → orange → red (hot)
+                        colorscale = [[0, '#0064c8'], [0.25, '#00c8c8'], [0.5, '#fbfd00'], [0.75, '#fb6800'], [1.0, '#f80000']];
+                    }} else if (dataType === 'area_ratio' || dataType === 'gaussian_factor') {{
+                        // Reversed: red at 0 (bad), green at 1 (good)
                         colorscale = [[0, '#f87171'], [0.4, '#fbbd24'], [0.7, '#b5bd24'], [1.0, '#4ade80']];
                     }} else {{
-                        // Energy: Jet colorscale (blue → cyan → green → yellow → red)
-                        colorscale = [
-                            [0.0, '#00007F'],    // Dark blue
-                            [0.125, '#0000FF'],  // Blue
-                            [0.375, '#00FFFF'],  // Cyan
-                            [0.5, '#00FF00'],    // Green
-                            [0.625, '#FFFF00'],  // Yellow
-                            [0.875, '#FF0000'],  // Red
-                            [1.0, '#7F0000']     // Dark red
-                        ];
+                        colorscale = [[0, '#4ade80'], [0.3, '#b5bd24'], [0.6, '#fbbd24'], [1.0, '#f87171']];
                     }}
 
                     const colorbarTrace = {{
@@ -4035,6 +3241,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                         Plotly.Plots.resize(plotEl);
                     }}
                 }}, 100);
+
+                logConsole(config.title + ' loaded: ' + data.n_valid_layers + ' layers', 'success');
+
+            }} catch (e) {{
+                console.error(e);
+                logConsole('Error loading ' + config.title + ': ' + e.message, 'error');
+            }}
         }}
 
         // Global storage for slice visualization data (to update kernels without re-fetching)
@@ -4042,29 +3255,20 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Render sliced layers with kernel visualization
         async function renderSlicesPlot() {{
-            const sessionId = currentSessionId || sliceSessionId;
-            if (!sessionId) return;
-
-            // Show loading overlay, hide placeholder
-            const slicesLoading = document.getElementById('slicesLoading');
-            const slicesPlaceholder = document.getElementById('slicesPlaceholder');
-            if (slicesLoading) slicesLoading.classList.remove('hidden');
-            if (slicesPlaceholder) slicesPlaceholder.style.display = 'none';
+            if (!currentSessionId) return;
 
             logConsole('Loading sliced layers visualization...', 'info');
 
             try {{
-                const response = await fetch('/api/slice_visualization/' + sessionId);
+                const response = await fetch('/api/slice_visualization/' + currentSessionId);
                 if (!response.ok) {{
                     logConsole('Failed to load slices: HTTP ' + response.status, 'error');
-                    if (slicesLoading) slicesLoading.classList.add('hidden');
                     return;
                 }}
 
                 const data = await response.json();
                 if (data.status !== 'success') {{
                     logConsole('Slices error: ' + (data.message || 'Unknown'), 'error');
-                    if (slicesLoading) slicesLoading.classList.add('hidden');
                     return;
                 }}
 
@@ -4074,15 +3278,11 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 // Actually render the plot
                 updateSlicesPlotWithKernels();
 
-                // Hide loading overlay
-                if (slicesLoading) slicesLoading.classList.add('hidden');
-
                 logConsole('Sliced layers loaded: ' + data.n_valid_layers + ' layers', 'success');
 
             }} catch (e) {{
                 console.error(e);
                 logConsole('Error loading slices: ' + e.message, 'error');
-                if (slicesLoading) slicesLoading.classList.add('hidden');
             }}
         }}
 
@@ -4399,45 +3599,81 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             const r = analysisResults;
             const s = r.summary;
             const p = r.params_used;
+            const resultMode = r.mode || 'energy';
 
-            // Calculate max energy density for display
-            const densityScores = r.energy_density_scores || {{}};
-            const densityValues = Object.values(densityScores);
-            const maxDensity = densityValues.length > 0 ? Math.max(...densityValues) : 0;
-            const meanDensity = densityValues.length > 0 ? densityValues.reduce((a, b) => a + b, 0) / densityValues.length : 0;
-
-            document.getElementById('summaryContent').innerHTML = `
-                <div class="summary-card">
-                    <h4>Analysis Results (Density-Based)</h4>
-                    <div class="summary-stat"><span class="label">Total Layers</span><span class="value">${{s.n_layers}}</span></div>
-                    <div class="summary-stat"><span class="label">Max Risk Score</span><span class="value">${{s.max_risk_score.toFixed(3)}}</span></div>
-                    <div class="summary-stat"><span class="label">Max Risk Layer</span><span class="value">${{s.max_risk_layer}}</span></div>
-                    <div class="summary-stat"><span class="label">Max Density</span><span class="value">${{maxDensity.toFixed(4)}} J/mm²</span></div>
-                    <div class="summary-stat"><span class="label">Mean Density</span><span class="value">${{meanDensity.toFixed(4)}} J/mm²</span></div>
-                </div>
-                <div class="summary-card">
-                    <h4>Risk Distribution</h4>
-                    <div class="summary-stat"><span class="label" style="color: var(--success)">LOW</span><span class="value">${{s.n_low}} layers</span></div>
-                    <div class="summary-stat"><span class="label" style="color: var(--warning)">MEDIUM</span><span class="value">${{s.n_medium}} layers</span></div>
-                    <div class="summary-stat"><span class="label" style="color: var(--danger)">HIGH</span><span class="value">${{s.n_high}} layers</span></div>
-                </div>
-                <div class="summary-card">
-                    <h4>Parameters Used</h4>
-                    <div class="summary-stat"><span class="label">Mode</span><span class="value">${{p.mode}}</span></div>
-                    <div class="summary-stat"><span class="label">Build Direction</span><span class="value">${{p.build_direction || 'Z'}}-up</span></div>
-                    <div class="summary-stat"><span class="label">Voxel Size</span><span class="value">${{p.voxel_size}} mm</span></div>
-                    <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
-                    <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
-                    <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
-                    ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 1.0) + '</span></div>' : '<div class="summary-stat"><span class="label">Gaussian Ratio Power</span><span class="value">' + (p.gaussian_ratio_power || 0.15) + '</span></div>'}}
-                </div>
-                <div class="summary-card">
-                    <h4>Thresholds</h4>
-                    <div class="summary-stat"><span class="label">Medium</span><span class="value">${{p.threshold_medium}}</span></div>
-                    <div class="summary-stat"><span class="label">High</span><span class="value">${{p.threshold_high}}</span></div>
-                    <div class="summary-stat"><span class="label">Computation Time</span><span class="value">${{r.computation_time_seconds.toFixed(1)}} s</span></div>
-                </div>
-            `;
+            if (resultMode === 'thermal') {{
+                document.getElementById('summaryContent').innerHTML = `
+                    <div class="summary-card">
+                        <h4>Thermal Analysis Results</h4>
+                        <div class="summary-stat"><span class="label">Total Layers</span><span class="value">${{s.n_layers}}</span></div>
+                        <div class="summary-stat"><span class="label">Material</span><span class="value">${{s.material}}</span></div>
+                        <div class="summary-stat"><span class="label">Max Temperature</span><span class="value">${{typeof s.max_temperature === 'number' ? s.max_temperature.toFixed(1) : s.max_temperature}} °C</span></div>
+                        <div class="summary-stat"><span class="label">Max Temp Layer</span><span class="value">${{s.max_temp_layer}}</span></div>
+                        <div class="summary-stat"><span class="label">Melting Point</span><span class="value">${{s.melting_point}} °C</span></div>
+                        <div class="summary-stat"><span class="label">Melting Events</span><span class="value">${{s.n_melting_events}}</span></div>
+                        <div class="summary-stat"><span class="label">Total Energy In</span><span class="value">${{typeof s.total_E_in_J === 'number' ? s.total_E_in_J.toFixed(2) : 0}} J</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Thermal Risk Distribution</h4>
+                        <div class="summary-stat"><span class="label" style="color: var(--success)">SAFE</span><span class="value">${{s.n_safe}} layers</span></div>
+                        <div class="summary-stat"><span class="label" style="color: var(--warning)">WARNING</span><span class="value">${{s.n_warning}} layers</span></div>
+                        <div class="summary-stat"><span class="label" style="color: var(--danger)">CRITICAL</span><span class="value">${{s.n_critical}} layers</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Process Parameters</h4>
+                        <div class="summary-stat"><span class="label">Material</span><span class="value">${{p.material}}</span></div>
+                        <div class="summary-stat"><span class="label">Laser Power</span><span class="value">${{p.laser_power}} W</span></div>
+                        <div class="summary-stat"><span class="label">Scan Velocity</span><span class="value">${{p.scan_velocity}} mm/s</span></div>
+                        <div class="summary-stat"><span class="label">Hatch Spacing</span><span class="value">${{p.hatch_spacing}} mm</span></div>
+                        <div class="summary-stat"><span class="label">Recoat Time</span><span class="value">${{p.recoat_time}} s</span></div>
+                        <div class="summary-stat"><span class="label">Scan Efficiency</span><span class="value">${{p.scan_efficiency}}</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Simulation Settings</h4>
+                        <div class="summary-stat"><span class="label">Build Direction</span><span class="value">${{p.build_direction || 'Z'}}-up</span></div>
+                        <div class="summary-stat"><span class="label">Voxel Size</span><span class="value">${{p.voxel_size}} mm</span></div>
+                        <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
+                        <div class="summary-stat"><span class="label">Preheat Temp</span><span class="value">${{p.preheat_temp}} °C</span></div>
+                        <div class="summary-stat"><span class="label">Convection Coeff.</span><span class="value">${{p.convection_coeff}} W/m²K</span></div>
+                        <div class="summary-stat"><span class="label">Substrate Influence</span><span class="value">${{p.substrate_influence}}</span></div>
+                        <div class="summary-stat"><span class="label">Warning Threshold</span><span class="value">${{p.warning_fraction}} × T_melt</span></div>
+                        <div class="summary-stat"><span class="label">Critical Threshold</span><span class="value">${{p.critical_fraction}} × T_melt</span></div>
+                        <div class="summary-stat"><span class="label">Computation Time</span><span class="value">${{r.computation_time_seconds.toFixed(1)}} s</span></div>
+                    </div>
+                `;
+            }} else {{
+                document.getElementById('summaryContent').innerHTML = `
+                    <div class="summary-card">
+                        <h4>Analysis Results</h4>
+                        <div class="summary-stat"><span class="label">Total Layers</span><span class="value">${{s.n_layers}}</span></div>
+                        <div class="summary-stat"><span class="label">Max Risk Score</span><span class="value">${{s.max_risk_score.toFixed(3)}}</span></div>
+                        <div class="summary-stat"><span class="label">Max Risk Layer</span><span class="value">${{s.max_risk_layer}}</span></div>
+                        <div class="summary-stat"><span class="label">Mean Risk Score</span><span class="value">${{s.mean_risk_score.toFixed(3)}}</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Risk Distribution</h4>
+                        <div class="summary-stat"><span class="label" style="color: var(--success)">LOW</span><span class="value">${{s.n_low}} layers</span></div>
+                        <div class="summary-stat"><span class="label" style="color: var(--warning)">MEDIUM</span><span class="value">${{s.n_medium}} layers</span></div>
+                        <div class="summary-stat"><span class="label" style="color: var(--danger)">HIGH</span><span class="value">${{s.n_high}} layers</span></div>
+                    </div>
+                    <div class="summary-card">
+                        <h4>Parameters Used</h4>
+                        <div class="summary-stat"><span class="label">Mode</span><span class="value">${{p.mode}}</span></div>
+                        <div class="summary-stat"><span class="label">Build Direction</span><span class="value">${{p.build_direction || 'Z'}}-up</span></div>
+                        <div class="summary-stat"><span class="label">Voxel Size</span><span class="value">${{p.voxel_size}} mm</span></div>
+                        <div class="summary-stat"><span class="label">Layer Grouping</span><span class="value">${{p.layer_grouping}}x (${{p.effective_layer_thickness.toFixed(3)}} mm)</span></div>
+                        <div class="summary-stat"><span class="label">Dissipation Factor</span><span class="value">${{p.dissipation_factor}}</span></div>
+                        <div class="summary-stat"><span class="label">Convection Factor</span><span class="value">${{p.convection_factor}}</span></div>
+                        ${{p.mode === 'area_only' ? '<div class="summary-stat"><span class="label">Area Ratio Power</span><span class="value">' + (p.area_ratio_power || 3.0) + '</span></div>' : '<div class="summary-stat"><span class="label">Gaussian Ratio Power</span><span class="value">' + (p.gaussian_ratio_power || 0.15) + '</span></div>'}}
+                    </div>
+                    <div class="summary-card">
+                        <h4>Thresholds</h4>
+                        <div class="summary-stat"><span class="label">Medium</span><span class="value">${{p.threshold_medium}}</span></div>
+                        <div class="summary-stat"><span class="label">High</span><span class="value">${{p.threshold_high}}</span></div>
+                        <div class="summary-stat"><span class="label">Computation Time</span><span class="value">${{r.computation_time_seconds.toFixed(1)}} s</span></div>
+                    </div>
+                `;
+            }}
         }}
 
         // Update layer visualization
@@ -4452,187 +3688,13 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             document.getElementById('markerSizeVal').textContent = size;
         }}
 
-        // Color scale control functions
-        function updateColorScaleMin(value) {{
-            const numVal = parseFloat(value);
-            if (!isNaN(numVal)) {{
-                manualColorMin = numVal;
-                updateColorScaleResetButton();
-                refreshCurrentVisualization();
-            }}
-        }}
-
-        function updateColorScaleMax(value) {{
-            const numVal = parseFloat(value);
-            if (!isNaN(numVal)) {{
-                manualColorMax = numVal;
-                updateColorScaleResetButton();
-                refreshCurrentVisualization();
-            }}
-        }}
-
-        function resetColorScale() {{
-            manualColorMin = null;
-            manualColorMax = null;
-            // Restore adaptive values to input fields
-            if (lastAdaptiveMin !== null) {{
-                document.getElementById('colorScaleMin').value = lastAdaptiveMin.toFixed(4);
-            }}
-            if (lastAdaptiveMax !== null) {{
-                document.getElementById('colorScaleMax').value = lastAdaptiveMax.toFixed(4);
-            }}
-            updateColorScaleResetButton();
-            refreshCurrentVisualization();
-        }}
-
-        function updateColorScaleResetButton() {{
-            const resetBtn = document.getElementById('colorScaleResetBtn');
-            if (resetBtn) {{
-                // Show button if either min or max is manually set
-                resetBtn.style.display = (manualColorMin !== null || manualColorMax !== null) ? 'block' : 'none';
-            }}
-        }}
-
-        function updateColorScaleInputs(minVal, maxVal, dataType) {{
-            // Store adaptive values for reset
-            lastAdaptiveMin = minVal;
-            lastAdaptiveMax = maxVal;
-
-            // Cache adaptive values per data type for instant tab switching
-            if (dataType) {{
-                tabAdaptiveRanges[dataType] = {{ min: minVal, max: maxVal }};
-            }}
-
-            // Update input fields with current effective values
-            const minInput = document.getElementById('colorScaleMin');
-            const maxInput = document.getElementById('colorScaleMax');
-            if (minInput) {{
-                minInput.value = (manualColorMin !== null ? manualColorMin : minVal).toFixed(4);
-            }}
-            if (maxInput) {{
-                maxInput.value = (manualColorMax !== null ? manualColorMax : maxVal).toFixed(4);
-            }}
-        }}
-
-        // Compute color for a single layer value given dataType, minVal, maxVal
-        function computeLayerColor(dataType, value, minVal, maxVal) {{
-            const valueRange = maxVal - minVal || 1;
-            let normalizedValue;
-            if (valueRange === 0) {{
-                normalizedValue = 0.5;
-            }} else {{
-                normalizedValue = (value - minVal) / valueRange;
-                normalizedValue = Math.max(0, Math.min(1, normalizedValue));
-            }}
-
-            if (dataType === 'risk') {{
-                if (value >= 2) return '#f87171';
-                else if (value >= 1) return '#fbbf24';
-                else return '#4ade80';
-            }} else if (dataType === 'area_ratio') {{
-                // Inverted Jet: red=low, blue=high
-                const iv = 1.0 - normalizedValue;
-                let r, g, b;
-                if (iv < 0.125) {{ const t = iv / 0.125; r = 0; g = 0; b = Math.round(128 + t * 127); }}
-                else if (iv < 0.375) {{ const t = (iv - 0.125) / 0.25; r = 0; g = Math.round(t * 255); b = 255; }}
-                else if (iv < 0.625) {{ const t = (iv - 0.375) / 0.25; r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t)); }}
-                else if (iv < 0.875) {{ const t = (iv - 0.625) / 0.25; r = 255; g = Math.round(255 * (1 - t)); b = 0; }}
-                else {{ const t = (iv - 0.875) / 0.125; r = Math.round(255 - t * 127); g = 0; b = 0; }}
-                return `rgb(${{r}}, ${{g}}, ${{b}})`;
-            }} else if (dataType === 'gaussian_factor') {{
-                const rv = 1.0 - normalizedValue;
-                if (rv < 0.3) {{ const t = rv / 0.3; return `rgb(${{Math.round(74 + t * 107)}}, ${{Math.round(222 - t * 33)}}, ${{Math.round(128 - t * 92)}})`; }}
-                else if (rv < 0.6) {{ const t = (rv - 0.3) / 0.3; return `rgb(${{Math.round(181 + t * 70)}}, ${{Math.round(189)}}, ${{Math.round(36)}})`; }}
-                else {{ const t = (rv - 0.6) / 0.4; return `rgb(${{Math.round(251 - t * 3)}}, ${{Math.round(189 - t * 76)}}, ${{Math.round(36 + t * 77)}})`; }}
-            }} else {{
-                let r, g, b;
-                if (normalizedValue < 0.125) {{
-                    const t = normalizedValue / 0.125;
-                    r = 0; g = 0; b = Math.round(128 + t * 127);
-                }} else if (normalizedValue < 0.375) {{
-                    const t = (normalizedValue - 0.125) / 0.25;
-                    r = 0; g = Math.round(t * 255); b = 255;
-                }} else if (normalizedValue < 0.625) {{
-                    const t = (normalizedValue - 0.375) / 0.25;
-                    r = Math.round(t * 255); g = 255; b = Math.round(255 * (1 - t));
-                }} else if (normalizedValue < 0.875) {{
-                    const t = (normalizedValue - 0.625) / 0.25;
-                    r = 255; g = Math.round(255 * (1 - t)); b = 0;
-                }} else {{
-                    const t = (normalizedValue - 0.875) / 0.125;
-                    r = Math.round(255 - t * 127); g = 0; b = 0;
-                }}
-                return `rgb(${{r}}, ${{g}}, ${{b}})`;
-            }}
-        }}
-
-        function refreshCurrentVisualization() {{
-            // Find the currently active tab and refresh its visualization
-            const activePanel = document.querySelector('.tab-panel.active');
-            if (!activePanel) return;
-
-            const tabId = activePanel.id.replace('tab-', '');
-            const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian'];
-            if (!colorScaleTabs.includes(tabId)) return;
-
-            const dataType = tabId === 'gaussian' ? 'gaussian_factor' : tabId;
-            const cachedData = layerDataCache[dataType];
-
-            if (!cachedData) {{
-                // No cache: full fetch
-                renderLayerSurfaces(dataType);
-                return;
-            }}
-
-            // Fast path: use Plotly.restyle() to update only colors (no geometry rebuild)
-            const plotIdMap = {{
-                'energy': 'energyPlot',
-                'density': 'densityPlot',
-                'risk': 'riskPlot',
-                'area_ratio': 'areaRatioPlot',
-                'gaussian_factor': 'gaussianPlot'
-            }};
-            const plotId = plotIdMap[dataType];
-            const plotEl = document.getElementById(plotId);
-
-            // Check that plot exists and has traces
-            if (!plotEl || !plotEl.data || plotEl.data.length === 0) {{
-                // Plot not initialized yet, do full render from cache
-                const plotConfigMap = {{
-                    'energy': {{ plotId: 'energyPlot', title: 'Energy Accumulation (3D)', loadingId: 'energyLoading', placeholderId: null }},
-                    'density': {{ plotId: 'densityPlot', title: 'Energy Density (J/mm²)', loadingId: 'densityLoading', placeholderId: null }},
-                    'risk': {{ plotId: 'riskPlot', title: 'Risk Classification (3D)', loadingId: 'riskLoading', placeholderId: null }},
-                    'area_ratio': {{ plotId: 'areaRatioPlot', title: 'Area Ratio (A_below / A_region)', loadingId: 'areaRatioLoading', placeholderId: null }},
-                    'gaussian_factor': {{ plotId: 'gaussianPlot', title: 'Gaussian Multiplier 1/(1+G)', loadingId: 'gaussianLoading', placeholderId: null }}
-                }};
-                renderFromData(dataType, cachedData, plotConfigMap[dataType]);
-                return;
-            }}
-
-            const minVal = manualColorMin !== null ? manualColorMin : cachedData.min_val;
-            const maxVal = manualColorMax !== null ? manualColorMax : cachedData.max_val;
-
-            // Count valid layer traces (skip empty layers and the colorbar trace at the end)
-            const validLayers = cachedData.layers.filter(l => l.vertices && l.vertices.length > 0);
-
-            // Batch all color updates into a single Plotly.restyle call (much faster than per-trace)
-            const newColors = validLayers.map(l => computeLayerColor(dataType, l.value, minVal, maxVal));
-            const traceIndices = validLayers.map((_, i) => i);
-            Plotly.restyle(plotId, {{ color: newColors }}, traceIndices);
-
-            // Update the colorbar trace (last trace, after all mesh3d traces)
-            const colorbarIdx = validLayers.length;
-            if (plotEl.data[colorbarIdx] && plotEl.data[colorbarIdx].type === 'scatter3d') {{
-                Plotly.restyle(plotId, {{ 'marker.cmin': minVal, 'marker.cmax': maxVal }}, [colorbarIdx]);
-            }}
-        }}
-
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {{
-            logConsole('Auto-loading Test STL 4...', 'info');
+            logConsole('Ready - Load an STL file or use "Load Test STL"', 'info');
             updateModelVisibility();
-            // Auto-load Test STL 4 by default
-            loadTestSTL(4);
+            // Restore saved mode preference
+            const savedMode = localStorage.getItem('oc_mode') || 'energy';
+            setMode(savedMode);
         }});
     </script>
 </body>
