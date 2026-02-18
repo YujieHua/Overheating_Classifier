@@ -122,6 +122,7 @@ def simulate_thermal_evolution(
     layer_grouping: int,
     voxel_size: float,       # mm
     layer_thickness: float,  # mm (single physical layer)
+    snapshot_interval: float = 2.5,  # s — time between stored snapshots
     progress_callback: Optional[Callable[[float], None]] = None,
 ) -> Dict:
     """
@@ -132,6 +133,7 @@ def simulate_thermal_evolution(
       2. Add laser energy input.
       3. Time-step until recoat time expires (conduction + convection cooling).
       4. Store peak and final temperatures.
+      5. Store time-stepped snapshots for playback visualization.
 
     Parameters
     ----------
@@ -157,18 +159,26 @@ def simulate_thermal_evolution(
         Voxel size in mm
     layer_thickness : float
         Single physical layer thickness in mm
+    snapshot_interval : float
+        Time between stored snapshots in seconds (default 2.5 s)
     progress_callback : callable, optional
         Called with fraction complete [0, 1] after each layer
 
     Returns
     -------
     dict with keys:
-        temperature_per_layer : {layer: {rid: T_peak_°C}}
-        temperature_end       : {layer: {rid: T_end_°C}}
-        energy_conservation   : {total_E_in, total_E_dissipated, final_E_stored}
-        layer_times           : {layer: total_time_s}
-        scan_times            : {layer: scan_time_s}
-        melting_detected      : [(layer, rid), …]
+        temperature_per_layer  : {layer: {rid: T_peak_°C}}
+        temperature_end        : {layer: {rid: T_end_°C}}
+        energy_conservation    : {total_E_in, total_E_dissipated, final_E_stored}
+        layer_times            : {layer: total_time_s}
+        scan_times             : {layer: scan_time_s}
+        melting_detected       : [(layer, rid), …]
+        temperature            : {viewing_layer: {t_snap: {actual_layer: max_T}}}
+        temperature_regions    : {viewing_layer: {t_snap: {actual_layer: {rid: T}}}}
+        heat_flow              : {viewing_layer: {t_snap: {actual_layer: Q_down_W}}}
+        cumulative_heat        : {viewing_layer: {t_snap: {actual_layer: cum_J}}}
+        contact_areas          : {layer: area_mm2}
+        time_steps             : [t0, t1, …]
     """
     # ------------------------------------------------------------------
     # Material & process constants
@@ -226,6 +236,30 @@ def simulate_thermal_evolution(
         layer_times[layer] = t_scan + t_recoat
 
     # ------------------------------------------------------------------
+    # Snapshot time steps (shared across all layers for consistent UI slider)
+    # ------------------------------------------------------------------
+    max_layer_time = max(layer_times.values()) if layer_times else snapshot_interval
+    n_snaps = max(1, int(math.ceil(max_layer_time / snapshot_interval)))
+    local_time_steps = [round(i * snapshot_interval, 2) for i in range(n_snaps + 1)]
+    if local_time_steps[-1] < max_layer_time:
+        local_time_steps.append(round(max_layer_time, 2))
+
+    logger.info(
+        f"Snapshots: {len(local_time_steps)} per layer, "
+        f"interval={snapshot_interval}s, max_time={max_layer_time:.2f}s"
+    )
+
+    # ------------------------------------------------------------------
+    # Scan / contact areas per layer (mm² — used by evolution graphs)
+    # ------------------------------------------------------------------
+    contact_areas: Dict[int, float] = {}
+    for layer in sorted(regions_per_layer.keys()):
+        A_total = sum(
+            r['area_mm2'] for r in regions_per_layer[layer]['regions'].values()
+        )
+        contact_areas[layer] = A_total
+
+    # ------------------------------------------------------------------
     # State: E_region[(layer, rid)] = excess energy [J] above T_powder
     #        E=0 → T = T_powder
     # ------------------------------------------------------------------
@@ -247,10 +281,68 @@ def simulate_thermal_evolution(
     total_E_in = 0.0
     total_E_dissipated = 0.0  # estimated from convection + build-plate conduction
 
+    # Snapshot storage (mirrors predictor's data structures for API compatibility)
+    # temperature[viewing_layer][t_snap] = {actual_layer: max_T}
+    temperature_snaps: Dict[int, Dict[float, Dict[int, float]]] = {}
+    # temperature_regions[viewing_layer][t_snap] = {actual_layer: {rid: T}}
+    temperature_regions_snaps: Dict[int, Dict[float, Dict[int, Dict[int, float]]]] = {}
+    # heat_flow[viewing_layer][t_snap] = {actual_layer: Q_down_W}
+    heat_flow_snaps: Dict[int, Dict[float, Dict[int, float]]] = {}
+    # cumulative_heat[viewing_layer][t_snap] = {actual_layer: cum_J}
+    cumulative_heat_snaps: Dict[int, Dict[float, Dict[int, float]]] = {}
+
+    # Per-layer cumulative heat dissipated (running totals, reset each layer processing)
+    # We accumulate per-layer Q_net dissipated during each viewing_layer's cooling phase
+    # cum_heat[actual_layer] = cumulative J dissipated during current viewing_layer's cooling
+    cum_heat_for_layer: Dict[int, float] = {}
+
     # ------------------------------------------------------------------
     # Main loop — process one grouped layer at a time
     # ------------------------------------------------------------------
     layers_sorted = sorted(regions_per_layer.keys())
+
+    def store_snapshot(viewing_layer: int, t_snap: float, active_layers: list) -> None:
+        """Capture temperature & heat-flow snapshot for all active layers."""
+        ts = temperature_snaps.setdefault(viewing_layer, {})
+        tr = temperature_regions_snaps.setdefault(viewing_layer, {})
+        hf = heat_flow_snaps.setdefault(viewing_layer, {})
+        ch = cumulative_heat_snaps.setdefault(viewing_layer, {})
+
+        ts[t_snap] = {}
+        tr[t_snap] = {}
+        hf[t_snap] = {}
+        ch[t_snap] = {}
+
+        for al in active_layers:
+            rids_al = list(regions_per_layer[al]['regions'].keys())
+            # Per-region temperatures
+            region_temps_al = {rid: get_temp(al, rid) for rid in rids_al}
+            max_t = max(region_temps_al.values()) if region_temps_al else T_powder
+
+            ts[t_snap][al] = max_t
+            tr[t_snap][al] = region_temps_al
+
+            # Instantaneous downward heat flow (from this layer to below)
+            q_total = 0.0
+            for rid in rids_al:
+                key = (al, rid)
+                E_curr = E_region.get(key, 0.0)
+                m = region_mass[key]
+                T_curr = T_powder + E_curr / (m * cp)
+                for c in conn_below_lookup.get(key, []):
+                    if al == 1:
+                        T_lower = T_powder
+                    else:
+                        lower_key = (al - 1, c['lower_region'])
+                        E_lower = E_region.get(lower_key, 0.0)
+                        m_lower = region_mass.get(lower_key, MIN_MASS_KG)
+                        T_lower = T_powder + E_lower / (m_lower * cp)
+                    A_m2 = c['overlap_area_mm2'] / 1e6
+                    q_total += k * A_m2 * (T_curr - T_lower) / dz_eff
+            hf[t_snap][al] = q_total
+
+            # Cumulative heat dissipated for this layer so far
+            ch[t_snap][al] = cum_heat_for_layer.get(al, 0.0)
 
     for layer_idx, layer in enumerate(layers_sorted):
         rids = list(regions_per_layer[layer]['regions'].keys())
@@ -275,7 +367,7 @@ def simulate_thermal_evolution(
             E_region[(layer, rid)] = E_initial + E_laser
             total_E_in += E_laser
 
-        # ---- 2. Store peak snapshot (immediately after laser) ----
+        # ---- 2. Store peak snapshot (immediately after laser, t=0) ----
         temperature_per_layer[layer] = {}
         for rid in rids:
             T_peak = get_temp(layer, rid)
@@ -297,10 +389,31 @@ def simulate_thermal_evolution(
 
         active_layers = layers_sorted[: layer_idx + 1]  # layers 1..current
 
+        # Reset cumulative heat counters for snapshot tracking
+        cum_heat_for_layer.update({al: 0.0 for al in active_layers})
+
+        # Store t=0 snapshot (immediately after laser)
+        temperature_snaps.setdefault(layer, {})
+        temperature_regions_snaps.setdefault(layer, {})
+        heat_flow_snaps.setdefault(layer, {})
+        cumulative_heat_snaps.setdefault(layer, {})
+        store_snapshot(layer, 0.0, active_layers)
+
+        # Snapshot schedule — clipped to this layer's actual total_time
+        layer_snap_times = [t for t in local_time_steps if t <= total_time + 1e-9]
+        if not layer_snap_times or layer_snap_times[-1] < total_time - 1e-9:
+            layer_snap_times.append(round(total_time, 2))
+        # Remove t=0 (already stored); we'll step through the rest
+        next_snap_idx = 1  # index into layer_snap_times
+
+        t_local = 0.0  # elapsed local time within this layer
+
         for _step in range(n_steps):
             new_E: Dict[Tuple[int, int], float] = {}
+            step_heat: Dict[int, float] = {}  # heat dissipated this step per layer
 
             for al in active_layers:
+                step_heat[al] = 0.0
                 for rid in regions_per_layer[al]['regions']:
                     key = (al, rid)
 
@@ -330,6 +443,7 @@ def simulate_thermal_evolution(
                         # Track energy lost to build plate for conservation
                         if al == 1 and Q_down > 0:
                             total_E_dissipated += Q_down * actual_dt
+                            step_heat[al] += Q_down * actual_dt
 
                     # ---- Conduction upward (to layer above) ----
                     for c in conn_above_lookup.get(key, []):
@@ -357,6 +471,7 @@ def simulate_thermal_evolution(
                         Q_conv = h_conv * A_exp * (T_curr - T_powder)
                         Q_net -= Q_conv
                         total_E_dissipated += Q_conv * actual_dt
+                        step_heat[al] += Q_conv * actual_dt
 
                     # ---- Energy update with safety clamp ----
                     dE = Q_net * actual_dt
@@ -382,6 +497,24 @@ def simulate_thermal_evolution(
                         eq_skip[key] = False
 
             E_region.update(new_E)
+
+            # Accumulate heat dissipated this step
+            for al in active_layers:
+                cum_heat_for_layer[al] = cum_heat_for_layer.get(al, 0.0) + step_heat.get(al, 0.0)
+
+            t_local += actual_dt
+
+            # ---- Take snapshot if we've reached the next target time ----
+            if next_snap_idx < len(layer_snap_times):
+                next_target = layer_snap_times[next_snap_idx]
+                if t_local >= next_target - actual_dt / 2:
+                    store_snapshot(layer, next_target, active_layers)
+                    next_snap_idx += 1
+
+        # Ensure we always store the final snapshot
+        final_t = layer_snap_times[-1]
+        if final_t not in temperature_snaps.get(layer, {}):
+            store_snapshot(layer, final_t, active_layers)
 
         # ---- 4. Store final (end-of-cooling) temperatures ----
         temperature_end[layer] = {}
@@ -435,6 +568,13 @@ def simulate_thermal_evolution(
         'layer_times': layer_times,
         'scan_times': scan_times,
         'melting_detected': melting_detected,
+        # Snapshot data for T Evolution playback
+        'temperature': temperature_snaps,
+        'temperature_regions': temperature_regions_snaps,
+        'heat_flow': heat_flow_snaps,
+        'cumulative_heat': cumulative_heat_snaps,
+        'contact_areas': contact_areas,
+        'time_steps': local_time_steps,
     }
 
 
@@ -493,6 +633,7 @@ def run_thermal_analysis(
     layer_grouping: int,
     voxel_size: float,
     layer_thickness: float,
+    snapshot_interval: float = 2.5,
     progress_callback: Optional[Callable[[float], None]] = None,
 ) -> Dict:
     """
@@ -530,6 +671,7 @@ def run_thermal_analysis(
         layer_grouping=layer_grouping,
         voxel_size=voxel_size,
         layer_thickness=layer_thickness,
+        snapshot_interval=snapshot_interval,
         progress_callback=progress_callback,
     )
 
