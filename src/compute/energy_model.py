@@ -16,18 +16,19 @@ from scipy import ndimage
 from typing import Dict, Optional, Union, Tuple
 import logging
 
-from .region_detect import detect_2d_regions
-
 logger = logging.getLogger(__name__)
 
 
-def _local_build_overlap_map(prev_labeled: np.ndarray, curr_labeled: np.ndarray):
-    """Build parent-child overlap maps between two labeled arrays.
+def _label_regions(mask: np.ndarray):
+    """Label connected regions (islands) in a 2D binary mask.
 
-    Local helper used by calculate_energy_accumulation(). Returns
-    (child_parents, parent_children) for per-layer parent-child tracking,
-    which differs from the full precomputed lookup in region_detect's
-    compute_cross_layer_connectivity().
+    Returns (labeled_array, n_regions).
+    """
+    return ndimage.label(mask > 0)
+
+
+def _build_overlap_map(prev_labeled: np.ndarray, curr_labeled: np.ndarray):
+    """Build parent-child overlap maps between two labeled arrays.
 
     Returns (child_parents, parent_children) where:
       child_parents[child_rid] = {parent_rid: overlap_count, ...}
@@ -67,12 +68,18 @@ def calculate_energy_accumulation(
     dissipation_factor: float = 0.5,
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
-    area_ratio_power: float = 3.0,
+    area_ratio_power: float = 1.0,
+    area_ratio_method: str = 'layer_scan',
     gaussian_ratio_power: float = 0.15,
+    laser_power: float = 200.0,
+    scan_speed: float = 800.0,
+    hatch_distance: float = 0.1,
+    layer_thickness: float = 0.03,
+    voxel_size: float = 0.1,
     progress_callback: Optional[callable] = None
-) -> Tuple[Dict[int, float], Dict]:
+) -> Tuple[Dict[int, float], Dict[int, float], Dict]:
     """
-    Calculate normalized energy accumulation per layer using region-aware tracking.
+    Calculate energy accumulation per layer in Joules using region-aware tracking.
 
     Each layer is decomposed into connected components (regions/islands).
     Energy is tracked per-region with proper split/merge handling.
@@ -91,30 +98,57 @@ def calculate_energy_accumulation(
     use_geometry_multiplier : bool
         If True, use Mode B (geometry multiplier). If False, use Mode A (area-only).
     area_ratio_power : float
-        Power exponent for area ratio in Mode A (1.0-3.0, default 3.0).
-        Higher values amplify sensitivity to contact area changes.
+        Power exponent for area ratio in Mode A (1.0-3.0, default 1.0).
+        Ratio = (prev layer scan area / curr layer scan area).
+        Higher values amplify sensitivity to layer area changes.
     gaussian_ratio_power : float
         Power exponent for Gaussian multiplier in Mode B (0.01-1.0, default 0.15).
         Values < 1 dampen the effect, bringing extreme values closer to 1.
+    laser_power : float
+        Laser power in Watts (W = J/s). Default 200W.
+    scan_speed : float
+        Scan speed in mm/s. Default 800 mm/s.
+    hatch_distance : float
+        Hatch distance in mm. Default 0.1 mm.
+    layer_thickness : float
+        Layer thickness in mm. Default 0.03 mm (30 microns).
+    voxel_size : float
+        Voxel size in mm. Default 0.1 mm.
     progress_callback : callable, optional
         Progress callback function(percent, message)
 
     Returns
     -------
-    tuple of (risk_scores, region_data)
+    tuple of (risk_scores, raw_energy_scores, region_data)
         risk_scores: dict mapping layer_number -> risk_score (0-1, normalized)
+        raw_energy_scores: dict mapping layer_number -> energy in Joules
         region_data: dict mapping layer_number -> region info for visualization
     """
     n_layers = len(masks)
     if n_layers == 0:
-        return {}, {}
+        return {}, {}, {}
+
+    # Validate laser parameters to prevent division by zero
+    if scan_speed <= 0:
+        raise ValueError(f"scan_speed must be positive, got {scan_speed}")
+    if hatch_distance <= 0:
+        raise ValueError(f"hatch_distance must be positive, got {hatch_distance}")
+    if layer_thickness <= 0:
+        raise ValueError(f"layer_thickness must be positive, got {layer_thickness}")
+
+    # Calculate Energy Density: ED = P / (v · h · Δz)  [J/mm³]
+    energy_density = laser_power / (scan_speed * hatch_distance * layer_thickness)
+    logger.info(f"Energy density: {energy_density:.2f} J/mm³ "
+                f"(P={laser_power}W, v={scan_speed}mm/s, h={hatch_distance}mm, Δz={layer_thickness}mm)")
 
     logger.info(f"Calculating region-aware energy accumulation for {n_layers} layers")
     logger.info(f"Parameters: dissipation_factor={dissipation_factor}, "
                 f"convection_factor={convection_factor}, "
                 f"use_geometry_multiplier={use_geometry_multiplier}, "
                 f"area_ratio_power={area_ratio_power}, "
-                f"gaussian_ratio_power={gaussian_ratio_power}")
+                f"gaussian_ratio_power={gaussian_ratio_power}, "
+                f"laser_power={laser_power}W, scan_speed={scan_speed}mm/s, "
+                f"hatch_distance={hatch_distance}mm")
 
     # Per-layer results
     E_layer_scores = {}  # layer -> raw energy (max across regions)
@@ -124,6 +158,7 @@ def calculate_energy_accumulation(
     prev_labeled = None
     prev_region_energies = {}    # rid -> energy
     prev_region_geo_factors = {} # rid -> geometry_factor (for empty layer decay)
+    prev_region_areas = {}       # rid -> area (voxels) of previous non-empty layer
 
     for n in range(1, n_layers + 1):
         if progress_callback and n % 50 == 0:
@@ -154,20 +189,22 @@ def calculate_energy_accumulation(
             logger.debug(f"Layer {n}: EMPTY, E={E_layer_scores[n]:.2f}")
             continue
 
-        # --- Label regions in current layer (8-connectivity) ---
-        curr_labeled, n_regions = detect_2d_regions(mask)
+        # --- Label regions in current layer ---
+        curr_labeled, n_regions = _label_regions(mask)
         logger.debug(f"Layer {n}: {n_regions} region(s)")
 
         # --- Build overlap map with previous layer ---
         if prev_labeled is not None:
-            child_parents, parent_children = _local_build_overlap_map(prev_labeled, curr_labeled)
+            child_parents, parent_children = _build_overlap_map(prev_labeled, curr_labeled)
         else:
             child_parents, parent_children = {}, {}
 
         # --- Per-region energy calculation ---
         curr_region_energies = {}
         curr_region_areas = {}
+        curr_region_contact_areas = {}
         curr_region_geo_factors = {}
+        curr_region_area_ratios = {}  # rid -> parent_area / region_area
 
         for rid in range(1, n_regions + 1):
             region_mask = (curr_labeled == rid)
@@ -190,8 +227,16 @@ def calculate_energy_accumulation(
                         fraction = overlap_count / parent_total_to_children
                         E_inherited += parent_energy * fraction
 
-            # 2. Energy input
-            E_in = float(A_region)
+            # 2. Energy input in Joules: E_in = ED × A_region_mm² × Δz
+            A_region_mm2 = A_region * (voxel_size ** 2)  # Convert voxels to mm²
+            E_in = energy_density * A_region_mm2 * layer_thickness  # Joules
+
+            # Compute contact area (overlap with previous layer) for every region
+            if prev_labeled is not None:
+                A_contact_region = int(np.sum(region_mask & (prev_labeled > 0)))
+            else:
+                A_contact_region = A_region  # First layer: full contact with baseplate
+            curr_region_contact_areas[rid] = A_contact_region
 
             # 3. Geometry factor (per-region)
             if n == 1:
@@ -211,16 +256,31 @@ def calculate_energy_accumulation(
                     G_avg = float(G_data)
                 geometry_factor = (1.0 / (1.0 + G_avg)) ** gaussian_ratio_power
             else:
-                # Mode A: (A_contact_region / A_region) ^ area_ratio_power
-                if prev_labeled is not None:
-                    A_contact_region = int(np.sum(region_mask & (prev_labeled > 0)))
+                # Mode A: area ratio based geometry factor
+                if area_ratio_method == 'contact':
+                    # Legacy: contact area / region area
+                    ratio = A_contact_region / A_region if A_region > 0 else 1.0
+                    ratio = min(ratio, 1.0)
                 else:
-                    A_contact_region = A_region
-                ratio = A_contact_region / A_region if A_region > 0 else 1.0
-                ratio = min(ratio, 1.0)
+                    # Default (layer_scan): parent scan areas / region area
+                    # Reduces bias towards ramps. Ratio can exceed 1.0.
+                    parent_total_area = sum(
+                        prev_region_areas.get(pid, 0) for pid in parents.keys()
+                    )
+                    ratio = parent_total_area / A_region if A_region > 0 else 1.0
                 geometry_factor = ratio ** area_ratio_power
 
             curr_region_geo_factors[rid] = geometry_factor
+
+            # Store area ratio for visualization
+            if n == 1:
+                curr_region_area_ratios[rid] = 1.0  # Baseplate = full support
+            elif not parents:
+                curr_region_area_ratios[rid] = 0.0  # Orphan = no support
+            elif not (use_geometry_multiplier and G_layers is not None and n in G_layers):
+                curr_region_area_ratios[rid] = ratio  # Mode A ratio
+            else:
+                curr_region_area_ratios[rid] = 1.0  # Mode B doesn't use area ratio
 
             # 4. Dissipation
             R_total = min(dissipation_factor * geometry_factor + convection_factor, 1.0)
@@ -242,12 +302,15 @@ def calculate_energy_accumulation(
             'labeled': curr_labeled,
             'region_energies': dict(curr_region_energies),
             'region_areas': dict(curr_region_areas),
+            'region_contact_areas': dict(curr_region_contact_areas),
+            'region_area_ratios': dict(curr_region_area_ratios),
         }
 
         # --- Update previous-layer state ---
         prev_labeled = curr_labeled
         prev_region_energies = curr_region_energies
         prev_region_geo_factors = curr_region_geo_factors
+        prev_region_areas = curr_region_areas
 
         logger.debug(f"Layer {n}: regions={n_regions}, "
                      f"E_max={E_layer_scores[n]:.2f}, "
@@ -261,10 +324,11 @@ def calculate_energy_accumulation(
         risk_scores = {n: 0.0 for n in range(1, n_layers + 1)}
         logger.warning("All energy dissipated - returning uniform zero risk scores")
 
-    logger.info(f"Energy accumulation complete. Max raw E={E_max:.2f}, "
+    logger.info(f"Energy accumulation complete. Max raw E={E_max:.2f} J, "
                 f"Max risk score={max(risk_scores.values()) if risk_scores else 0:.3f}")
 
-    return risk_scores, region_data
+    # Return both normalized risk_scores and raw energy in Joules
+    return risk_scores, E_layer_scores, region_data
 
 
 def classify_risk_levels(
@@ -323,6 +387,40 @@ def calculate_layer_areas(
         layer: np.sum(mask > 0) * (voxel_size ** 2)
         for layer, mask in masks.items()
     }
+
+
+def calculate_energy_density(
+    raw_energy_scores: Dict[int, float],
+    layer_areas: Dict[int, float]
+) -> Dict[int, float]:
+    """
+    Calculate energy density (J/mm²) for each layer.
+
+    Energy density is a more objective metric for overheating risk because
+    it normalizes by scan area, preventing larger layers from artificially
+    appearing as higher risk simply due to having more total energy.
+
+    Parameters
+    ----------
+    raw_energy_scores : dict
+        Maps layer_number -> accumulated energy in Joules
+    layer_areas : dict
+        Maps layer_number -> scan area in mm²
+
+    Returns
+    -------
+    dict
+        Maps layer_number -> energy density in J/mm²
+    """
+    energy_density = {}
+    for layer in raw_energy_scores:
+        energy = raw_energy_scores.get(layer, 0.0)
+        area = layer_areas.get(layer, 0.0)
+        if area > 0:
+            energy_density[layer] = energy / area
+        else:
+            energy_density[layer] = 0.0
+    return energy_density
 
 
 def calculate_contact_areas(
@@ -424,18 +522,23 @@ def run_energy_analysis(
     dissipation_factor: float = 0.5,
     convection_factor: float = 0.05,
     use_geometry_multiplier: bool = False,
-    area_ratio_power: float = 3.0,
+    area_ratio_power: float = 1.0,
+    area_ratio_method: str = 'layer_scan',
     gaussian_ratio_power: float = 0.15,
     threshold_medium: float = 0.3,
     threshold_high: float = 0.6,
-    voxel_size: float = 1.0,
+    voxel_size: float = 0.1,
+    layer_thickness: float = 0.03,
+    laser_power: float = 200.0,
+    scan_speed: float = 800.0,
+    hatch_distance: float = 0.1,
     progress_callback: Optional[callable] = None
 ) -> Dict:
     """
     Run complete energy analysis pipeline.
 
     This is the main entry point that combines:
-    1. Region-aware energy accumulation calculation
+    1. Region-aware energy accumulation calculation (in Joules)
     2. Risk classification
     3. Statistics generation
 
@@ -452,13 +555,21 @@ def run_energy_analysis(
     use_geometry_multiplier : bool
         If True, use Mode B. If False, use Mode A.
     area_ratio_power : float
-        Power exponent for area ratio in Mode A (1.0-3.0)
+        Power exponent for layer area ratio in Mode A (1.0-3.0)
     threshold_medium : float
         Risk classification threshold for MEDIUM
     threshold_high : float
         Risk classification threshold for HIGH
     voxel_size : float
         Voxel size in mm
+    layer_thickness : float
+        Layer thickness in mm
+    laser_power : float
+        Laser power in Watts
+    scan_speed : float
+        Scan speed in mm/s
+    hatch_distance : float
+        Hatch distance in mm
     progress_callback : callable, optional
         Progress callback function
 
@@ -466,7 +577,8 @@ def run_energy_analysis(
     -------
     dict
         Complete analysis results including:
-        - risk_scores: normalized scores per layer
+        - risk_scores: normalized scores per layer (0-1)
+        - raw_energy_scores: energy in Joules per layer
         - risk_levels: classification per layer
         - layer_areas: cross-sectional areas
         - contact_areas: contact areas with layer below
@@ -480,34 +592,57 @@ def run_energy_analysis(
     layer_areas = calculate_layer_areas(masks, voxel_size)
     contact_areas = calculate_contact_areas(masks, voxel_size)
 
-    # Calculate energy accumulation (region-aware)
-    risk_scores, region_data = calculate_energy_accumulation(
+    # Calculate energy accumulation (region-aware) in Joules
+    # Note: risk_scores from this function are based on total energy (legacy)
+    energy_risk_scores, raw_energy_scores, region_data = calculate_energy_accumulation(
         masks=masks,
         G_layers=G_layers,
         dissipation_factor=dissipation_factor,
         convection_factor=convection_factor,
         use_geometry_multiplier=use_geometry_multiplier,
         area_ratio_power=area_ratio_power,
+        area_ratio_method=area_ratio_method,
         gaussian_ratio_power=gaussian_ratio_power,
+        laser_power=laser_power,
+        scan_speed=scan_speed,
+        hatch_distance=hatch_distance,
+        layer_thickness=layer_thickness,
+        voxel_size=voxel_size,
         progress_callback=progress_callback
     )
 
-    # Classify risk levels
+    # Calculate energy density (J/mm²) - more objective metric
+    energy_density_scores = calculate_energy_density(raw_energy_scores, layer_areas)
+
+    # Normalize energy density to 0-1 range for risk classification
+    max_density = max(energy_density_scores.values()) if energy_density_scores else 0
+    if max_density > 0:
+        risk_scores = {n: d / max_density for n, d in energy_density_scores.items()}
+    else:
+        risk_scores = {n: 0.0 for n in energy_density_scores}
+        logger.warning("All energy density is zero - returning uniform zero risk scores")
+
+    logger.info(f"Energy density: max={max_density:.4f} J/mm², "
+                f"mean={np.mean(list(energy_density_scores.values())):.4f} J/mm²")
+
+    # Classify risk levels based on energy density (not total energy)
     risk_levels = classify_risk_levels(
         risk_scores=risk_scores,
         threshold_medium=threshold_medium,
         threshold_high=threshold_high
     )
 
-    # Get statistics
+    # Get statistics (now based on energy density)
     summary = get_energy_statistics(risk_scores, risk_levels)
 
-    logger.info(f"Energy analysis complete: {summary['n_high']} HIGH, "
+    logger.info(f"Energy analysis complete (density-based): {summary['n_high']} HIGH, "
                 f"{summary['n_medium']} MEDIUM, {summary['n_low']} LOW")
 
     return {
-        'risk_scores': risk_scores,
-        'risk_levels': risk_levels,
+        'risk_scores': risk_scores,  # Normalized energy density (0-1) - used for risk classification
+        'raw_energy_scores': raw_energy_scores,  # Total energy in Joules
+        'energy_density_scores': energy_density_scores,  # Energy density in J/mm²
+        'risk_levels': risk_levels,  # Classification based on energy density
         'layer_areas': layer_areas,
         'contact_areas': contact_areas,
         'region_data': region_data,
@@ -521,5 +656,8 @@ def run_energy_analysis(
             'threshold_medium': threshold_medium,
             'threshold_high': threshold_high,
             'mode': 'geometry_multiplier' if use_geometry_multiplier else 'area_only',
+            'laser_power': laser_power,
+            'scan_speed': scan_speed,
+            'hatch_distance': hatch_distance,
         }
     }
