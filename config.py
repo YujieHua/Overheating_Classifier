@@ -73,3 +73,68 @@ config = AppConfig()
 def get_config() -> AppConfig:
     """Get the global configuration instance."""
     return config
+
+
+# ---------------------------------------------------------------------------
+# Thermal simulation additions
+# ---------------------------------------------------------------------------
+
+from enum import Enum
+
+
+class AnalysisMode(Enum):
+    ENERGY = "energy"
+    THERMAL = "thermal"
+
+
+@dataclass
+class MaterialProperties:
+    name: str
+    thermal_conductivity: float  # W/(m·K)
+    specific_heat: float         # J/(kg·K)
+    density: float               # kg/m³
+    melting_point: float         # °C
+    absorptivity: float          # 0-1
+
+
+MATERIAL_DATABASE = {
+    'SS316L': MaterialProperties('Stainless Steel 316L', 16.2, 500, 7990, 1400, 0.35),
+    'Ti64':   MaterialProperties('Ti-6Al-4V',            6.7,  526, 4430, 1660, 0.40),
+    'IN718':  MaterialProperties('Inconel 718',          11.4, 435, 8190, 1336, 0.38),
+    'AlSi10Mg': MaterialProperties('AlSi10Mg',           147,  963, 2670,  660, 0.30),
+}
+
+
+@dataclass
+class ProcessDefaults:
+    laser_power: float = 280.0
+    scan_velocity: float = 960.0
+    hatch_spacing: float = 0.1
+    recoat_time: float = 8.0
+    scan_efficiency: float = 0.1
+
+
+@dataclass
+class ThermalSimDefaults:
+    convection_coefficient: float = 10.0
+    substrate_influence: float = 0.3
+    warning_fraction: float = 0.8
+    critical_fraction: float = 1.0
+    preheat_temp: float = 80.0
+
+
+THERMAL_PARAMETER_RULES = {
+    'laser_power':           {'min': 50,   'max': 1000,  'unit': 'W'},
+    'scan_velocity':         {'min': 100,  'max': 5000,  'unit': 'mm/s'},
+    'hatch_spacing':         {'min': 0.01, 'max': 1.0,   'unit': 'mm'},
+    'recoat_time':           {'min': 1,    'max': 60,    'unit': 's'},
+    'scan_efficiency':       {'min': 0.01, 'max': 1.0},
+    'convection_coefficient':{'min': 0,    'max': 200,   'unit': 'W/m²K'},
+    'substrate_influence':   {'min': 0.0,  'max': 1.0},
+    'preheat_temp':          {'min': 20,   'max': 500,   'unit': '°C'},
+    'thermal_conductivity':  {'min': 1,    'max': 500,   'unit': 'W/mK'},
+    'specific_heat':         {'min': 100,  'max': 2000,  'unit': 'J/kgK'},
+    'density':               {'min': 1000, 'max': 20000, 'unit': 'kg/m³'},
+    'melting_point':         {'min': 200,  'max': 3500,  'unit': '°C'},
+    'absorptivity':          {'min': 0.05, 'max': 0.95},
+}
