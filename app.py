@@ -903,6 +903,12 @@ def run_analysis_worker(session: AnalysisSession, stl_path: str, params: dict, s
                     'preheat_temp': thermal_params.preheat_temp,
                 },
                 'computation_time_seconds': computation_time,
+                # Snapshot data for T Evolution playback
+                'temperature': thermal_results['temperature'],
+                'temperature_regions': thermal_results['temperature_regions'],
+                'heat_flow': thermal_results['heat_flow'],
+                'cumulative_heat': thermal_results['cumulative_heat'],
+                'time_steps': thermal_results['time_steps'],
             }
 
             progress_with_cancel(98, f"[INFO] Thermal analysis complete in {computation_time:.1f}s")
@@ -1278,6 +1284,11 @@ def get_results(session_id):
     results.pop('masks', None)
     results.pop('G_layers', None)
     results.pop('region_data', None)
+    # Snapshot data is large and served by dedicated endpoints
+    results.pop('temperature', None)
+    results.pop('temperature_regions', None)
+    results.pop('heat_flow', None)
+    results.pop('cumulative_heat', None)
 
     return jsonify({
         'status': 'success',
@@ -2292,6 +2303,257 @@ def _build_3d_branches(masks: Dict[int, np.ndarray], region_data_all: Dict) -> D
         'layer_regions': layer_regions,
         'branch_debug_info': branch_debug_info
     }
+
+
+@app.route('/api/temperature_surfaces/<session_id>/<int:max_layer>/<time>')
+def get_temperature_surfaces(session_id, max_layer, time):
+    """Return Plotly mesh3d traces for all layers 1..max_layer colored by temperature at given time."""
+    session = session_registry.get_session(session_id)
+    if not session or not session.results:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    if results.get('mode') != 'thermal':
+        return jsonify({'status': 'error', 'message': 'Thermal mode required'}), 400
+
+    t_snap_req = float(time)
+    temp_regions = results.get('temperature_regions', {})
+    temp_snaps = results.get('temperature', {})
+    region_data_all = results.get('region_data', {})
+    masks = results.get('masks', {})
+    time_steps = results.get('time_steps', [])
+    params = results.get('params_used', {})
+
+    voxel_size = params.get('voxel_size', 0.1)
+    layer_thickness = params.get('effective_layer_thickness', params.get('layer_thickness', 0.04))
+    preheat_temp = params.get('preheat_temp', 80.0)
+
+    # Get snapshot data for this viewing_layer
+    viewing_data_regions = temp_regions.get(max_layer, {})
+    viewing_data_temps = temp_snaps.get(max_layer, {})
+
+    # Find closest time step to t_snap_req
+    if not time_steps:
+        available_times = sorted(viewing_data_temps.keys())
+    else:
+        available_times = sorted(time_steps)
+
+    if not available_times:
+        return jsonify({'status': 'error', 'message': 'No time snapshots available'}), 404
+
+    closest_t = min(available_times, key=lambda t: abs(t - t_snap_req))
+
+    # per-layer temperatures at this snap: {layer: {rid: T}}
+    layer_region_temps = viewing_data_regions.get(closest_t, {})
+    # per-layer max temperatures: {layer: max_T}
+    layer_max_temps = viewing_data_temps.get(closest_t, {})
+
+    # Global temperature range for colorbar (use preheat as min, compute max from all snaps)
+    all_temps = []
+    for vl_data in temp_snaps.values():
+        for t_data in vl_data.values():
+            all_temps.extend(t_data.values())
+    global_min = preheat_temp
+    global_max = max(all_temps) if all_temps else preheat_temp + 100.0
+
+    traces = []
+    for layer in range(1, max_layer + 1):
+        mask = masks.get(layer)
+        if mask is None:
+            continue
+        mask_arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+        if mask_arr.sum() == 0:
+            continue
+
+        z = layer * layer_thickness
+        region_temps_at_t = layer_region_temps.get(layer, {})
+        rd = region_data_all.get(layer, {})
+        label_map = rd.get('labeled')
+
+        def _norm(T):
+            return max(0.0, min(1.0, (T - global_min) / max(global_max - global_min, 1e-6)))
+
+        if region_temps_at_t and label_map is not None:
+            label_arr = np.array(label_map) if not isinstance(label_map, np.ndarray) else label_map
+            for rid, T_val in region_temps_at_t.items():
+                int_rid = int(rid)
+                region_mask = ((label_arr == int_rid) & (mask_arr > 0)).astype(np.uint8)
+                if region_mask.sum() == 0:
+                    continue
+                vertices, faces = _generate_layer_surface(region_mask, voxel_size, z, skip_garbage_filter=True)
+                if not vertices or not faces:
+                    continue
+                norm_t = _norm(T_val)
+                traces.append({
+                    'type': 'mesh3d',
+                    'x': [v[0] for v in vertices],
+                    'y': [v[1] for v in vertices],
+                    'z': [v[2] for v in vertices],
+                    'i': [f[0] for f in faces],
+                    'j': [f[1] for f in faces],
+                    'k': [f[2] for f in faces],
+                    'intensity': [norm_t] * len(vertices),
+                    'intensitymode': 'vertex',
+                    'colorscale': 'Hot',
+                    'cmin': 0, 'cmax': 1,
+                    'showscale': False,
+                    'flatshading': True,
+                    'name': f'L{layer}R{rid}',
+                    'hovertemplate': f'Layer {layer}<br>T = {T_val:.1f} °C<extra></extra>',
+                })
+        else:
+            # Fallback: color whole layer by max temp or preheat
+            T_val = float(max(region_temps_at_t.values())) if region_temps_at_t else preheat_temp
+            vertices, faces = _generate_layer_surface(mask_arr, voxel_size, z)
+            if not vertices or not faces:
+                continue
+            norm_t = _norm(T_val)
+            traces.append({
+                'type': 'mesh3d',
+                'x': [v[0] for v in vertices],
+                'y': [v[1] for v in vertices],
+                'z': [v[2] for v in vertices],
+                'i': [f[0] for f in faces],
+                'j': [f[1] for f in faces],
+                'k': [f[2] for f in faces],
+                'intensity': [norm_t] * len(vertices),
+                'intensitymode': 'vertex',
+                'colorscale': 'Hot',
+                'cmin': 0, 'cmax': 1,
+                'showscale': False,
+                'flatshading': True,
+                'name': f'L{layer}',
+                'hovertemplate': f'Layer {layer}<br>T = {T_val:.1f} °C<extra></extra>',
+            })
+
+    # Colorbar dummy trace
+    traces.append({
+        'type': 'mesh3d',
+        'x': [0], 'y': [0], 'z': [0],
+        'i': [0], 'j': [0], 'k': [0],
+        'intensity': [0],
+        'intensitymode': 'vertex',
+        'colorscale': 'Hot',
+        'cmin': global_min,
+        'cmax': global_max,
+        'showscale': True,
+        'colorbar': {'title': 'T (°C)', 'thickness': 15, 'len': 0.6, 'x': 1.02},
+        'opacity': 0,
+        'name': '_colorbar',
+    })
+
+    return jsonify({
+        'status': 'success',
+        'traces': traces,
+        'actual_time': closest_t,
+        'global_min': global_min,
+        'global_max': global_max,
+        'max_layer': max_layer,
+        'time_steps': available_times,
+    })
+
+
+@app.route('/api/global_temp_range/<session_id>')
+def get_global_temp_range(session_id):
+    """Return global temperature min/max across all viewing layers and time steps."""
+    session = session_registry.get_session(session_id)
+    if not session or not session.results:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    if results.get('mode') != 'thermal':
+        return jsonify({'status': 'error', 'message': 'Thermal mode required'}), 400
+
+    temp_snaps = results.get('temperature', {})
+    params = results.get('params_used', {})
+    preheat_temp = params.get('preheat_temp', 80.0)
+
+    all_temps = []
+    for vl_data in temp_snaps.values():
+        for t_data in vl_data.values():
+            all_temps.extend(float(v) for v in t_data.values())
+
+    global_min = preheat_temp
+    global_max = max(all_temps) if all_temps else preheat_temp + 100.0
+
+    time_steps = results.get('time_steps', [])
+    n_layers = results.get('n_layers', 1)
+
+    return jsonify({
+        'status': 'success',
+        'global_min': global_min,
+        'global_max': global_max,
+        'time_steps': time_steps,
+        'n_layers': n_layers,
+    })
+
+
+@app.route('/api/evolution_graphs/<session_id>/<int:max_layer>/<time>')
+def get_evolution_graphs(session_id, max_layer, time):
+    """Return temperature, heat_flow, cumulative_heat data for canvas bar graphs."""
+    session = session_registry.get_session(session_id)
+    if not session or not session.results:
+        return jsonify({'status': 'error', 'message': 'No results available'}), 404
+
+    results = session.results
+    if results.get('mode') != 'thermal':
+        return jsonify({'status': 'error', 'message': 'Thermal mode required'}), 400
+
+    t_snap_req = float(time)
+    temp_snaps = results.get('temperature', {})
+    heat_flow_snaps = results.get('heat_flow', {})
+    cumulative_heat_snaps = results.get('cumulative_heat', {})
+    time_steps = results.get('time_steps', [])
+    params = results.get('params_used', {})
+    preheat_temp = params.get('preheat_temp', 80.0)
+
+    # Get data for this viewing_layer
+    vl_temps = temp_snaps.get(max_layer, {})
+    vl_hf = heat_flow_snaps.get(max_layer, {})
+    vl_ch = cumulative_heat_snaps.get(max_layer, {})
+
+    # Find closest time step
+    available_times = sorted(time_steps if time_steps else vl_temps.keys())
+    if not available_times:
+        return jsonify({'status': 'error', 'message': 'No snapshots'}), 404
+
+    closest_t = min(available_times, key=lambda t: abs(t - t_snap_req))
+
+    layer_temps = vl_temps.get(closest_t, {})
+    layer_hf = vl_hf.get(closest_t, {})
+    layer_ch = vl_ch.get(closest_t, {})
+
+    # Build per-layer arrays for layers 1..max_layer
+    temperatures = []
+    heat_flows = []
+    cumulative_heats = []
+    layer_ids = []
+    for layer in range(1, max_layer + 1):
+        T = float(layer_temps.get(layer, preheat_temp))
+        hf = float(layer_hf.get(layer, 0.0))
+        ch = float(layer_ch.get(layer, 0.0))
+        temperatures.append(T)
+        heat_flows.append(hf)
+        cumulative_heats.append(ch)
+        layer_ids.append(layer)
+
+    # Global ranges for graph scaling
+    all_temps = [float(v) for vl in temp_snaps.values() for t_data in vl.values() for v in t_data.values()]
+    all_hf = [float(v) for vl in heat_flow_snaps.values() for t_data in vl.values() for v in t_data.values()]
+    all_ch = [float(v) for vl in cumulative_heat_snaps.values() for t_data in vl.values() for v in t_data.values()]
+
+    return jsonify({
+        'status': 'success',
+        'actual_time': closest_t,
+        'max_layer': max_layer,
+        'layer_ids': layer_ids,
+        'temperatures': temperatures,
+        'heat_flows': heat_flows,
+        'cumulative_heats': cumulative_heats,
+        'temp_range': [preheat_temp, max(all_temps) if all_temps else preheat_temp + 100.0],
+        'hf_range': [0.0, max(all_hf) if all_hf else 1.0],
+        'ch_range': [0.0, max(all_ch) if all_ch else 1.0],
+    })
 
 
 def _generate_layer_surface(mask: np.ndarray, voxel_size: float, z: float,
@@ -3456,6 +3718,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 <button class="tab-btn energy-only-tab" onclick="switchTab('energy', event)">Energy Accumulation</button>
                 <button class="tab-btn energy-only-tab" onclick="switchTab('density', event)">Energy Density</button>
                 <button class="tab-btn thermal-only-tab" style="display:none;" onclick="switchTab('temperature', event)">&#127777; Temperature</button>
+                <button class="tab-btn thermal-only-tab" style="display:none;" onclick="switchTab('t_evolution', event)">&#9654; T Evolution</button>
                 <button class="tab-btn" onclick="switchTab('risk', event)">Risk Map</button>
                 <button class="tab-btn" onclick="switchTab('summary', event)">Summary</button>
             </nav>
@@ -3576,6 +3839,27 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- T Evolution Tab -->
+                <div class="tab-panel" id="tab-t_evolution">
+                    <div class="viz-container" id="tEvolutionPlot" style="position:relative; height:100%;">
+                        <div class="loading-overlay hidden" id="tEvolutionLoading">
+                            <div class="loading-spinner"></div>
+                            <div class="loading-text">Loading T Evolution...</div>
+                        </div>
+                        <!-- Time info overlay (top-left corner) -->
+                        <div id="tEvolutionTimeInfo" style="position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.75); color:#fff; padding:6px 12px; border-radius:6px; font-size:12px; pointer-events:none; z-index:10; display:none; font-family:monospace;">
+                            Layer&nbsp;<span id="tEvoLayerInfo" style="color:#7ec8e3;">1</span>&nbsp;/&nbsp;<span id="tEvoLayerMax">1</span>
+                            &nbsp;&nbsp;|&nbsp;&nbsp;
+                            t&nbsp;=&nbsp;<span id="tEvoTimeInfo" style="color:#f9a825;">0.0</span>&nbsp;s
+                        </div>
+                        <!-- Canvas overlay for bar graphs (right side) -->
+                        <canvas id="tEvoGraphsCanvas" style="position:absolute; top:10px; right:10px; pointer-events:none; z-index:5; display:none;" width="200" height="360"></canvas>
+                        <div style="display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-secondary);" id="tEvoPlaceholder">
+                            Run thermal analysis to see temperature evolution
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Risk Map Tab -->
                 <div class="tab-panel" id="tab-risk">
                     <div class="viz-container" id="riskPlot">
@@ -3674,6 +3958,46 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     <input type="range" id="kernelOpacity" min="0.1" max="1.0" step="0.1" value="0.8" onchange="updateKernelOpacity(this.value)">
                 </div>
             </div>
+
+            <!-- T Evolution Playback Controls -->
+            <div class="viz-block" id="tEvolutionBlock" style="display: none;">
+                <div class="block-title">Temperature Evolution Playback</div>
+                <div class="control-group">
+                    <label>Layer Group&nbsp;<span class="value" id="tEvoLayerVal">1 / 1</span></label>
+                    <input type="range" id="tEvoLayerSlider" min="1" max="1" value="1" oninput="onTEvoLayerChange(this.value)">
+                </div>
+                <div class="control-group">
+                    <label>Time&nbsp;<span class="value" id="tEvoTimeVal">0.0 s</span></label>
+                    <input type="range" id="tEvoTimeSlider" min="0" max="0" value="0" oninput="onTEvoTimeChange(this.value)">
+                </div>
+                <div class="control-group" style="display:flex; gap:6px; align-items:center; justify-content:space-between; margin-top:4px;">
+                    <button onclick="playbackStepBackward()" title="Step Backward" style="flex:0; padding:5px 10px; background:#4a5568; border:none; border-radius:4px; color:#e0e0e0; cursor:pointer; font-size:13px;">&#9664;</button>
+                    <button id="tEvoPlayBtn" onclick="togglePlayback()" style="flex:1; padding:5px 12px; background:#2d6a4f; border:none; border-radius:4px; color:#e0e0e0; cursor:pointer; font-size:12px;">&#9654; Play</button>
+                    <button onclick="playbackStepForward()" title="Step Forward" style="flex:0; padding:5px 10px; background:#4a5568; border:none; border-radius:4px; color:#e0e0e0; cursor:pointer; font-size:13px;">&#9654;</button>
+                </div>
+                <div class="control-group" style="margin-top:8px;">
+                    <label>Speed</label>
+                    <select id="tEvoSpeedSelect" onchange="onSpeedChange(this.value)" style="width:100%; padding:4px 8px; background:#2a2a2a; border:1px solid #444; border-radius:4px; color:#e0e0e0; font-size:12px;">
+                        <option value="0.25">0.25x</option>
+                        <option value="0.5">0.5x</option>
+                        <option value="1" selected>1x</option>
+                        <option value="2">2x</option>
+                        <option value="3">3x</option>
+                    </select>
+                </div>
+                <div class="control-group" style="margin-top:4px;">
+                    <label class="radio-option" style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+                        <input type="checkbox" id="tEvoAutoAdvance" checked style="cursor:pointer;">
+                        <span>Auto-advance layer</span>
+                    </label>
+                </div>
+                <div class="control-group" style="margin-top:4px;">
+                    <label class="radio-option" style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+                        <input type="checkbox" id="tEvoShowGraphs" checked onchange="toggleEvolutionGraphs()" style="cursor:pointer;">
+                        <span>Show side graphs</span>
+                    </label>
+                </div>
+            </div>
         </aside>
     </div>
 
@@ -3741,7 +4065,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             if (activePanel) {{
                 const tabName = activePanel.id.replace('tab-', '');
                 const energyOnlyTabs = ['area_ratio', 'gaussian', 'energy', 'density'];
-                const thermalOnlyTabs = ['temperature'];
+                const thermalOnlyTabs = ['temperature', 't_evolution'];
                 if (mode === 'thermal' && energyOnlyTabs.includes(tabName)) {{
                     document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
                     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -3749,6 +4073,8 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     const firstVisibleBtn = document.querySelector('.tab-btn:not([style*="display: none"])');
                     if (firstVisibleBtn) firstVisibleBtn.classList.add('active');
                 }} else if (mode === 'energy' && thermalOnlyTabs.includes(tabName)) {{
+                    // Stop evolution playback when switching away from thermal mode
+                    stopPlayback();
                     document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
                     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
                     document.getElementById('tab-preview').classList.add('active');
@@ -3811,7 +4137,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Shared 3D camera state across tabs
         let shared3DCamera = null;
-        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'density': 'densityPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot', 'temperature': 'temperaturePlot' }};
+        const plotIds3D = {{ 'preview': 'previewPlot', 'slices': 'slicesPlot', 'energy': 'energyPlot', 'density': 'densityPlot', 'risk': 'riskPlot', 'area_ratio': 'areaRatioPlot', 'gaussian': 'gaussianPlot', 'regions': 'regionsPlot', 'temperature': 'temperaturePlot', 't_evolution': 'tEvolutionPlot' }};
 
         // Switch tabs
         function switchTab(tabName, evt) {{
@@ -3861,6 +4187,16 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                 regionsViewBlock.style.display = (tabName === 'regions') ? 'block' : 'none';
             }}
 
+            // Show/hide T Evolution playback controls
+            const tEvolutionBlock = document.getElementById('tEvolutionBlock');
+            if (tEvolutionBlock) {{
+                tEvolutionBlock.style.display = (tabName === 't_evolution') ? 'block' : 'none';
+            }}
+            // Stop playback when leaving T Evolution tab
+            if (tabName !== 't_evolution') {{
+                stopPlayback();
+            }}
+
             // Show/hide color scale controls (for tabs with continuous color scales)
             const colorScaleBlock = document.getElementById('colorScaleBlock');
             const colorScaleTabs = ['energy', 'density', 'risk', 'area_ratio', 'gaussian', 'temperature'];
@@ -3889,7 +4225,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
 
         // Resize all visible Plotly plots
         function resizeAllPlots() {{
-            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot', 'temperaturePlot'].forEach(plotId => {{
+            ['previewPlot', 'slicesPlot', 'areaRatioPlot', 'gaussianPlot', 'regionsPlot', 'energyPlot', 'riskPlot', 'temperaturePlot', 'tEvolutionPlot'].forEach(plotId => {{
                 const plotEl = document.getElementById(plotId);
                 if (plotEl && plotEl.data) {{
                     Plotly.Plots.resize(plotEl);
@@ -4400,6 +4736,7 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
                     {{ label: 'Regions', fn: () => renderLayerSurfaces('regions') }},
                     {{ label: 'Temperature', fn: () => renderLayerSurfaces('temperature') }},
                     {{ label: 'Thermal Risk', fn: () => renderLayerSurfaces('thermal_risk') }},
+                    {{ label: 'T Evolution', fn: () => initTEvolution() }},
                     {{ label: 'Summary', fn: () => updateSummary() }}
                 ];
             }} else {{
@@ -5440,6 +5777,341 @@ HTML_TEMPLATE = f'''<!DOCTYPE html>
             if (plotEl.data[colorbarIdx] && plotEl.data[colorbarIdx].type === 'scatter3d') {{
                 Plotly.restyle(plotId, {{ 'marker.cmin': minVal, 'marker.cmax': maxVal }}, [colorbarIdx]);
             }}
+        }}
+
+        // =============================================================
+        // T EVOLUTION PLAYBACK
+        // =============================================================
+        let tEvoTimeSteps = [];      // [t0, t1, ...] from API
+        let tEvoCurrentLayer = 1;    // current viewing_layer (layer group slider)
+        let tEvoCurrentTimeIdx = 0;  // index into tEvoTimeSteps
+        let tEvoNLayers = 1;
+        let tEvoPlaying = false;
+        let tEvoPlayTimer = null;
+        let tEvoSpeed = 1.0;
+        let tEvoInitialized = false;
+
+        async function initTEvolution() {{
+            if (!currentSessionId) return;
+            try {{
+                const resp = await fetch(`/api/global_temp_range/${{currentSessionId}}`);
+                const data = await resp.json();
+                if (data.status !== 'success') return;
+
+                tEvoTimeSteps = data.time_steps || [];
+                tEvoNLayers = data.n_layers || 1;
+                tEvoInitialized = true;
+
+                // Set up layer slider
+                const layerSlider = document.getElementById('tEvoLayerSlider');
+                const timeSlider = document.getElementById('tEvoTimeSlider');
+                if (layerSlider) {{
+                    layerSlider.min = 1;
+                    layerSlider.max = tEvoNLayers;
+                    layerSlider.value = tEvoNLayers;
+                    tEvoCurrentLayer = tEvoNLayers;
+                }}
+                if (timeSlider) {{
+                    timeSlider.min = 0;
+                    timeSlider.max = Math.max(0, tEvoTimeSteps.length - 1);
+                    timeSlider.value = 0;
+                    tEvoCurrentTimeIdx = 0;
+                }}
+                updateTEvoLabels();
+
+                // Hide placeholder, show overlays
+                const placeholder = document.getElementById('tEvoPlaceholder');
+                if (placeholder) placeholder.style.display = 'none';
+                const timeInfo = document.getElementById('tEvolutionTimeInfo');
+                if (timeInfo) timeInfo.style.display = 'block';
+
+                // Render initial frame
+                await renderEvolution3D(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+                await renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+                logConsole('T Evolution initialized', 'success');
+            }} catch(e) {{
+                logConsole('T Evolution init error: ' + e, 'error');
+            }}
+        }}
+
+        function updateTEvoLabels() {{
+            const t = tEvoTimeSteps[tEvoCurrentTimeIdx] !== undefined ? tEvoTimeSteps[tEvoCurrentTimeIdx] : 0;
+            const layerValEl = document.getElementById('tEvoLayerVal');
+            const timeValEl = document.getElementById('tEvoTimeVal');
+            const overlayLayer = document.getElementById('tEvoLayerInfo');
+            const overlayLayerMax = document.getElementById('tEvoLayerMax');
+            const overlayTime = document.getElementById('tEvoTimeInfo');
+            if (layerValEl) layerValEl.textContent = tEvoCurrentLayer + ' / ' + tEvoNLayers;
+            if (timeValEl) timeValEl.textContent = t.toFixed(2) + ' s';
+            if (overlayLayer) overlayLayer.textContent = tEvoCurrentLayer;
+            if (overlayLayerMax) overlayLayerMax.textContent = tEvoNLayers;
+            if (overlayTime) overlayTime.textContent = t.toFixed(2);
+        }}
+
+        async function onTEvoLayerChange(val) {{
+            tEvoCurrentLayer = parseInt(val);
+            tEvoCurrentTimeIdx = 0;
+            const timeSlider = document.getElementById('tEvoTimeSlider');
+            if (timeSlider) timeSlider.value = 0;
+            updateTEvoLabels();
+            await renderEvolution3D(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+            await renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+        }}
+
+        async function onTEvoTimeChange(val) {{
+            tEvoCurrentTimeIdx = parseInt(val);
+            updateTEvoLabels();
+            await renderEvolution3D(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+            await renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+        }}
+
+        async function renderEvolution3D(maxLayer, timeIdx) {{
+            if (!currentSessionId || !tEvoInitialized) return;
+            const t = tEvoTimeSteps[timeIdx] !== undefined ? tEvoTimeSteps[timeIdx] : 0;
+            const loadingEl = document.getElementById('tEvolutionLoading');
+            if (loadingEl) loadingEl.classList.remove('hidden');
+            try {{
+                const resp = await fetch(`/api/temperature_surfaces/${{currentSessionId}}/${{maxLayer}}/${{t}}`);
+                const data = await resp.json();
+                if (data.status !== 'success') {{ logConsole('T Evolution 3D error: ' + (data.message || ''), 'error'); return; }}
+
+                const plotEl = document.getElementById('tEvolutionPlot');
+                const layout = {{
+                    title: '', margin: {{l:0, r:0, t:30, b:0}},
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    font: {{color: '#e0e0e0', size: 10}},
+                    scene: {{
+                        xaxis: {{showgrid: true, gridcolor: '#333', title: 'X (mm)'}},
+                        yaxis: {{showgrid: true, gridcolor: '#333', title: 'Y (mm)'}},
+                        zaxis: {{showgrid: true, gridcolor: '#333', title: 'Z (mm)'}},
+                        bgcolor: 'rgba(0,0,0,0)',
+                        camera: shared3DCamera || {{eye: {{x: 1.5, y: 1.5, z: 1.2}}}},
+                    }},
+                    showlegend: false,
+                }};
+                const config = {{responsive: true, displayModeBar: false}};
+                if (!plotEl.data) {{
+                    Plotly.newPlot(plotEl, data.traces, layout, config);
+                }} else {{
+                    await Plotly.react(plotEl, data.traces, layout, config);
+                }}
+                // Sync shared camera
+                plotEl.on('plotly_relayout', (ev) => {{
+                    if (ev['scene.camera']) shared3DCamera = JSON.parse(JSON.stringify(ev['scene.camera']));
+                }});
+            }} catch(e) {{
+                logConsole('T Evolution 3D fetch error: ' + e, 'error');
+            }} finally {{
+                if (loadingEl) loadingEl.classList.add('hidden');
+            }}
+        }}
+
+        async function renderEvolutionGraphs(maxLayer, timeIdx) {{
+            const showGraphs = document.getElementById('tEvoShowGraphs');
+            if (showGraphs && !showGraphs.checked) return;
+            if (!currentSessionId || !tEvoInitialized) return;
+            const t = tEvoTimeSteps[timeIdx] !== undefined ? tEvoTimeSteps[timeIdx] : 0;
+            try {{
+                const resp = await fetch(`/api/evolution_graphs/${{currentSessionId}}/${{maxLayer}}/${{t}}`);
+                const data = await resp.json();
+                if (data.status !== 'success') return;
+
+                const canvas = document.getElementById('tEvoGraphsCanvas');
+                if (!canvas) return;
+                canvas.style.display = 'block';
+                const ctx = canvas.getContext('2d');
+                // Use dynamic height: 360px for ≤20 layers, expand up to 600px
+                const nLayers = data.layer_ids.length;
+                const rowH = Math.max(8, Math.min(18, Math.floor(340 / Math.max(nLayers, 1))));
+                const graphH = nLayers * rowH;
+                const totalH = graphH * 3 + 60;  // 3 graphs + headers
+                canvas.height = Math.min(totalH, 600);
+                canvas.width = 210;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Draw 3 graphs stacked
+                const graphW = canvas.width - 10;
+                const g1y = 5, g2y = g1y + graphH + 20, g3y = g2y + graphH + 20;
+
+                renderBarGraph(ctx, {{
+                    title: 'Temp (°C)',
+                    values: data.temperatures,
+                    layerIds: data.layer_ids,
+                    range: data.temp_range,
+                    color: [255, 100, 30],
+                    x: 5, y: g1y, w: graphW, h: graphH, rowH,
+                }});
+                renderBarGraph(ctx, {{
+                    title: 'Heat Flow (W)',
+                    values: data.heat_flows,
+                    layerIds: data.layer_ids,
+                    range: data.hf_range,
+                    color: [100, 180, 255],
+                    x: 5, y: g2y, w: graphW, h: graphH, rowH,
+                }});
+                renderBarGraph(ctx, {{
+                    title: 'Cum. Heat (J)',
+                    values: data.cumulative_heats,
+                    layerIds: data.layer_ids,
+                    range: data.ch_range,
+                    color: [80, 220, 120],
+                    x: 5, y: g3y, w: graphW, h: graphH, rowH,
+                }});
+            }} catch(e) {{
+                logConsole('Evolution graphs error: ' + e, 'error');
+            }}
+        }}
+
+        function renderBarGraph(ctx, opts) {{
+            const {{title, values, layerIds, range, color, x, y, w, h, rowH}} = opts;
+            const [minVal, maxVal] = range;
+            const span = Math.max(maxVal - minVal, 1e-9);
+            const labelW = 28;
+            const barW = w - labelW;
+
+            // Background
+            ctx.fillStyle = 'rgba(20, 20, 28, 0.85)';
+            ctx.fillRect(x, y, w, h + 16);
+
+            // Title
+            ctx.fillStyle = '#ccc';
+            ctx.font = 'bold 9px sans-serif';
+            ctx.fillText(title, x + 2, y + 10);
+
+            // Bars
+            const nLayers = layerIds.length;
+            for (let i = 0; i < nLayers; i++) {{
+                const val = values[i];
+                const norm = Math.max(0, Math.min(1, (val - minVal) / span));
+                const bx = x + labelW;
+                const by = y + 14 + i * rowH;
+                const bLen = norm * barW;
+
+                // Bar
+                const r = color[0], g = color[1], b = color[2];
+                ctx.fillStyle = `rgba(${{r}}, ${{g}}, ${{b}}, 0.75)`;
+                ctx.fillRect(bx, by + 1, bLen, rowH - 2);
+
+                // Layer label (only every Nth row to avoid clutter)
+                if (nLayers <= 30 || i % Math.ceil(nLayers / 20) === 0) {{
+                    ctx.fillStyle = '#999';
+                    ctx.font = '7px sans-serif';
+                    ctx.fillText(layerIds[i], x + 1, by + rowH - 2);
+                }}
+            }}
+
+            // Axis line
+            ctx.strokeStyle = '#555';
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(x + labelW, y + 14);
+            ctx.lineTo(x + labelW, y + 14 + h);
+            ctx.stroke();
+        }}
+
+        function toggleEvolutionGraphs() {{
+            const canvas = document.getElementById('tEvoGraphsCanvas');
+            const showGraphs = document.getElementById('tEvoShowGraphs');
+            if (!canvas || !showGraphs) return;
+            if (!showGraphs.checked) {{
+                canvas.style.display = 'none';
+            }} else {{
+                renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+            }}
+        }}
+
+        function togglePlayback() {{
+            if (tEvoPlaying) {{
+                stopPlayback();
+            }} else {{
+                startPlayback();
+            }}
+        }}
+
+        function startPlayback() {{
+            if (!tEvoInitialized) return;
+            tEvoPlaying = true;
+            const btn = document.getElementById('tEvoPlayBtn');
+            if (btn) btn.innerHTML = '&#9646;&#9646; Pause';
+            scheduleNextFrame();
+        }}
+
+        function stopPlayback() {{
+            tEvoPlaying = false;
+            if (tEvoPlayTimer) {{ clearTimeout(tEvoPlayTimer); tEvoPlayTimer = null; }}
+            const btn = document.getElementById('tEvoPlayBtn');
+            if (btn) btn.innerHTML = '&#9654; Play';
+        }}
+
+        function scheduleNextFrame() {{
+            if (!tEvoPlaying) return;
+            const delay = Math.round(800 / tEvoSpeed);  // base 800ms per frame
+            tEvoPlayTimer = setTimeout(async () => {{
+                if (!tEvoPlaying) return;
+                const maxTimeIdx = tEvoTimeSteps.length - 1;
+                if (tEvoCurrentTimeIdx < maxTimeIdx) {{
+                    tEvoCurrentTimeIdx++;
+                }} else {{
+                    // End of time steps for this layer
+                    const autoAdvance = document.getElementById('tEvoAutoAdvance');
+                    if (autoAdvance && autoAdvance.checked && tEvoCurrentLayer < tEvoNLayers) {{
+                        tEvoCurrentLayer++;
+                        tEvoCurrentTimeIdx = 0;
+                        const layerSlider = document.getElementById('tEvoLayerSlider');
+                        if (layerSlider) layerSlider.value = tEvoCurrentLayer;
+                    }} else {{
+                        stopPlayback();
+                        return;
+                    }}
+                }}
+                const timeSlider = document.getElementById('tEvoTimeSlider');
+                if (timeSlider) timeSlider.value = tEvoCurrentTimeIdx;
+                updateTEvoLabels();
+                await renderEvolution3D(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+                await renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+                scheduleNextFrame();
+            }}, delay);
+        }}
+
+        async function playbackStepForward() {{
+            if (!tEvoInitialized) return;
+            stopPlayback();
+            const maxTimeIdx = tEvoTimeSteps.length - 1;
+            if (tEvoCurrentTimeIdx < maxTimeIdx) {{
+                tEvoCurrentTimeIdx++;
+            }} else if (tEvoCurrentLayer < tEvoNLayers) {{
+                tEvoCurrentLayer++;
+                tEvoCurrentTimeIdx = 0;
+                const layerSlider = document.getElementById('tEvoLayerSlider');
+                if (layerSlider) layerSlider.value = tEvoCurrentLayer;
+            }}
+            const timeSlider = document.getElementById('tEvoTimeSlider');
+            if (timeSlider) timeSlider.value = tEvoCurrentTimeIdx;
+            updateTEvoLabels();
+            await renderEvolution3D(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+            await renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+        }}
+
+        async function playbackStepBackward() {{
+            if (!tEvoInitialized) return;
+            stopPlayback();
+            if (tEvoCurrentTimeIdx > 0) {{
+                tEvoCurrentTimeIdx--;
+            }} else if (tEvoCurrentLayer > 1) {{
+                tEvoCurrentLayer--;
+                tEvoCurrentTimeIdx = tEvoTimeSteps.length - 1;
+                const layerSlider = document.getElementById('tEvoLayerSlider');
+                if (layerSlider) layerSlider.value = tEvoCurrentLayer;
+            }}
+            const timeSlider = document.getElementById('tEvoTimeSlider');
+            if (timeSlider) timeSlider.value = tEvoCurrentTimeIdx;
+            updateTEvoLabels();
+            await renderEvolution3D(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+            await renderEvolutionGraphs(tEvoCurrentLayer, tEvoCurrentTimeIdx);
+        }}
+
+        function onSpeedChange(val) {{
+            tEvoSpeed = parseFloat(val);
         }}
 
         // Initialize on page load
